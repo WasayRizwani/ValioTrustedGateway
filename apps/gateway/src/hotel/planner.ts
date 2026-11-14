@@ -7,6 +7,12 @@
 import type { Mandate, Need, Offer } from "@tta/shared";
 import { buildOffers } from "../catalog/offers.js";
 import { getProduct, getValioSubstitutes, allergenConflicts, isLactoseFree } from "../catalog/index.js";
+import {
+  inferAnchorCategory,
+  isDeterministicallyCompatible,
+  judgeRecipeSubstitutesWithLlm,
+  type JudgeIngredientInput,
+} from "../catalog/substituteJudge.js";
 import { createOrderIntent } from "../orders/store.js";
 import { isDairyText } from "../policy/engine.js";
 import { appendAudit } from "../audit/chain.js";
@@ -40,6 +46,12 @@ export type PlanRequest = {
    * so only stock beyond that usual use counts toward the event.
    */
   baselineUntil?: string;
+  /** Optional test/runtime override for the Stage-2 batched LLM culinary judge. */
+  judgeOptions?: {
+    fetchImpl?: typeof fetch;
+    forceEnableInTests?: boolean;
+    timeoutMs?: number;
+  };
 };
 
 export type SubstituteOption = {
@@ -50,6 +62,8 @@ export type SubstituteOption = {
   availableDate: string | null;
   deliveryReliability: number | null;
   tradeOff: string;
+  culinaryNote?: string;
+  verifiedBy?: "llm_judge" | "catalog_declared" | "category_gate";
 };
 
 export type IngredientLine = {
@@ -117,7 +131,16 @@ export function mustBeLactoseFree(mandate: Mandate, item: IngredientStock): bool
   );
 }
 
-function recipeCompatible(item: IngredientStock, offer: Offer, lf: boolean): { ok: boolean; why: string } {
+function itemQueryContext(item: IngredientStock): string {
+  return [item.name, ...item.catalogHints].filter(Boolean).join(" ");
+}
+
+export function recipeCompatible(
+  item: IngredientStock,
+  offer: Offer,
+  lf: boolean,
+  anchorCategory: string | null = null,
+): { ok: boolean; why: string } {
   if (lf && !isLactoseFree({ name: offer.productName, labels: offer.labels, claims: offer.claims })) {
     return { ok: false, why: "not lactose-free" };
   }
@@ -128,7 +151,22 @@ function recipeCompatible(item: IngredientStock, offer: Offer, lf: boolean): { o
   if (conflicts.length) {
     return { ok: false, why: `${conflicts[0].level} ${conflicts[0].found}` };
   }
-  return { ok: true, why: "meets lactose/allergen constraints" };
+  const prod = getProduct(offer.productId);
+  const det = isDeterministicallyCompatible({
+    queryText: itemQueryContext(item),
+    anchorCategory,
+    candidate: {
+      productId: offer.productId,
+      name: offer.productName,
+      nameFi: prod?.nameFi,
+      category: offer.category ?? prod?.category ?? null,
+      isValioDeclaredSub: offer.substitutionSource === "valio_catalog",
+    },
+  });
+  if (!det.ok) {
+    return { ok: false, why: det.reason };
+  }
+  return { ok: true, why: "meets category, culinary, lactose and allergen constraints" };
 }
 
 function tradeOff(offer: Offer, reference: Offer | undefined, neededBy: string): string {
@@ -173,7 +211,22 @@ async function planSourcingImpl(customerId: string, mandate: Mandate, request: P
     only: request.onlyIngredients ?? null,
   });
 
+  type PendingShortfallWork = {
+    slotIndex: number;
+    item: IngredientStock;
+    usedBy: string[];
+    shortfall: number;
+    need: Need;
+    compatible: Offer[];
+    primary: Offer | undefined;
+    reference: Offer | undefined;
+    stage1AltPool: Offer[];
+  };
+
   const lines: IngredientLine[] = [];
+  const pendingWork: PendingShortfallWork[] = [];
+  const inTime = (o: Offer) => !o.availableDate || o.availableDate <= request.neededBy;
+
   for (const [ingredientId, r] of req) {
     if (request.onlyIngredients?.length && !request.onlyIngredients.includes(ingredientId)) continue;
     const item = k.inventory.find((i) => i.ingredientId === ingredientId);
@@ -204,9 +257,15 @@ async function planSourcingImpl(customerId: string, mandate: Mandate, request: P
 
     const lf = mustBeLactoseFree(mandate, item);
     const need: Need = ingredientToNeed(item, shortfall, request.neededBy, lf);
+    const extraHints = item.catalogHints.slice(1);
     let offers: Offer[] = [];
     try {
-      offers = await withAgent("sourcing", () => buildOffers(customerId, need, { includeSubstitutions: false }));
+      offers = await withAgent("sourcing", () =>
+        buildOffers(customerId, need, {
+          includeSubstitutions: false,
+          extraSearchHints: extraHints.length ? extraHints : undefined,
+        }),
+      );
     } catch (e) {
       base.status = "unsourceable";
       base.explanation = `Could not query Valio for ${item.name}: ${e instanceof Error ? e.message : e}`;
@@ -230,15 +289,23 @@ async function planSourcingImpl(customerId: string, mandate: Mandate, request: P
         }
       }
     }
-    const compatible = offers.filter(
-      (o) => !request.excludeProductIds?.includes(o.productId) && recipeCompatible(item, o, lf).ok,
+
+    const anchorCategory = inferAnchorCategory(
+      offers.map((o) => ({
+        name: o.productName,
+        nameFi: getProduct(o.productId)?.nameFi,
+        category: o.category,
+      })),
+      itemQueryContext(item),
     );
-    const inTime = (o: Offer) => !o.availableDate || o.availableDate <= request.neededBy;
+    const compatible = offers.filter(
+      (o) => !request.excludeProductIds?.includes(o.productId) && recipeCompatible(item, o, lf, anchorCategory).ok,
+    );
     const primary = compatible.find((o) => o.canFulfil && inTime(o));
     const reference = compatible[0];
 
-    // Recipe-compatible alternatives: in-time and fulfilable first, then partial.
-    const altPool = compatible
+    // Stage-1 recipe-compatible shortlist (up to 6 candidates sent to Stage-2 batched LLM culinary judge)
+    const stage1AltPool = compatible
       .filter((o) => o !== primary && inTime(o))
       .sort(
         (a, b) =>
@@ -246,41 +313,111 @@ async function planSourcingImpl(customerId: string, mandate: Mandate, request: P
           Number(b.canFulfil) - Number(a.canFulfil) ||
           b.score - a.score,
       )
-      .slice(0, 3);
-    const labels: Array<"best" | "better" | "good"> = ["best", "better", "good"];
-    base.substitutes = altPool.map((o, i) => ({
-      label: labels[i],
-      productId: o.productId,
-      productName: o.productName,
-      totalPrice: o.totalPrice,
-      availableDate: o.availableDate,
-      deliveryReliability: o.deliveryReliability,
-      tradeOff:
-        (o.substitutionSource === "valio_catalog" ? `Valio-declared substitute${o.substituteFor ? ` for ${o.substituteFor}` : ""} · ` : "") +
-        (o.canFulfil ? "" : `PARTIAL (short ${o.shortfall} packs) · `) +
-        tradeOff(o, primary ?? reference, request.neededBy),
+      .slice(0, 6);
+
+    const slotIndex = lines.length;
+    lines.push(base);
+    pendingWork.push({
+      slotIndex,
+      item,
+      usedBy: [...r.usedBy],
+      shortfall,
+      need,
+      compatible,
+      primary,
+      reference,
+      stage1AltPool,
+    });
+  }
+
+  // Stage-2: One batched LLM culinary judge call across all shortfall ingredients in this plan (cached + fallback)
+  const judgeInputs: JudgeIngredientInput[] = pendingWork
+    .filter((w) => w.stage1AltPool.length > 0)
+    .map((w) => ({
+      ingredientId: w.item.ingredientId,
+      ingredientName: w.item.name,
+      unit: w.item.unit,
+      requiredQty: w.shortfall,
+      recipes: w.usedBy,
+      primary: w.primary
+        ? {
+            productId: w.primary.productId,
+            productName: w.primary.productName,
+            category: w.primary.category,
+          }
+        : null,
+      candidates: w.stage1AltPool.map((o) => ({
+        productId: o.productId,
+        productName: o.productName,
+        category: o.category,
+        packSize: o.packSize,
+        packUnit: o.packUnit,
+        totalPrice: o.totalPrice,
+        isValioDeclaredSub: o.substitutionSource === "valio_catalog",
+      })),
     }));
+
+  const judgeBatch = await judgeRecipeSubstitutesWithLlm(judgeInputs, request.judgeOptions);
+  const labels: Array<"best" | "better" | "good"> = ["best", "better", "good"];
+
+  for (const w of pendingWork) {
+    const base = lines[w.slotIndex]!;
+    const verdict = judgeBatch.byIngredient.get(w.item.ingredientId);
+    const vettedPool = verdict
+      ? w.stage1AltPool.filter((o) => verdict.approvedIds.has(o.productId))
+      : w.stage1AltPool;
+    const altPool = vettedPool.slice(0, 3);
+
+    base.substitutes = altPool.map((o, i) => {
+      const culinaryNote = verdict?.notes.get(o.productId);
+      const verifiedBy: SubstituteOption["verifiedBy"] =
+        o.substitutionSource === "valio_catalog"
+          ? "catalog_declared"
+          : judgeBatch.source === "deterministic_fallback"
+            ? "category_gate"
+            : "llm_judge";
+      return {
+        label: labels[i],
+        productId: o.productId,
+        productName: o.productName,
+        totalPrice: o.totalPrice,
+        availableDate: o.availableDate,
+        deliveryReliability: o.deliveryReliability,
+        ...(culinaryNote ? { culinaryNote } : {}),
+        verifiedBy,
+        tradeOff:
+          (o.substitutionSource === "valio_catalog" ? `Valio-declared substitute${o.substituteFor ? ` for ${o.substituteFor}` : ""} · ` : "") +
+          (o.canFulfil ? "" : `PARTIAL (short ${o.shortfall} packs) · `) +
+          tradeOff(o, w.primary ?? w.reference, request.neededBy),
+      };
+    });
 
     // Stock-out: a substitute Valio itself declares for the missing SKU beats an arbitrary alternative.
     const declared = request.excludeProductIds?.length
-      ? compatible.find((o) => o.substitutionSource === "valio_catalog" && o.canFulfil && inTime(o))
+      ? w.compatible.find(
+          (o) =>
+            o.substitutionSource === "valio_catalog" &&
+            o.canFulfil &&
+            inTime(o) &&
+            (!verdict || verdict.approvedIds.has(o.productId)),
+        )
       : undefined;
-    let pick: Offer | undefined = declared ?? primary;
+    let pick: Offer | undefined = declared ?? w.primary;
     let isSub = Boolean(declared);
     if (declared) {
       base.status = "substitute_proposed";
-      base.explanation = `${base.name} can't be supplied as before. Valio's own catalog lists ${declared.productName} as a substitute (${tradeOff(declared, primary ?? reference, request.neededBy)}); lactose/allergen constraints for ${[...r.usedBy].join(", ")} still hold.`;
-    } else if (primary) {
+      base.explanation = `${base.name} can't be supplied as before. Valio's own catalog lists ${declared.productName} as a substitute (${tradeOff(declared, w.primary ?? w.reference, request.neededBy)}); lactose/allergen constraints for ${w.usedBy.join(", ")} still hold.`;
+    } else if (w.primary) {
       base.status = "sourced";
-      base.explanation = `Short ${shortfall}${item.unit} for ${[...r.usedBy].join(", ")}; best in-time compatible offer is ${primary.productName} at €${primary.totalPrice.toFixed(2)}.`;
+      base.explanation = `Short ${w.shortfall}${w.item.unit} for ${w.usedBy.join(", ")}; best in-time compatible offer is ${w.primary.productName} at €${w.primary.totalPrice.toFixed(2)}.`;
     } else if (altPool[0]) {
       pick = altPool[0];
       isSub = true;
       base.status = pick.canFulfil ? "substitute_proposed" : "partial";
-      base.explanation = `Exact request can't be met by ${request.neededBy}. Recipe-compatible substitute: ${pick.productName} (${base.substitutes[0].tradeOff}). Kept lactose/allergen constraints for ${[...r.usedBy].join(", ")}.`;
+      base.explanation = `Exact request can't be met by ${request.neededBy}. Recipe-compatible substitute: ${pick.productName} (${base.substitutes[0].tradeOff}). Kept lactose/allergen constraints for ${w.usedBy.join(", ")}.`;
     } else {
       base.status = "unsourceable";
-      base.explanation = `Nothing compatible can reach you by ${request.neededBy} for ${item.name}. Affected recipes: ${[...r.usedBy].join(", ")}. Consider moving the date or changing the menu.`;
+      base.explanation = `Nothing compatible can reach you by ${request.neededBy} for ${w.item.name}. Affected recipes: ${w.usedBy.join(", ")}. Consider moving the date or changing the menu.`;
     }
 
     if (pick) {
@@ -296,7 +433,7 @@ async function planSourcingImpl(customerId: string, mandate: Mandate, request: P
           const res = await createOrderIntent({
             customerId,
             mandate,
-            need,
+            need: w.need,
             runId,
             offerProductId: pick.productId,
             markSubstitution: isSub,
@@ -312,7 +449,6 @@ async function planSourcingImpl(customerId: string, mandate: Mandate, request: P
         }
       }
     }
-    lines.push(base);
   }
 
   const flags = lines
@@ -332,7 +468,15 @@ async function planSourcingImpl(customerId: string, mandate: Mandate, request: P
     `${lines.length} ingredients checked for ${request.neededBy}: ${parts.join(", ") || "nothing to buy"}. ` +
     `Estimated purchase €${total.toFixed(2)}${request.createIntents ? " (orders created; the audit trail shows what was actually placed)" : ""}.`;
 
-  appendAudit(runId, customerId, "menu_plan_completed", { summary, flags });
+  appendAudit(runId, customerId, "menu_plan_completed", {
+    summary,
+    flags,
+    substituteJudge: {
+      source: judgeBatch.source,
+      model: judgeBatch.model,
+      vetoedCount: judgeBatch.totalVetoed,
+    },
+  });
   return { neededBy: request.neededBy, runId, lines, summary, flags };
 }
 

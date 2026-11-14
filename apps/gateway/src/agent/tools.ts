@@ -1,9 +1,9 @@
 import { smartRestock } from "../hotel/optimizer.js";
 import { randomUUID } from "node:crypto";
-import { NeedSchema, type Need } from "@tta/shared";
+import { NeedSchema, type ComplexNeedResult, type Need, type Offer } from "@tta/shared";
 import { getMandate } from "../auth/customers.js";
 import { searchProducts, searchFromNeed } from "../catalog/index.js";
-import { buildOffers, explainOffers } from "../catalog/offers.js";
+import { buildOffers, buildOffersBatch, explainOffers } from "../catalog/offers.js";
 import { getPrices, getAvailability } from "../valio/client.js";
 import { verifyClaim } from "../claims/sign.js";
 import { SignedClaimSchema, PreferencesSchema } from "@tta/shared";
@@ -14,9 +14,9 @@ import {
   commitOrder,
   listOrders,
 } from "../orders/store.js";
-import { createQuote, getQuote } from "../orders/quotes.js";
+import { createMultiItemQuote, createQuote, getQuote } from "../orders/quotes.js";
 import { getAuditTrail, verifyAuditChain } from "../audit/chain.js";
-import { parseNeedFromText } from "../need/parse.js";
+import { parseComplexNeedFromText, parseNeedFromText } from "../need/parse.js";
 import {
   getInventory,
   getRecipes,
@@ -43,21 +43,49 @@ export type AgentToolDef = {
 export type AgentToolContext = {
   trustedUserText?: string;
   trustedNeed?: Need | { clarificationRequired: string };
+  trustedComplexNeed?: ComplexNeedResult | { clarificationRequired: string };
   readOnlyRequest?: boolean;
   callerRole?: string;
 };
 
-export function needFromArgs(argsNeed: unknown, context?: AgentToolContext): Need | { clarificationRequired: string } {
-  const trusted = context?.trustedNeed;
-  if (!trusted) return NeedSchema.parse(argsNeed);
-  if ("clarificationRequired" in trusted) return trusted;
+function stemWord(token: string): string {
+  if (token.length <= 3) return token;
+  if (token.endsWith("ies") && token.length > 4) return `${token.slice(0, -3)}y`;
+  if (token.endsWith("ves") && token.length > 4) return `${token.slice(0, -3)}f`;
+  if (token.endsWith("oes") && token.length > 4) return token.slice(0, -2);
+  if (token.endsWith("es") && token.length > 4 && /(?:sh|ch|x|z|s)es$/.test(token)) {
+    return token.slice(0, -2);
+  }
+  if (token.endsWith("s") && !token.endsWith("ss")) return token.slice(0, -1);
+  return token;
+}
 
-  const parsed = NeedSchema.safeParse(argsNeed);
-  const candidate = parsed.success ? parsed.data : trusted;
+const GENERIC_MODIFIERS = new Set([
+  "lactose",
+  "free",
+  "laktoositon",
+  "laktosfri",
+  "organic",
+  "luomu",
+  "vegan",
+  "vegaani",
+  "fresh",
+  "valio",
+]);
+
+function extractItemStems(need: Pick<Need, "productIntent" | "constraints">): string[] {
+  const raw = `${need.productIntent} ${(need.constraints?.keywords ?? []).join(" ")}`
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((w) => w.length >= 2 && !GENERIC_MODIFIERS.has(w));
+  return [...new Set(raw.map(stemWord))];
+}
+
+function pinCandidateToTrusted(candidate: Need, trusted: Need): Need {
   return {
     ...candidate,
     // The model may normalize product wording and add constraints, but it
-    // cannot rewrite the buyer's quantity, unit, or deadline.
+    // cannot rewrite the buyer's quantity, unit, or deadline for that item.
     quantity: trusted.quantity,
     unit: trusted.unit,
     neededBy: trusted.neededBy,
@@ -79,6 +107,60 @@ export function needFromArgs(argsNeed: unknown, context?: AgentToolContext): Nee
       keywords: candidate.constraints.keywords ?? trusted.constraints.keywords,
     },
   };
+}
+
+function matchTrustedNeedFromComplex(candidate: Need, trustedNeeds: Need[], fallbackIndex = 0): Need {
+  const candStems = extractItemStems(candidate);
+  let bestIdx = Math.min(fallbackIndex, trustedNeeds.length - 1);
+  let bestScore = -1;
+
+  for (let i = 0; i < trustedNeeds.length; i++) {
+    const t = trustedNeeds[i];
+    const tStems = extractItemStems(t);
+    let score = 0;
+    for (const cs of candStems) {
+      if (tStems.some((ts) => ts === cs || ts.startsWith(cs) || cs.startsWith(ts))) {
+        score += 10;
+      }
+    }
+    if (candidate.unit === t.unit) score += 2;
+    if (candidate.quantity === t.quantity) score += 3;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  }
+  return trustedNeeds[bestIdx] ?? trustedNeeds[0];
+}
+
+export function needFromArgs(
+  argsNeed: unknown,
+  context?: AgentToolContext,
+  fallbackIndex = 0,
+): Need | { clarificationRequired: string } {
+  const complex = context?.trustedComplexNeed;
+  if (complex) {
+    if ("clarificationRequired" in complex) return complex;
+    if (complex.needs.length > 1) {
+      const parsed = NeedSchema.safeParse(argsNeed);
+      if (!parsed.success) {
+        return complex.needs[Math.min(fallbackIndex, complex.needs.length - 1)] ?? complex.needs[0];
+      }
+      const matched = matchTrustedNeedFromComplex(parsed.data, complex.needs, fallbackIndex);
+      return pinCandidateToTrusted(parsed.data, matched);
+    }
+  }
+
+  const trusted =
+    complex && !("clarificationRequired" in complex) && complex.needs[0]
+      ? complex.needs[0]
+      : context?.trustedNeed;
+  if (!trusted) return NeedSchema.parse(argsNeed);
+  if ("clarificationRequired" in trusted) return trusted;
+
+  const parsed = NeedSchema.safeParse(argsNeed);
+  const candidate = parsed.success ? parsed.data : trusted;
+  return pinCandidateToTrusted(candidate, trusted);
 }
 
 const NEED_PARAM_SCHEMA: Record<string, unknown> = {
@@ -133,7 +215,7 @@ export const agentToolDefs: AgentToolDef[] = [
     function: {
       name: "parse_need",
       description:
-        "Parse a natural-language purchasing request into a structured Need. Extract neededBy only from the user's text and default to next Monday if no date is stated. Do not provide a separate date hint. Only returns clarificationRequired when quantity/unit is missing — do not invent customer or allergens.",
+        "Parse a natural-language purchasing request into one or more structured Needs (returns isMultiItem=true and a needs[] array when multiple items are requested). Extract neededBy only from the user's text and default to next Monday if no date is stated. Do not provide a separate date hint. Only returns clarificationRequired when quantity/unit is missing — do not invent customer or allergens.",
       parameters: {
         type: "object",
         properties: {
@@ -313,11 +395,16 @@ export const agentToolDefs: AgentToolDef[] = [
     function: {
       name: "rank_offers",
       description:
-        "Build ranked offers for a structured Need: catalog + live Valio price/availability + pack math.",
+        "Build ranked offers for one Need (`need`) or a multi-item basket (`needs` array): catalog + live Valio price/availability + pack math.",
       parameters: {
         type: "object",
         properties: {
           need: NEED_PARAM_SCHEMA,
+          needs: {
+            type: "array",
+            description: "Pass all needs here when parse_need returned isMultiItem=true to batch-rank every item at once.",
+            items: NEED_PARAM_SCHEMA,
+          },
           preferences: {
             type: "object",
             description:
@@ -325,7 +412,6 @@ export const agentToolDefs: AgentToolDef[] = [
             properties: { price: { type: "number" }, reliability: { type: "number" }, carbon: { type: "number" }, delivery: { type: "number" } },
           },
         },
-        required: ["need"],
       },
     },
   },
@@ -334,11 +420,25 @@ export const agentToolDefs: AgentToolDef[] = [
     function: {
       name: "request_quote",
       description:
-        "Request a firm-price quote (price guaranteed until validUntil, availability not held) for a need, optionally for shortlisted productIds. Then pass quoteId to create_order_intent.",
+        "Request a firm-price quote (price guaranteed until validUntil, availability not held) for one need (`need`) or a multi-item bundle (`items: [{ need, productId }]`). Then pass quoteId to create_order_intent.",
       parameters: {
         type: "object",
-        properties: { need: NEED_PARAM_SCHEMA, productIds: { type: "array", items: { type: "string" } } },
-        required: ["need"],
+        properties: {
+          need: NEED_PARAM_SCHEMA,
+          productIds: { type: "array", items: { type: "string" } },
+          items: {
+            type: "array",
+            description: "Multi-item quote lines: one { need, productId } per requested item.",
+            items: {
+              type: "object",
+              properties: {
+                need: NEED_PARAM_SCHEMA,
+                productId: { type: "string" },
+              },
+              required: ["need"],
+            },
+          },
+        },
       },
     },
   },
@@ -355,15 +455,26 @@ export const agentToolDefs: AgentToolDef[] = [
     function: {
       name: "create_order_intent",
       description:
-        "Create a fixed-price order intent (NOT a commitment). Returns policy decision: auto_commit, pending_approval, or blocked. Pass quoteId to build it from a firm quote (no re-pricing).",
+        "Create a fixed-price order intent (NOT a commitment) for one item (`need` + `offerProductId`), a multi-item basket (`items: [{ need, offerProductId }]`), or from a firm `quoteId` (no re-pricing). Returns policy decision: auto_commit, pending_approval, or blocked.",
       parameters: {
         type: "object",
         properties: {
           need: NEED_PARAM_SCHEMA,
           offerProductId: { type: "string" },
           quoteId: { type: "string" },
+          items: {
+            type: "array",
+            description: "Consolidated multi-item basket lines: one { need, offerProductId } per requested item.",
+            items: {
+              type: "object",
+              properties: {
+                need: NEED_PARAM_SCHEMA,
+                offerProductId: { type: "string" },
+              },
+              required: ["need"],
+            },
+          },
         },
-        required: ["need"],
       },
     },
   },
@@ -481,6 +592,49 @@ function summarize(result: unknown): string {
   return s.length > 4000 ? JSON.stringify(result, null, 2).slice(0, 2000) + "\n…" : s;
 }
 
+function formatComplexParseResult(
+  complex: ComplexNeedResult | { clarificationRequired: string },
+): Record<string, unknown> {
+  if ("clarificationRequired" in complex) return complex;
+  return {
+    ...complex.needs[0],
+    needs: complex.needs,
+    isMultiItem: complex.isMultiItem,
+  };
+}
+
+function trimOfferForAgent(o: Offer) {
+  return {
+    productId: o.productId,
+    productName: o.productName,
+    brand: o.brand,
+    requiredPacks: o.requiredPacks,
+    packSize: o.packSize,
+    packUnit: o.packUnit,
+    totalQuantity: o.totalQuantity,
+    unitPrice: o.unitPrice,
+    totalPrice: o.totalPrice,
+    comparisonPrice: o.comparisonPrice,
+    comparisonUnit: o.comparisonUnit,
+    availableDate: o.availableDate,
+    availableQuantity: o.availableQuantity,
+    availabilityUnknown: o.availabilityUnknown,
+    canFulfil: o.canFulfil,
+    shortfall: o.shortfall,
+    isSubstitution: o.isSubstitution,
+    substitutionLabel: o.substitutionLabel,
+    deliveryReliability: o.deliveryReliability,
+    carbonKgPerKg: o.carbonKgPerKg,
+    score: o.score,
+    scoreReasons: o.scoreReasons,
+    paretoOptimal: o.paretoOptimal,
+    cutoffRisk: o.cutoffRisk,
+    orderByAt: o.orderByAt,
+    criteriaScores: o.criteriaScores,
+    priceClaimSignature: o.priceClaim?.signature?.slice(0, 16),
+  };
+}
+
 export async function executeAgentTool(
   customerId: string,
   name: string,
@@ -504,17 +658,25 @@ export async function executeAgentTool(
       }
       switch (name) {
         case "parse_need": {
+          if (context?.trustedComplexNeed && !("clarificationRequired" in context.trustedComplexNeed)) {
+            return formatComplexParseResult(context.trustedComplexNeed);
+          }
           if (context?.trustedNeed && !("clarificationRequired" in context.trustedNeed)) {
             return context.trustedNeed;
           }
           const argText = typeof args.text === "string" ? args.text.trim() : "";
           if (context?.trustedUserText) {
-            const fromTrusted = parseNeedFromText(context.trustedUserText);
+            const fromTrusted = parseComplexNeedFromText(context.trustedUserText);
             if (!("clarificationRequired" in fromTrusted) || !argText) {
-              return fromTrusted;
+              return formatComplexParseResult(fromTrusted);
             }
           }
-          return parseNeedFromText(argText || context?.trustedUserText || "");
+          const parsedComplex = parseComplexNeedFromText(argText || context?.trustedUserText || "");
+          if ("clarificationRequired" in parsedComplex) {
+            const fallbackSingle = parseNeedFromText(argText || context?.trustedUserText || "");
+            return fallbackSingle;
+          }
+          return formatComplexParseResult(parsedComplex);
         }
         case "get_mandate":
           return getMandate(customerId);
@@ -554,44 +716,41 @@ export async function executeAgentTool(
           };
         }
         case "rank_offers": {
+          const mandate = getMandate(customerId);
+          const preferences = args.preferences ? PreferencesSchema.parse(args.preferences) : undefined;
+          if (Array.isArray(args.needs) && args.needs.length > 0) {
+            const boundNeeds: Need[] = [];
+            for (let i = 0; i < args.needs.length; i++) {
+              const bound = needFromArgs(args.needs[i], context, i);
+              if ("clarificationRequired" in bound) return bound;
+              boundNeeds.push(bound);
+            }
+            const batch = await buildOffersBatch(customerId, boundNeeds, {
+              includeSubstitutions: true,
+              preferences,
+              mandate,
+            });
+            return {
+              isMultiItem: boundNeeds.length > 1,
+              explanation: batch.combinedExplanation,
+              items: batch.items.map((it) => ({
+                need: it.need,
+                explanation: it.explanation,
+                offers: it.offers.slice(0, 6).map(trimOfferForAgent),
+                partialAvailability: it.offers.some((o) => !o.canFulfil),
+              })),
+              offers: (batch.items[0]?.offers ?? []).slice(0, 8).map(trimOfferForAgent),
+            };
+          }
           const need = needFromArgs(args.need, context);
           if ("clarificationRequired" in need) return need;
-          const mandate = getMandate(customerId);
           const offers = await buildOffers(customerId, need, {
             includeSubstitutions: true,
-            preferences: args.preferences ? PreferencesSchema.parse(args.preferences) : undefined,
+            preferences,
           });
           return {
             explanation: explainOffers(offers, need, mandate),
-            offers: offers.slice(0, 8).map((o) => ({
-              productId: o.productId,
-              productName: o.productName,
-              brand: o.brand,
-              requiredPacks: o.requiredPacks,
-              packSize: o.packSize,
-              packUnit: o.packUnit,
-              totalQuantity: o.totalQuantity,
-              unitPrice: o.unitPrice,
-              totalPrice: o.totalPrice,
-              comparisonPrice: o.comparisonPrice,
-              comparisonUnit: o.comparisonUnit,
-              availableDate: o.availableDate,
-              availableQuantity: o.availableQuantity,
-              availabilityUnknown: o.availabilityUnknown,
-              canFulfil: o.canFulfil,
-              shortfall: o.shortfall,
-              isSubstitution: o.isSubstitution,
-              substitutionLabel: o.substitutionLabel,
-              deliveryReliability: o.deliveryReliability,
-              carbonKgPerKg: o.carbonKgPerKg,
-              score: o.score,
-              scoreReasons: o.scoreReasons,
-              paretoOptimal: o.paretoOptimal,
-              cutoffRisk: o.cutoffRisk,
-              orderByAt: o.orderByAt,
-              criteriaScores: o.criteriaScores,
-              priceClaimSignature: o.priceClaim?.signature?.slice(0, 16),
-            })),
+            offers: offers.slice(0, 8).map(trimOfferForAgent),
             partialAvailability: offers.some((o) => !o.canFulfil),
             substitutions: offers
               .filter((o) => o.substitutionLabel)
@@ -632,9 +791,35 @@ export async function executeAgentTool(
         case "create_order_intent": {
           const mandate = getMandate(customerId);
           if (!mandate) throw new Error("no mandate");
+          if (Array.isArray(args.items) && args.items.length > 0) {
+            const boundItems: Array<{ need: Need; offerProductId?: string }> = [];
+            for (let i = 0; i < args.items.length; i++) {
+              const rawItem = args.items[i] as { need?: unknown; offerProductId?: string };
+              const boundNeed = needFromArgs(rawItem?.need, context, i);
+              if ("clarificationRequired" in boundNeed) return boundNeed;
+              boundItems.push({
+                need: boundNeed,
+                offerProductId: typeof rawItem?.offerProductId === "string" ? rawItem.offerProductId : undefined,
+              });
+            }
+            return createOrderIntent({
+              customerId,
+              mandate,
+              items: boundItems,
+            });
+          }
           const quoteId = args.quoteId as string | undefined;
+          const existingQuote = quoteId ? getQuote(quoteId, customerId) : undefined;
+          if (quoteId && existingQuote?.isMultiItemBasket && existingQuote.lines.length > 1) {
+            return createOrderIntent({
+              customerId,
+              mandate,
+              quoteId,
+              offerProductId: args.offerProductId as string | undefined,
+            });
+          }
           const need = needFromArgs(
-            args.need ?? (quoteId ? getQuote(quoteId, customerId)?.need : undefined),
+            args.need ?? existingQuote?.need,
             context,
           );
           if ("clarificationRequired" in need) return need;
@@ -647,6 +832,19 @@ export async function executeAgentTool(
           });
         }
         case "request_quote": {
+          if (Array.isArray(args.items) && args.items.length > 0) {
+            const boundItems: Array<{ need: Need; productId?: string }> = [];
+            for (let i = 0; i < args.items.length; i++) {
+              const rawItem = args.items[i] as { need?: unknown; productId?: string };
+              const boundNeed = needFromArgs(rawItem?.need, context, i);
+              if ("clarificationRequired" in boundNeed) return boundNeed;
+              boundItems.push({
+                need: boundNeed,
+                productId: typeof rawItem?.productId === "string" ? rawItem.productId : undefined,
+              });
+            }
+            return createMultiItemQuote(customerId, boundItems);
+          }
           const need = needFromArgs(args.need, context);
           if ("clarificationRequired" in need) return need;
           return createQuote(customerId, need, {
@@ -719,6 +917,7 @@ Users may describe many kinds of kitchen situations in their own words. Interpre
 
 Core purchase path (when the user wants something ordered):
 parse_need → rank_offers → create_order_intent → commit_order only if auto_eligible.
+- Multi-item requests: When parse_need returns isMultiItem=true with a needs[] array of 2+ items, NEVER drop secondary items. Pass needs to rank_offers({ needs }) to rank every item, pick the best fulfilable offer per item, and pass items: [{ need, offerProductId }, ...] to create_order_intent to build ONE consolidated multi-item basket order. Commit via commit_order if auto_eligible, or escalate if pending_approval.
 If pending_approval → stop and escalate (intent id + snapshot hash). Never approve or override.
 For chat, parse_need is bound to the user's exact latest message. Never paraphrase it or append a date, quantity, unit, or constraint.
 The server pins quantity, unit, and neededBy in rank_offers, request_quote, and create_order_intent to the buyer's parsed request. Treat those returned tool values as authoritative. Never state a different deadline or availability date than the tool results.

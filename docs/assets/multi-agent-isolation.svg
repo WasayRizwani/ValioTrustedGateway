@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="520" viewBox="0 0 1400 520" fill="none">
+  <defs>
+    <filter id="cardShadow" x="-4%" y="-4%" width="108%" height="112%">
+      <feDropShadow dx="0" dy="5" stdDeviation="10" flood-color="#0F172A" flood-opacity="0.05"/>
+    </filter>
+  </defs>
+
+  <rect width="1400" height="520" rx="20" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1.5"/>
+
+  <text x="40" y="44" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="20" font-weight="800" fill="#003882">Least-Privilege Multi-Agent Isolation &amp; Authority Matrix (REST + MCP Parity)</text>
+  <text x="40" y="68" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13.5" font-weight="500" fill="#475569">Enforced in gateway middleware on every HTTP route and MCP tool call — never delegated to LLM prompt instructions. Every 403 refusal is hash-chained.</text>
+
+  <!-- Matrix Table Container -->
+  <rect x="36" y="92" width="1328" height="394" rx="16" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.5" filter="url(#cardShadow)"/>
+
+  <!-- Table Header -->
+  <rect x="36" y="92" width="1328" height="54" rx="16" fill="#0F172A"/>
+  <rect x="36" y="130" width="1328" height="16" fill="#0F172A"/>
+  <text x="60" y="125" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12.5" font-weight="800" fill="#F8FAFC">IDENTITY / CREDENTIAL</text>
+  <text x="345" y="125" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12" font-weight="800" fill="#93C5FD" text-anchor="middle">CATALOG &amp; QUOTES</text>
+  <text x="545" y="125" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12" font-weight="800" fill="#93C5FD" text-anchor="middle">PRIVATE KITCHEN</text>
+  <text x="745" y="125" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12" font-weight="800" fill="#93C5FD" text-anchor="middle">PROPOSE &amp; COMMIT</text>
+  <text x="955" y="125" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12" font-weight="800" fill="#93C5FD" text-anchor="middle">VALIO SUGGESTIONS</text>
+  <text x="1195" y="125" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12" font-weight="800" fill="#6EE7B7" text-anchor="middle">APPROVE / EDIT MANDATE</text>
+
+  <!-- Row 1: Sourcing Agent -->
+  <line x1="36" y1="214" x2="1364" y2="214" stroke="#E2E8F0"/>
+  <rect x="56" y="158" width="76" height="20" rx="10" fill="#EFF6FF"/>
+  <text x="94" y="172" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="10" font-weight="800" fill="#1D4ED8" text-anchor="middle">BUYER SIDE</text>
+  <text x="56" y="194" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="800" fill="#0F172A">Sourcing Agent</text>
+  <text x="168" y="194" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#64748B">(sourcing)</text>
+
+  <rect x="275" y="164" width="140" height="34" rx="10" fill="#ECFDF5" stroke="#6EE7B7"/>
+  <text x="345" y="185" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#047857" text-anchor="middle">✓ Search, Rank, Quote</text>
+
+  <rect x="475" y="164" width="140" height="34" rx="10" fill="#FEF2F2" stroke="#FECACA"/>
+  <text x="545" y="185" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#DC2626" text-anchor="middle">✕ 403 No Kitchen</text>
+
+  <rect x="675" y="164" width="140" height="34" rx="10" fill="#FEF2F2" stroke="#FECACA"/>
+  <text x="745" y="185" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#DC2626" text-anchor="middle">✕ 403 Cannot Order</text>
+
+  <rect x="885" y="164" width="140" height="34" rx="10" fill="#FEF2F2" stroke="#FECACA"/>
+  <text x="955" y="185" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#DC2626" text-anchor="middle">✕ 403 Forbidden</text>
+
+  <rect x="1085" y="164" width="220" height="34" rx="10" fill="#FEF2F2" stroke="#FECACA"/>
+  <text x="1195" y="185" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#DC2626" text-anchor="middle">✕ 403 Audited Refusal</text>
+
+  <!-- Row 2: Kitchen Planner -->
+  <line x1="36" y1="282" x2="1364" y2="282" stroke="#E2E8F0"/>
+  <rect x="56" y="226" width="76" height="20" rx="10" fill="#EFF6FF"/>
+  <text x="94" y="240" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="10" font-weight="800" fill="#1D4ED8" text-anchor="middle">BUYER SIDE</text>
+  <text x="56" y="262" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="800" fill="#0F172A">Kitchen Planner</text>
+  <text x="170" y="262" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#64748B">(planner)</text>
+
+  <rect x="275" y="232" width="140" height="34" rx="10" fill="#F1F5F9" stroke="#CBD5E1"/>
+  <text x="345" y="253" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#475569" text-anchor="middle">Mandate Read Only</text>
+
+  <rect x="475" y="232" width="140" height="34" rx="10" fill="#ECFDF5" stroke="#6EE7B7"/>
+  <text x="545" y="253" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#047857" text-anchor="middle">✓ Stock, Recipes, Plan</text>
+
+  <rect x="675" y="232" width="140" height="34" rx="10" fill="#FEF2F2" stroke="#FECACA"/>
+  <text x="745" y="253" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#DC2626" text-anchor="middle">✕ 403 Cannot Spend</text>
+
+  <rect x="885" y="232" width="140" height="34" rx="10" fill="#FEF2F2" stroke="#FECACA"/>
+  <text x="955" y="253" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#DC2626" text-anchor="middle">✕ 403 Forbidden</text>
+
+  <rect x="1085" y="232" width="220" height="34" rx="10" fill="#FEF2F2" stroke="#FECACA"/>
+  <text x="1195" y="253" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#DC2626" text-anchor="middle">✕ 403 Audited Refusal</text>
+
+  <!-- Row 3: Procurement Agent -->
+  <line x1="36" y1="350" x2="1364" y2="350" stroke="#E2E8F0"/>
+  <rect x="56" y="294" width="76" height="20" rx="10" fill="#EFF6FF"/>
+  <text x="94" y="308" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="10" font-weight="800" fill="#1D4ED8" text-anchor="middle">BUYER SIDE</text>
+  <text x="56" y="330" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="800" fill="#0F172A">Procurement Agent</text>
+  <text x="192" y="330" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#64748B">(procurement)</text>
+
+  <rect x="275" y="300" width="140" height="34" rx="10" fill="#ECFDF5" stroke="#6EE7B7"/>
+  <text x="345" y="321" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#047857" text-anchor="middle">✓ Read Quotes/Offers</text>
+
+  <rect x="475" y="300" width="140" height="34" rx="10" fill="#FEF2F2" stroke="#FECACA"/>
+  <text x="545" y="321" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#DC2626" text-anchor="middle">✕ 403 No Kitchen</text>
+
+  <rect x="675" y="300" width="140" height="34" rx="10" fill="#ECFDF5" stroke="#6EE7B7"/>
+  <text x="745" y="321" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#047857" text-anchor="middle">✓ Intent &amp; Auto-Commit</text>
+
+  <rect x="885" y="300" width="140" height="34" rx="10" fill="#ECFDF5" stroke="#6EE7B7"/>
+  <text x="955" y="321" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11" font-weight="700" fill="#047857" text-anchor="middle">✓ Accept into Mandate</text>
+
+  <rect x="1085" y="300" width="220" height="34" rx="10" fill="#FEF2F2" stroke="#FECACA"/>
+  <text x="1195" y="321" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#DC2626" text-anchor="middle">✕ 403 Cannot Self-Approve</text>
+
+  <!-- Row 4: Valio Account Agent -->
+  <line x1="36" y1="418" x2="1364" y2="418" stroke="#E2E8F0"/>
+  <rect x="56" y="362" width="82" height="20" rx="10" fill="#EEF2FF"/>
+  <text x="97" y="376" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="10" font-weight="800" fill="#4338CA" text-anchor="middle">VALIO SIDE</text>
+  <text x="56" y="398" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="800" fill="#0F172A">Valio Account Agent</text>
+  <text x="198" y="398" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#64748B">(supplier)</text>
+
+  <rect x="275" y="368" width="140" height="34" rx="10" fill="#ECFDF5" stroke="#6EE7B7"/>
+  <text x="345" y="389" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#047857" text-anchor="middle">✓ Catalog + Past POs</text>
+
+  <rect x="475" y="368" width="140" height="34" rx="10" fill="#FEF2F2" stroke="#FECACA"/>
+  <text x="545" y="389" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#DC2626" text-anchor="middle">✕ 403 Privacy Wall</text>
+
+  <rect x="675" y="368" width="140" height="34" rx="10" fill="#FEF2F2" stroke="#FECACA"/>
+  <text x="745" y="389" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#DC2626" text-anchor="middle">✕ 403 Cannot Order</text>
+
+  <rect x="885" y="368" width="140" height="34" rx="10" fill="#ECFDF5" stroke="#6EE7B7"/>
+  <text x="955" y="389" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#047857" text-anchor="middle">✓ Propose Substitutes</text>
+
+  <rect x="1085" y="368" width="220" height="34" rx="10" fill="#FEF2F2" stroke="#FECACA"/>
+  <text x="1195" y="389" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#DC2626" text-anchor="middle">✕ 403 Audited Refusal</text>
+
+  <!-- Row 5: Human Buyer -->
+  <rect x="37" y="419" width="1326" height="66" rx="15" fill="#F0FDF4"/>
+  <rect x="56" y="429" width="96" height="20" rx="10" fill="#059669"/>
+  <text x="104" y="443" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="10" font-weight="800" fill="#FFFFFF" text-anchor="middle">HUMAN OWNER</text>
+  <text x="56" y="467" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="800" fill="#064E3B">Human Buyer Key</text>
+  <text x="184" y="467" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#047857">(Desk UI)</text>
+
+  <rect x="275" y="435" width="140" height="34" rx="10" fill="#DCFCE7" stroke="#34D399"/>
+  <text x="345" y="456" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#065F46" text-anchor="middle">✓ Full Access</text>
+
+  <rect x="475" y="435" width="140" height="34" rx="10" fill="#DCFCE7" stroke="#34D399"/>
+  <text x="545" y="456" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#065F46" text-anchor="middle">✓ Full Kitchen Write</text>
+
+  <rect x="675" y="435" width="140" height="34" rx="10" fill="#DCFCE7" stroke="#34D399"/>
+  <text x="745" y="456" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#065F46" text-anchor="middle">✓ Intent &amp; Commit</text>
+
+  <rect x="885" y="435" width="140" height="34" rx="10" fill="#DCFCE7" stroke="#34D399"/>
+  <text x="955" y="456" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#065F46" text-anchor="middle">✓ Review &amp; Accept</text>
+
+  <rect x="1085" y="435" width="220" height="34" rx="10" fill="#059669"/>
+  <text x="1195" y="456" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="11.5" font-weight="800" fill="#FFFFFF" text-anchor="middle">✓ Passkey Sign-Off &amp; Mandate</text>
+</svg>

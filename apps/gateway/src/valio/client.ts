@@ -2,6 +2,7 @@ import type { ClaimPayload, SignedClaim } from "@tta/shared";
 import { config } from "../config.js";
 import { signClaim } from "../claims/sign.js";
 import { attestationFor } from "../catalog/index.js";
+import { recordAvailabilitySnapshots, recordPriceSnapshots } from "../catalog/db.js";
 
 export type PriceResult = {
   productId: string;
@@ -171,7 +172,7 @@ export async function getPrices(
   };
   const currency = data.currency ?? "EUR";
 
-  return data.products.map((p) => {
+  const results: PriceResult[] = data.products.map((p) => {
     const productId = String(p.productId);
     const catalogPrice = p.catalogPrice as
       | { value?: number; valueWithTax?: number; validFrom?: string; validTo?: string }
@@ -216,6 +217,12 @@ export async function getPrices(
       raw: p,
     };
   });
+  try {
+    recordPriceSnapshots(customerId, requestedDate, results);
+  } catch {
+    // non-fatal if DB snapshot write fails
+  }
+  return results;
 }
 
 export async function getAvailability(
@@ -246,7 +253,7 @@ export async function getAvailability(
     products: Array<Record<string, unknown>>;
   };
 
-  return data.products.map((p) => {
+  const results: AvailabilityResult[] = data.products.map((p) => {
     const productId = String(p.productId);
     if (simulatedStockouts.has(productId)) {
       p = { ...p, salesBlock: true, scheduleLines: [] };
@@ -263,7 +270,7 @@ export async function getAvailability(
     const availableDate =
       line && typeof line.availableDate === "string" ? line.availableDate : null;
     const salesUnit =
-      line && typeof line.salesUnit === "string" ? line.salesUnit : null;
+      line && typeof line.salesUnit === "string" ? line.availableDate && typeof line.salesUnit === "string" ? line.salesUnit : line.salesUnit : null;
     const claimPayload: ClaimPayload = {
       customerId,
       productId,
@@ -290,4 +297,10 @@ export async function getAvailability(
       raw: p,
     };
   });
+  try {
+    recordAvailabilitySnapshots(customerId, requestedDate, results);
+  } catch {
+    // non-fatal if DB snapshot write fails
+  }
+  return results;
 }

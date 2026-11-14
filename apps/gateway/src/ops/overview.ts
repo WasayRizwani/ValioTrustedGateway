@@ -244,6 +244,12 @@ function describe(type: string, p: Record<string, any>): Pick<Activity, "actor" 
       return { actor: "human", kind: "info", text: "Recipe saved" };
     case "kitchen_inventory_updated":
       return { actor: "human", kind: "info", text: "Inventory updated" };
+    case "kitchen_inventory_synced":
+      return {
+        actor: "system",
+        kind: "good",
+        text: `Auto-synced POS & fridge stock (${p.criticalCount ?? 0} very low, ${p.lowCount ?? 0} low)`,
+      };
     case "standing_order_triggered":
       return { actor: "system", kind: "info", text: `Recurring order for ${p.ingredient} is due — ordering for delivery ${p.deliveryDate}` };
     case "standing_order_created":
@@ -303,6 +309,42 @@ function describe(type: string, p: Record<string, any>): Pick<Activity, "actor" 
       return { actor: "agent", kind: "warn", text: `Drafted exception follow-up: ${p.problem ?? p.subject ?? "issue"}` };
     case "selftest_run":
       return { actor: "system", kind: "info", text: "Self-test executed" };
+    case "voice_event_proposed":
+      return {
+        actor: "agent",
+        kind: "info",
+        text: `Phone call proposal saved (${p.eventId ?? "event"}) — awaiting buyer approval, zero money spent`,
+      };
+    case "voice_event_approved":
+      return {
+        actor: "human",
+        kind: "good",
+        text: `Buyer approved phone event plan (${p.eventId ?? "event"}) — scheduled for live stock & mandate check`,
+      };
+    case "fallback_cascade_executed":
+      return {
+        actor: "system",
+        kind: "good",
+        text: `Stock-out cascade: ${clip(String(p.droppedProductName ?? p.droppedProductId ?? "primary SKU"), 36)} → ${clip(String(p.backupProductName ?? p.backupProductId ?? "backup SKU"), 36)} (€${Number(p.newTotalPrice ?? 0).toFixed(2)})`,
+      };
+    case "prompt_injection_neutralized":
+      return {
+        actor: "system",
+        kind: "bad",
+        text: `Neutralized prompt injection & enforced allergen guardrail${p.productName ? ` on ${clip(String(p.productName), 42)}` : ""}`,
+      };
+    case "claim_tamper_rejected":
+      return {
+        actor: "system",
+        kind: "bad",
+        text: `Rejected forged price claim${p.productId ? ` for ${p.productId}` : ""} (${String(p.reason ?? "bad signature").replace(/_/g, " ")})`,
+      };
+    case "order_splitting_blocked":
+      return {
+        actor: "system",
+        kind: "warn",
+        text: `Caught suspected order splitting${p.totalAttemptedEur ? ` (€${Number(p.totalAttemptedEur).toFixed(0)} across ${p.attempts ?? 3} orders)` : ""} — held for human approval`,
+      };
     default:
       return null;
   }
@@ -508,7 +550,7 @@ export function getAuditRuns(customerId: string, limit = 40): AuditRun[] {
   }
   const out: AuditRun[] = [];
   const HOUSEKEEPING = new Set([
-    "demo_reset", "kitchen_inventory_updated", "kitchen_recipe_saved", "kitchen_imported",
+    "demo_reset", "kitchen_inventory_updated", "kitchen_inventory_synced", "kitchen_recipe_saved", "kitchen_imported",
     "standing_order_created", "standing_order_updated", "standing_order_deleted", "delivery_received",
     "event_cancelled", "rate_limited",
   ]);
@@ -533,6 +575,11 @@ export function getAuditRuns(customerId: string, limit = 40): AuditRun[] {
       title = `Chat: ${clip(String(m?.messagePreview ?? "agent conversation"), 60)}`;
     }
     if (types.has("forbidden_action")) title = `Blocked attempt: ${pl("forbidden_action")?.action}`;
+    if (types.has("prompt_injection_neutralized")) title = "Security Arena: Prompt-injection blocked";
+    if (types.has("claim_tamper_rejected")) title = "Security Arena: Forged Ed25519 claim rejected";
+    if (types.has("order_splitting_blocked")) title = "Security Arena: Order-splitting caught";
+    if (types.has("voice_event_proposed")) title = `Voice proposal: ${pl("voice_event_proposed")?.eventId ?? "event"}`;
+    if (types.has("voice_event_approved")) title = `Voice approval: ${pl("voice_event_approved")?.eventId ?? "event"}`;
     let outcome = "In progress";
     let tone: AuditRun["tone"] = "info";
     const allCommitted = evs.filter((x) => x.type === "committed").map((x) => JSON.parse(x.payload) as Record<string, any>);
@@ -560,6 +607,9 @@ export function getAuditRuns(customerId: string, limit = 40): AuditRun[] {
     } else if (types.has("stale_offer")) {
       outcome = "Stopped — price or stock changed";
       tone = "bad";
+    } else if (types.has("prompt_injection_neutralized") || types.has("claim_tamper_rejected") || types.has("order_splitting_blocked")) {
+      outcome = "Attack blocked — guardrail verified";
+      tone = "good";
     } else if (types.has("forbidden_action")) {
       outcome = "Refused";
       tone = "bad";
@@ -576,7 +626,7 @@ export function getAuditRuns(customerId: string, limit = 40): AuditRun[] {
       outcome = "Handed over — orders appear as their own runs";
     } else if (planDone) {
       outcome = "Plan ready — nothing ordered yet";
-    } else if (types.has("selftest_run") || types.has("agent_chat_turn") || types.has("event_created")) {
+    } else if (types.has("selftest_run") || types.has("agent_chat_turn") || types.has("event_created") || types.has("voice_event_proposed") || types.has("voice_event_approved")) {
       outcome = "Completed";
     }
     void inten;

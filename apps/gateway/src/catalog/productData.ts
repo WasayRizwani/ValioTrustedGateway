@@ -67,6 +67,46 @@ export function allergenConflicts(
   return out;
 }
 
+/**
+ * Extract non-lactose allergen exclusions from `mandate.allergenRestrictions` (e.g. "nuts", "gluten", "milk", "egg", "soy", "fish").
+ * Blocking "nuts" in Kitchen Rules also blocks "peanut" so peanut butter and peanut traces are caught too.
+ */
+export function extractMandateExcludedAllergens(allergenRestrictions?: string[] | null): string[] {
+  const out: string[] = [];
+  for (const raw of allergenRestrictions ?? []) {
+    if (!raw || raw === "must_be_lactose_free") continue;
+    const cleaned = raw
+      .trim()
+      .toLowerCase()
+      .replace(/^must_be_/, "")
+      .replace(/_free$/, "")
+      .replace(/_/g, " ")
+      .trim();
+    if (!cleaned || cleaned === "lactose") continue;
+    out.push(cleaned);
+    if (cleaned === "nuts" || cleaned === "tree nuts" || cleaned === "nut") {
+      if (cleaned === "nut") out.push("nuts");
+      out.push("peanut");
+    }
+  }
+  return [...new Set(out)];
+}
+
+/** Expand explicit `excludeAllergens` entries so `"nuts"` also covers `"peanut"`. */
+export function expandExcludedAllergens(excluded?: string[] | null): string[] {
+  const out: string[] = [];
+  for (const raw of excluded ?? []) {
+    const k = raw.trim().toLowerCase();
+    if (!k) continue;
+    out.push(k);
+    if (k === "nuts" || k === "tree nuts" || k === "nut") {
+      if (k === "nut") out.push("nuts");
+      out.push("peanut");
+    }
+  }
+  return [...new Set(out)];
+}
+
 const CERT_NAME: Record<string, string> = {
   EU_ORGANIC_FARMING: "EU Organic",
   SVANEN: "Nordic Swan Ecolabel",

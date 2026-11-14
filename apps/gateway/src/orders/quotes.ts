@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { BasketLine, Need, Offer, Quote, SignedClaim } from "@tta/shared";
 import { getDb, appendAudit } from "../audit/chain.js";
 import { config } from "../config.js";
-import { buildOffers } from "../catalog/offers.js";
+import { buildOffers, buildOffersBatch } from "../catalog/offers.js";
 import { offerToBasketLine } from "../policy/engine.js";
 import { signClaim } from "../claims/sign.js";
 import { withAgent } from "../agents/context.js";
@@ -14,10 +14,15 @@ const round2 = (n: number) => Math.round(n * 100) / 100;
 
 function rowToQuote(row: Record<string, unknown>): Quote {
   const lines = JSON.parse(String(row.lines_json)) as BasketLine[];
+  const meta = row.meta_json
+    ? (JSON.parse(String(row.meta_json)) as { itemNeeds?: Need[]; isMultiItemBasket?: boolean })
+    : undefined;
   return {
     quoteId: String(row.id),
     customerId: String(row.customer_id),
     need: JSON.parse(String(row.need_json)),
+    ...(meta?.itemNeeds ? { itemNeeds: meta.itemNeeds } : {}),
+    ...(meta?.isMultiItemBasket ? { isMultiItemBasket: true } : {}),
     lines,
     totalPrice: Number(row.total_price),
     currency: String(row.currency),
@@ -145,6 +150,151 @@ export async function createQuote(
     currency,
     validUntil,
     lines: lines.map((l) => ({ productId: l.productId, packs: l.packs, unitPrice: l.unitPrice, totalPrice: l.totalPrice })),
+    availabilityHeld: false,
+  });
+  return getQuote(quoteId, customerId)!;
+}
+
+export type MultiQuoteItemInput = {
+  need: Need;
+  productId?: string;
+  offer?: Offer;
+};
+
+/**
+ * Issue a consolidated firm-price quote across multiple requested items.
+ * Each line represents the chosen (or top fulfilable) SKU for its corresponding Need,
+ * with combined totalPrice equal to the sum of all lines.
+ */
+export async function createMultiItemQuote(
+  customerId: string,
+  items: MultiQuoteItemInput[],
+  source?: { runId?: string; includeSubstitutions?: boolean },
+): Promise<Quote> {
+  if (items.length === 0) {
+    throw new Error("No items provided for multi-item quote");
+  }
+  if (items.length === 1) {
+    const single = items[0]!;
+    return createQuote(customerId, single.need, {
+      productIds: single.productId ? [single.productId] : undefined,
+      offers: single.offer ? [single.offer] : undefined,
+      runId: source?.runId,
+      includeSubstitutions: source?.includeSubstitutions,
+    });
+  }
+
+  const runId = source?.runId ?? randomUUID();
+  const chosenOffers: Offer[] = [];
+  const itemNeeds: Need[] = [];
+
+  // Use batch ranking for items without pre-selected offers/productIds, or targeted buildOffers when productId is given
+  const needsOnly = items.map((it) => it.need);
+  const batch = await withAgent("sourcing", () =>
+    buildOffersBatch(customerId, needsOnly, {
+      includeSubstitutions: source?.includeSubstitutions ?? true,
+    }),
+  );
+
+  for (let i = 0; i < items.length; i++) {
+    const req = items[i]!;
+    let chosen: Offer | undefined = req.offer;
+    if (!chosen && req.productId) {
+      chosen = batch.items[i]?.offers.find((o) => o.productId === req.productId);
+      if (!chosen) {
+        const direct = await withAgent("sourcing", () =>
+          buildOffers(customerId, req.need, {
+            productIds: [req.productId!],
+            includeSubstitutions: source?.includeSubstitutions ?? true,
+          }),
+        );
+        chosen = direct[0];
+      }
+    }
+    if (!chosen) {
+      const pool = batch.items[i]?.offers ?? [];
+      chosen = pool.find((o) => o.canFulfil) ?? pool[0];
+    }
+    if (!chosen) {
+      throw new Error(
+        `No offers available for "${req.need.productIntent}" (${req.need.quantity} ${req.need.unit}) — nothing to quote`,
+      );
+    }
+    chosenOffers.push(chosen);
+    itemNeeds.push(req.need);
+  }
+
+  const quoteId = `QUO-${randomUUID().slice(0, 8).toUpperCase()}`;
+  const issuedAt = new Date();
+  const validUntil = new Date(issuedAt.getTime() + config.quoteTtlMinutes * 60_000).toISOString();
+  const lines = chosenOffers.map(offerToBasketLine);
+  const currency = chosenOffers[0]?.priceClaim?.claim.currency ?? "EUR";
+  const claims: SignedClaim[] = chosenOffers.map((o) =>
+    signClaim(
+      {
+        customerId,
+        productId: o.productId,
+        unitPrice: o.unitPrice,
+        currency,
+        availableQuantity: o.availableQuantity,
+        availabilityUnknown: o.availabilityUnknown,
+        salesUnit: o.packUnit,
+        availableDate: o.availableDate,
+        comparisonPrice: o.comparisonPrice,
+        comparisonUnit: o.comparisonUnit,
+        validUntil,
+        claimType: "combined",
+      },
+      { subject: { quoteId } },
+    ),
+  );
+  lines.forEach((l, i) => (l.claimIds = [claims[i]!.claimId ?? claims[i]!.signature]));
+  const totalPrice = round2(lines.reduce((s, l) => s + l.totalPrice, 0));
+
+  const earliestNeededBy = itemNeeds
+    .map((n) => n.neededBy)
+    .sort()[0]!;
+  const summaryNeed: Need = {
+    ...itemNeeds[0]!,
+    neededBy: earliestNeededBy,
+  };
+  const metaJson = JSON.stringify({
+    itemNeeds,
+    isMultiItemBasket: true,
+  });
+
+  getDb()
+    .prepare(
+      `INSERT INTO quotes (id, customer_id, run_id, status, need_json, lines_json, claims_json, total_price, currency, issued_at, valid_until, intent_id, meta_json)
+       VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+    )
+    .run(
+      quoteId,
+      customerId,
+      runId,
+      JSON.stringify(summaryNeed),
+      JSON.stringify(lines),
+      JSON.stringify(claims),
+      totalPrice,
+      currency,
+      issuedAt.toISOString(),
+      validUntil,
+      metaJson,
+    );
+
+  appendAudit(runId, customerId, "quote_issued", {
+    quoteId,
+    isMultiItemBasket: true,
+    itemCount: lines.length,
+    totalPrice,
+    currency,
+    validUntil,
+    lines: lines.map((l) => ({
+      productId: l.productId,
+      packs: l.packs,
+      unitPrice: l.unitPrice,
+      totalPrice: l.totalPrice,
+    })),
     availabilityHeld: false,
   });
   return getQuote(quoteId, customerId)!;

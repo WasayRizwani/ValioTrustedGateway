@@ -2,7 +2,8 @@
 import { getDb } from "../audit/chain.js";
 import { getLastReset, type LastReset } from "./overview.js";
 import { getKitchen } from "../hotel/kitchen.js";
-import { listOrders, type Alternative } from "../orders/store.js";
+import { listOrders, type Alternative, type CascadeExecuted } from "../orders/store.js";
+import type { HumanSignatureProof } from "../auth/humanProof.js";
 
 export type Stage = "approval" | "awaiting_delivery" | "delivered" | "closed";
 
@@ -33,6 +34,8 @@ export type OrderRow = {
   rationale: string[];
   alternatives: Alternative[];
   decidedBy: "agent" | "human" | null;
+  humanSignatureProof: HumanSignatureProof | null;
+  cascadeExecuted: CascadeExecuted | null;
 };
 
 function sourceOf(types: Set<string>, idemKey: string | null, hasIngredient: boolean): string {
@@ -144,10 +147,22 @@ export function getOrderHistory(customerId: string): { orders: OrderRow[]; count
         rationale: i.meta?.rationale ?? [],
         alternatives: i.meta?.alternatives ?? [],
         need:
-          i.need.ingredientQuantity != null && i.need.ingredientUnit && i.need.ingredientUnit.toLowerCase() !== String(i.need.unit).toLowerCase()
-            ? `${i.need.ingredientQuantity} ${i.need.ingredientUnit === "each" ? "pcs" : i.need.ingredientUnit} ${i.need.productIntent} (pack rounding: ${i.need.quantity} ${i.need.unit})`
-            : `${i.need.quantity} ${i.need.unit} ${i.need.productIntent}`,
+          i.meta?.itemNeeds && i.meta.itemNeeds.length > 1
+            ? i.meta.itemNeeds
+                .map((n) =>
+                  n.ingredientQuantity != null &&
+                  n.ingredientUnit &&
+                  n.ingredientUnit.toLowerCase() !== String(n.unit).toLowerCase()
+                    ? `${n.ingredientQuantity} ${n.ingredientUnit === "each" ? "pcs" : n.ingredientUnit} ${n.productIntent}`
+                    : `${n.quantity} ${n.unit === "each" ? "pcs" : n.unit} ${n.productIntent}`,
+                )
+                .join(" + ")
+            : i.need.ingredientQuantity != null && i.need.ingredientUnit && i.need.ingredientUnit.toLowerCase() !== String(i.need.unit).toLowerCase()
+              ? `${i.need.ingredientQuantity} ${i.need.ingredientUnit === "each" ? "pcs" : i.need.ingredientUnit} ${i.need.productIntent} (pack rounding: ${i.need.quantity} ${i.need.unit})`
+              : `${i.need.quantity} ${i.need.unit} ${i.need.productIntent}`,
         decidedBy: i.status === "committed" ? (types.has("human_approved") ? "human" : "agent") : null,
+        humanSignatureProof: i.meta?.humanSignatureProof ?? null,
+        cascadeExecuted: i.meta?.cascadeExecuted ?? null,
       };
     });
 

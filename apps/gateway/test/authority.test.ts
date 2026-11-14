@@ -37,6 +37,7 @@ const AUTHORITY_CALLS: Array<[string, string, unknown]> = [
   ["PUT", "/v1/mandate", { customerId: "HOTEL-001" }],
   ["POST", "/v1/standing-orders", { ingredientId: "x" }],
   ["PUT", "/v1/kitchen/restock/automation", { enabled: true }],
+  ["POST", "/v1/kitchen/restock/sync", { mode: "pos_sync", autoOrder: false }],
   ["POST", "/v1/admin/demo-reset", {}],
 ];
 

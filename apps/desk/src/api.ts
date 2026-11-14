@@ -2,8 +2,15 @@ const API_KEY_STORAGE = "tta_api_key";
 
 const inFlightGets = new Map<string, Promise<unknown>>();
 const getCache = new Map<string, { data: unknown; at: number }>();
+let cacheEpoch = 0;
 const FRESH_GET_TTL_MS = 400;
 const FALLBACK_GET_TTL_MS = 60_000;
+
+export function clearApiCache(): void {
+  cacheEpoch += 1;
+  inFlightGets.clear();
+  getCache.clear();
+}
 
 export function getApiKey(): string {
   try {
@@ -14,8 +21,7 @@ export function getApiKey(): string {
 }
 
 export function setApiKey(key: string) {
-  inFlightGets.clear();
-  getCache.clear();
+  clearApiCache();
   try {
     localStorage.setItem(API_KEY_STORAGE, key);
   } catch {
@@ -33,6 +39,8 @@ export async function api<T = unknown>(
 
   if (method !== "GET") {
     getCache.clear();
+    inFlightGets.clear();
+    cacheEpoch += 1;
   } else {
     const cached = getCache.get(cacheKey);
     if (cached && Date.now() - cached.at < FRESH_GET_TTL_MS) {
@@ -43,6 +51,8 @@ export async function api<T = unknown>(
       return existing as Promise<T>;
     }
   }
+
+  const requestEpoch = cacheEpoch;
 
   const run = (async (): Promise<T> => {
     const res = await fetch(path, {
@@ -81,7 +91,7 @@ export async function api<T = unknown>(
             : (json?.message ?? (json ? JSON.stringify(json) : `HTTP ${res.status}`)),
       );
     }
-    if (method === "GET") {
+    if (method === "GET" && requestEpoch === cacheEpoch) {
       getCache.set(cacheKey, { data: json, at: Date.now() });
     }
     return json as T;
@@ -92,7 +102,9 @@ export async function api<T = unknown>(
     try {
       return await run;
     } finally {
-      inFlightGets.delete(cacheKey);
+      if (inFlightGets.get(cacheKey) === run) {
+        inFlightGets.delete(cacheKey);
+      }
     }
   }
 
@@ -128,6 +140,7 @@ export type Intent = {
     deliveryReliability: number | null;
     claimIds?: string[];
     isSubstitution: boolean;
+    substitutionLabel?: "good" | "better" | "best";
     labels?: string[];
     allergens?: string[];
     mayContain?: string[];
@@ -152,6 +165,37 @@ export type Intent = {
       origin: string | null;
       note: string;
     }>;
+    quoteId?: string;
+    quoteValidUntil?: string;
+    humanSignatureProof?: {
+      verified: boolean;
+      mode: string;
+      credentialId: string;
+      signerLabel: string;
+      signaturePrefix: string;
+      verifiedAt: string;
+    } | null;
+    authorizedFallback?: {
+      productId: string;
+      productName?: string;
+      maxTotalPrice?: number;
+    } | null;
+    cascadeExecuted?: {
+      droppedProductId: string;
+      droppedProductName?: string;
+      backupProductId: string;
+      backupProductName: string;
+      newTotalPrice: number;
+      at: string;
+    } | null;
+    itemNeeds?: Array<{
+      productIntent: string;
+      quantity: number;
+      unit: string;
+      neededBy: string;
+      constraints?: Record<string, unknown>;
+    }>;
+    isMultiItemBasket?: boolean;
   };
   policy: {
     decision: string;
@@ -203,6 +247,7 @@ export type Offer = {
   productId: string;
   productName: string;
   brand: string | null;
+  category?: string | null;
   packSize: number;
   packUnit: string;
   requiredPacks: number;
@@ -221,6 +266,22 @@ export type Offer = {
   carbonKgPerKg: number | null;
   score: number;
   scoreReasons: string[];
+  orderByAt?: string | null;
+  cutoffRisk?: boolean;
+  paretoOptimal?: boolean;
+  criteria?: {
+    price: number;
+    deliveryDate: string | null;
+    reliability: number | null;
+    carbonKgPerKg: number | null;
+    certifications: string[];
+  };
+  criteriaScores?: {
+    price: number;
+    delivery: number;
+    reliability: number;
+    carbon: number;
+  };
   labels: string[];
   allergens?: string[];
   mayContain?: string[];
@@ -234,6 +295,244 @@ export type Offer = {
   priceClaim?: { signature: string; claim: unknown; asOf: string };
   availabilityClaim?: { signature: string };
 };
+
+export type VoiceReadiness = {
+  mode: "mock" | "live" | string;
+  ready: boolean;
+  phoneNumber: string;
+  missing: string[];
+};
+
+export type VoiceTranscriptLine = {
+  speaker: string;
+  role?: "caller" | "assistant" | string;
+  text: string;
+  at?: string;
+};
+
+export type VoiceSimulateResponse = {
+  ok?: boolean;
+  callId?: string;
+  preset?: string;
+  callerPhone?: string;
+  callerLabel?: string;
+  phoneNumber?: string;
+  transcript?: VoiceTranscriptLine[];
+  turns?: VoiceTranscriptLine[];
+  eventId?: string;
+  status?: string;
+  message?: string;
+  approvalToken?: string | null;
+  approvalUrl?: string | null;
+  mockApprovalUrl?: string | null;
+  safetyNote?: string;
+  event?: {
+    id: string;
+    name: string;
+    date: string;
+    guests: number;
+    status?: string;
+    orderBy?: string;
+    deliverBy?: string;
+    autoOrder?: boolean;
+    plan?: {
+      estTotal: number;
+      flags?: string[];
+      lines?: Array<{
+        ingredientId?: string;
+        name: string;
+        shortfall: number;
+        unit: string;
+        chosen?: {
+          productId: string;
+          productName: string;
+          totalPrice: number;
+        } | null;
+      }>;
+    };
+  };
+  voice?: {
+    eventId: string;
+    delivery: string;
+    approval: string;
+    approvalUrl?: string;
+    errorCode?: string;
+  } | null;
+};
+
+export type MandateSimulationResult = {
+  totalOrders?: number;
+  evaluatedCount?: number;
+  autoCount: number;
+  approvalCount: number;
+  blockedCount: number;
+  autoPct?: number;
+  estimatedMinutesSaved?: number;
+  currentAutoCount?: number;
+  deltaAutoCount?: number;
+  summary?: string;
+  samples?: Array<{
+    id?: string;
+    orderId?: string;
+    productName: string;
+    totalPrice: number;
+    quantity?: number;
+    unit?: string;
+    currentDecision?: string;
+    simulatedDecision: string;
+    failingRules?: string[];
+    reasons?: string[];
+  }>;
+};
+
+export type ArenaRunResult = {
+  scenario?: string;
+  title?: string;
+  description?: string;
+  prompt?: string;
+  attackPrompt?: string;
+  verdict?: string;
+  passed?: boolean;
+  blocked?: boolean;
+  defenseLayer?: string;
+  layersTriggered?: string[];
+  summary?: string;
+  explanation?: string;
+  details?: unknown;
+  auditRunId?: string;
+  ranAt?: string;
+  results?: Array<{
+    id?: string;
+    scenario?: string;
+    title: string;
+    attack?: string;
+    passed: boolean;
+    defenseLayer?: string;
+    outcome: string;
+    detail?: string;
+  }>;
+};
+
+export type ValioSuggestion = {
+  id: string;
+  customerId: string;
+  kind: "stockout_alert" | "better_price";
+  title: string;
+  body: string;
+  status: "new" | "accepted" | "dismissed";
+  createdAt: string;
+  originalProductId: string;
+  suggestedProductId: string;
+  suggestedProductName: string;
+  deltaEur: number;
+  source: "valio_catalog" | "price_comparison";
+  need: {
+    productIntent: string;
+    quantity: number;
+    unit: string;
+    neededBy: string;
+  };
+  intentId?: string;
+};
+
+export type RestockAutomationPolicy = {
+  enabled: boolean;
+  autoSyncInventory: boolean;
+  syncIntervalMinutes: number;
+  daysCover: number;
+  maxItems: number;
+  urgencies: Array<"critical" | "low">;
+  pauseOnStandingOrderDrift: boolean;
+  smartQuantities: boolean;
+  intervalMinutes: number;
+};
+
+export type RestockRunLine = {
+  ingredientId?: string;
+  ingredient: string;
+  urgency: string;
+  outcome: string;
+  productName?: string;
+  quantity?: number;
+  unit?: string;
+  orderId?: string;
+  intentId?: string;
+  status?: string;
+  totalPrice?: number;
+  committed?: boolean;
+  savedEur?: number;
+};
+
+export type RestockRunResult = {
+  customerId?: string;
+  ranAt: string;
+  trigger?: "manual" | "pos_sync" | "service_rush" | "scheduled";
+  summary: string;
+  skippedReason?: string;
+  lines: RestockRunLine[];
+  pendingApprovalCount: number;
+  committedCount: number;
+};
+
+export type InventorySyncStatus = {
+  autoSyncEnabled: boolean;
+  syncIntervalMinutes: number;
+  lastSyncedAt: string;
+  lastSyncSource: "pos_sync" | "service_rush" | "delivery_receipt" | "scheduled";
+  lastSyncSummary: string;
+  deductions?: Array<{
+    ingredientId: string;
+    name: string;
+    used: number;
+    onHandAfter: number;
+    unit: string;
+  }>;
+  connectedSources: Array<{
+    id: string;
+    label: string;
+    detail: string;
+    connected: boolean;
+  }>;
+};
+
+export type StockHealthItem = {
+  ingredientId: string;
+  name: string;
+  onHand: number;
+  onOrder: number;
+  parLevel: number;
+  targetQty: number;
+  suggestedOrderQty: number;
+  unit: string;
+  urgency: "critical" | "low" | "ok";
+  standingOrderDrift?: boolean;
+  daysToExpiry?: number;
+};
+
+export type StockHealthSnapshot = {
+  daysCover: number;
+  criticalCount: number;
+  lowCount: number;
+  okCount: number;
+  actionableCount: number;
+  items: StockHealthItem[];
+};
+
+export type RestockAutomationBundle = {
+  policy: RestockAutomationPolicy;
+  lastRun: RestockRunResult | null;
+  syncStatus?: InventorySyncStatus;
+  stockHealth?: StockHealthSnapshot | null;
+};
+
+export function timeAgoShort(iso?: string | null): string {
+  if (!iso) return "just now";
+  const sec = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+  if (sec < 45) return "just now";
+  if (sec < 3600) return `${Math.floor(sec / 60)} min ago`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)} h ago`;
+  return `${Math.floor(sec / 86400)} d ago`;
+}
 
 export function localDate(d: Date): string {
   const y = d.getFullYear();

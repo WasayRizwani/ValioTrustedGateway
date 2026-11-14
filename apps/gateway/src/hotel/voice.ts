@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { config } from "../config.js";
 import { getDb, appendAudit } from "../audit/chain.js";
 import { getRecipes } from "./kitchen.js";
-import { createEvent, deleteEvent, getEventRecord, view, type EventInput, type EventRecord, type EventView } from "./events.js";
+import { addDays, createEvent, deleteEvent, getEventRecord, todayIso, view, type EventInput, type EventRecord, type EventView } from "./events.js";
 
 type Caller = { customerId: string; buyerEmail: string };
 type VoiceState = { eventId: string; delivery: string; approval: string; attempts: number; updatedAt: string; approvalUrl?: string; errorCode?: string; retryAfterAt?: string };
@@ -117,7 +117,7 @@ export function voiceReadiness() {
 }
 
 export function resolveCaller(phone: string): Caller | null {
-  const caller = config.voiceCallerMap[phone];
+  const caller = config.voiceCallerMap[phone] ?? config.voiceCallerMap["*"];
   if (!caller || typeof caller.customerId !== "string" || !Object.values(config.apiKeys).includes(caller.customerId)) return null;
   if (typeof caller.buyerEmail !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(caller.buyerEmail)) return null;
   return caller;
@@ -220,16 +220,16 @@ export function getVoiceState(customerId: string, eventId: string): VoiceState |
   const row = db().prepare(`SELECT o.event_id,o.status,o.attempts,o.updated_at,o.error_code,o.mock_approval_url,o.retry_after_at,a.status approval,a.token_hash,a.expires_at
     FROM voice_outbox o JOIN voice_approvals a ON a.event_id=o.event_id WHERE o.customer_id=? AND o.event_id=? ORDER BY o.updated_at DESC LIMIT 1`).get(customerId, eventId) as { event_id: string; status: string; attempts: number; updated_at: string; error_code: string | null; mock_approval_url: string | null; retry_after_at: string | null; approval: string; token_hash: string; expires_at: string } | undefined;
   if (!row) return null;
-  // A link is exposed only in explicit mock mode for a local demo; live bearer tokens are never stored.
+  // Live bearer tokens are never stored in mock_approval_url; only explicit mock/simulated proposals set it.
   let approval = row.approval;
   try {
-    if (approval === "approved") return { eventId: row.event_id, delivery: row.status, approval, attempts: row.attempts, updatedAt: row.updated_at, errorCode: row.error_code ?? undefined, retryAfterAt: row.retry_after_at ?? undefined, ...(config.voiceMockMode && row.mock_approval_url ? { approvalUrl: row.mock_approval_url } : {}) };
+    if (approval === "approved") return { eventId: row.event_id, delivery: row.status, approval, attempts: row.attempts, updatedAt: row.updated_at, errorCode: row.error_code ?? undefined, retryAfterAt: row.retry_after_at ?? undefined, ...(row.mock_approval_url ? { approvalUrl: row.mock_approval_url } : {}) };
     const ev = getEventRecord(customerId, eventId);
     const tokenRow = db().prepare("SELECT event_version,snapshot_hash,expires_at FROM voice_approvals WHERE event_id=?").get(eventId) as { event_version: number; snapshot_hash: string; expires_at: string };
     if (ev.version !== tokenRow.event_version || eventSnapshot(ev) !== tokenRow.snapshot_hash || new Date(tokenRow.expires_at).getTime() <= Date.now() || ev.status === "cancelled") approval = "stale";
   } catch { approval = "stale"; }
   const delivery = row.status === "sending" && Date.now() - new Date(row.updated_at).getTime() > 60_000 ? "unknown" : row.status;
-  return { eventId: row.event_id, delivery, approval, attempts: row.attempts, updatedAt: row.updated_at, errorCode: row.error_code ?? undefined, retryAfterAt: row.retry_after_at ?? undefined, ...(config.voiceMockMode && row.mock_approval_url ? { approvalUrl: row.mock_approval_url } : {}) };
+  return { eventId: row.event_id, delivery, approval, attempts: row.attempts, updatedAt: row.updated_at, errorCode: row.error_code ?? undefined, retryAfterAt: row.retry_after_at ?? undefined, ...(row.mock_approval_url ? { approvalUrl: row.mock_approval_url } : {}) };
 }
 
 export async function retryVoiceEmail(customerId: string, eventId: string) {
@@ -303,6 +303,237 @@ export function approveVoicePlan(token: string) {
   if (!outcome.ok) return false;
   appendAudit(randomUUID(), outcome.customerId, "voice_event_approved", { eventId: outcome.eventId });
   return true;
+}
+
+export function isSimulatedVoiceToken(token: string): boolean {
+  if (!token) return false;
+  const row = db()
+    .prepare(
+      `SELECT o.status FROM voice_approvals a
+       JOIN voice_outbox o ON o.event_id = a.event_id
+       WHERE a.token_hash = ?
+       ORDER BY o.updated_at DESC LIMIT 1`,
+    )
+    .get(sha(token)) as { status: string } | undefined;
+  return row?.status === "mocked";
+}
+
+export async function simulateVoiceCall(
+  customerId: string,
+  opts?: {
+    preset?: string;
+    name?: string;
+    date?: string;
+    guests?: number;
+    recipeIds?: string[];
+    spokenText?: string;
+    utterance?: string;
+    text?: string;
+  },
+) {
+  const database = db();
+  const saved = getSavedRecipes(customerId);
+  if (!saved.length) {
+    throw new Error("no_saved_recipes");
+  }
+  const rawPreset = String(opts?.preset ?? "wedding").toLowerCase();
+  const preset: "gala" | "sports" | "wedding" =
+    rawPreset === "gala" ? "gala" : rawPreset === "sports" ? "sports" : "wedding";
+
+  let defaultName = "Saturday Wedding Brunch";
+  let defaultDate = addDays(todayIso(), 12);
+  let defaultGuests = 120;
+  let defaultRecipes = saved.slice(0, 2);
+  let defaultSpeech =
+    "Hi! I'm in the walk-in cooler — we just booked a 120-guest Saturday Wedding Brunch. Can you check our pantry and line up the missing Valio ingredients?";
+
+  if (preset === "gala") {
+    defaultName = "Nordic Tech Gala Banquet";
+    defaultDate = addDays(todayIso(), 10);
+    defaultGuests = 320;
+    defaultRecipes = saved.slice(0, 3);
+    defaultSpeech =
+      "Hey assistant, hands are full on the prep line — put together a banquet plan for next week's 320-guest Nordic Tech Gala Banquet.";
+  } else if (preset === "sports") {
+    defaultName = "City Sports Day Lunch";
+    defaultDate = addDays(todayIso(), 9);
+    defaultGuests = 220;
+    defaultRecipes = saved.slice(0, 1);
+    defaultSpeech =
+      "Calling from the kitchen — we have 220 guests for City Sports Day Lunch next week. Please check stock and prepare the lactose-free ingredient plan.";
+  }
+
+  const name = opts?.name?.trim() || defaultName;
+  const date =
+    opts?.date && /^\d{4}-\d{2}-\d{2}$/.test(opts.date) && opts.date >= todayIso()
+      ? opts.date
+      : defaultDate;
+  const guests =
+    typeof opts?.guests === "number" && Number.isFinite(opts.guests) && opts.guests >= 1
+      ? Math.round(opts.guests)
+      : defaultGuests;
+
+  const savedIds = new Set(saved.map((r) => r.id));
+  const requestedIds = Array.isArray(opts?.recipeIds)
+    ? opts!.recipeIds.map(String).filter((id) => savedIds.has(id))
+    : [];
+  const chosenRecipeIds = requestedIds.length ? requestedIds : defaultRecipes.map((r) => r.id);
+  const recipes = chosenRecipeIds.map((recipeId) => ({ recipeId, servings: guests }));
+  const recipeNames = chosenRecipeIds.map(
+    (id) => saved.find((r) => r.id === id)?.name ?? id,
+  );
+
+  const callId = `call-sim-${randomUUID().slice(0, 8)}`;
+  const token = randomBytes(32).toString("base64url");
+  const tokenHash = sha(token);
+  const expiresAt = new Date(Date.now() + 7 * 86400_000).toISOString();
+  const outboxId = `mail-${randomUUID()}`;
+  const approvalUrl = `/approval/voice/${token}`;
+  const buyerEmail =
+    config.voiceCallerMap["*"]?.buyerEmail ?? "chef.matti@hotel-kitchen.local";
+
+  const ev = await createEvent(
+    customerId,
+    { name, date, guests, recipes, autoOrder: false },
+    (created) => {
+      database
+        .prepare(
+          `INSERT INTO voice_approvals(event_id,customer_id,buyer_email,event_version,snapshot_hash,token_hash,expires_at,status,updated_at)
+           VALUES(?,?,?,?,?,?,?,'pending',?)`,
+        )
+        .run(
+          created.id,
+          customerId,
+          buyerEmail,
+          created.version,
+          eventSnapshot(created),
+          tokenHash,
+          expiresAt,
+          now(),
+        );
+      database
+        .prepare(
+          `INSERT INTO voice_outbox(id,event_id,customer_id,recipient,status,attempts,provider_id,mock_approval_url,updated_at)
+           VALUES(?,?,?,?,'mocked',1,?,?,?)`,
+        )
+        .run(
+          outboxId,
+          created.id,
+          customerId,
+          buyerEmail,
+          `sim-${outboxId}`,
+          approvalUrl,
+          now(),
+        );
+    },
+  );
+
+  const persisted = getEventRecord(customerId, ev.id);
+  database
+    .prepare(
+      `UPDATE voice_approvals SET event_version=?,snapshot_hash=?,updated_at=? WHERE event_id=?`,
+    )
+    .run(persisted.version, eventSnapshot(persisted), now(), ev.id);
+
+  appendAudit(randomUUID(), customerId, "voice_event_proposed", {
+    eventId: ev.id,
+    callId,
+    simulated: true,
+    emailStatus: "mocked",
+  });
+
+  const spoken = (opts?.spokenText ?? opts?.utterance ?? opts?.text ?? "").trim() || defaultSpeech;
+  const shortfallCount = (ev.plan?.lines ?? []).filter((l) => l.shortfall > 0).length;
+  const estTotal = ev.plan?.estTotal ?? 0;
+
+  const transcript = [
+    {
+      speaker: "Chef Matti",
+      role: "caller",
+      text: spoken,
+    },
+    {
+      speaker: "Valio Voice Assistant · Tool",
+      role: "assistant",
+      text: `list_saved_recipes() → matched ${recipeNames.join(", ")} and compared against current pantry inventory.`,
+    },
+    {
+      speaker: "Valio Voice Assistant",
+      role: "assistant",
+      text: `Got it, Chef Matti! For ${guests} guests at ${name} (${date}), I subtracted on-hand stock and priced ${shortfallCount} missing Valio item${shortfallCount === 1 ? "" : "s"} (~€${estTotal.toFixed(2)}). Shall I save this non-ordering proposal and send your approval link?`,
+    },
+    {
+      speaker: "Chef Matti",
+      role: "caller",
+      text: "Yes, confirmed — save the proposal and send the one-tap approval link to my phone so I can review after prep.",
+    },
+    {
+      speaker: "Valio Voice Assistant · Tool",
+      role: "assistant",
+      text: `create_event_proposal(confirmed=true, autoOrder=false) → saved ${ev.id} awaiting buyer sign-off (€0.00 committed).`,
+    },
+    {
+      speaker: "Valio Voice Assistant",
+      role: "assistant",
+      text: "Proposal saved! Zero money was spent on this call. Your single-use mobile approval link is ready whenever you want to schedule purchasing.",
+    },
+  ];
+
+  const voiceState = getVoiceState(customerId, ev.id);
+  const assistantNumber = config.voicePublicNumber || "+1 269 665 8009";
+
+  return {
+    callId,
+    preset,
+    assistantNumber,
+    phoneNumber: assistantNumber,
+    callerLabel: "+358 40 123 4567 · Chef Matti (Walk-in Cooler)",
+    transcript,
+    eventId: ev.id,
+    event: { ...ev, voice: voiceState },
+    voice: voiceState,
+    approvalUrl,
+  };
+}
+
+export function approveVoiceEventByBuyer(customerId: string, eventId: string) {
+  const d = db();
+  // Ensure event exists and events table is initialized
+  const current = getEventRecord(customerId, eventId);
+  if (current.status === "cancelled") {
+    throw Object.assign(new Error("event_cancelled"), { code: "event_cancelled" });
+  }
+  const tx = d.transaction(() => {
+    const eventRow = d
+      .prepare("SELECT json FROM events WHERE id=? AND customer_id=?")
+      .get(eventId, customerId) as { json: string } | undefined;
+    if (!eventRow) throw new Error("event not found");
+    const ev = JSON.parse(eventRow.json) as EventRecord;
+    ev.autoOrder = true;
+    ev.version = (ev.version ?? 1) + 1;
+    d.prepare("UPDATE events SET json=? WHERE id=? AND customer_id=?").run(
+      JSON.stringify(ev),
+      eventId,
+      customerId,
+    );
+    const ts = now();
+    d.prepare(
+      `UPDATE voice_approvals
+       SET status='approved', consumed_at=COALESCE(consumed_at, ?), event_version=?, snapshot_hash=?, updated_at=?
+       WHERE event_id=? AND customer_id=?`,
+    ).run(ts, ev.version, eventSnapshot(ev), ts, eventId, customerId);
+    return ev;
+  });
+  const updatedRecord = tx();
+  appendAudit(randomUUID(), customerId, "voice_event_approved", {
+    eventId,
+    approvedBy: "buyer",
+  });
+  const updatedView = view(updatedRecord);
+  return {
+    ok: true,
+    event: { ...updatedView, voice: getVoiceState(customerId, eventId) },
+  };
 }
 
 export { publicError };

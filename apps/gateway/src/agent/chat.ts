@@ -7,8 +7,9 @@ import {
   type ToolTrace,
 } from "./tools.js";
 import { fenceToolOutput } from "./sanitize.js";
-import { parseNeedFromText } from "../need/parse.js";
+import { parseComplexNeedFromText, parseNeedFromText } from "../need/parse.js";
 import { ValioRateLimitError } from "../valio/client.js";
+import type { Need } from "@tta/shared";
 
 export type ChatMessage = {
   role: "system" | "user" | "assistant" | "tool";
@@ -98,9 +99,14 @@ async function runOpenAiLoop(
   const trustedUserText = [...history].reverse().find((m) => m.role === "user")?.content ?? "";
   const restockAsk = /restock|what should we order|running low|inventory|recipes|order history|replenish|low stock/i.test(trustedUserText);
   const parsedFromUser = parseNeedFromText(trustedUserText);
+  const parsedComplexFromUser = parseComplexNeedFromText(trustedUserText);
   const toolContext: AgentToolContext = {
     trustedUserText,
     trustedNeed: restockAsk && Boolean((parsedFromUser as { clarificationRequired?: string }).clarificationRequired) ? undefined : parsedFromUser,
+    trustedComplexNeed:
+      restockAsk && "clarificationRequired" in parsedComplexFromUser
+        ? undefined
+        : parsedComplexFromUser,
     readOnlyRequest: isReadOnlyRequest(trustedUserText),
     callerRole,
   };
@@ -242,9 +248,14 @@ async function runAnthropicLoop(
   const trustedUserText = [...history].reverse().find((m) => m.role === "user")?.content ?? "";
   const restockAsk = /restock|what should we order|running low|inventory|recipes|order history|replenish|low stock/i.test(trustedUserText);
   const parsedFromUser = parseNeedFromText(trustedUserText);
+  const parsedComplexFromUser = parseComplexNeedFromText(trustedUserText);
   const toolContext: AgentToolContext = {
     trustedUserText,
     trustedNeed: restockAsk && Boolean((parsedFromUser as { clarificationRequired?: string }).clarificationRequired) ? undefined : parsedFromUser,
+    trustedComplexNeed:
+      restockAsk && "clarificationRequired" in parsedComplexFromUser
+        ? undefined
+        : parsedComplexFromUser,
     readOnlyRequest: isReadOnlyRequest(trustedUserText),
     callerRole,
   };
@@ -351,9 +362,14 @@ export async function runHeuristicAgent(
       userText,
     );
   const parsedFromUser = parseNeedFromText(userText);
+  const parsedComplexFromUser = parseComplexNeedFromText(userText);
   const toolContext: AgentToolContext = {
     trustedUserText: userText,
     trustedNeed: restockAsk && Boolean((parsedFromUser as { clarificationRequired?: string }).clarificationRequired) ? undefined : parsedFromUser,
+    trustedComplexNeed:
+      restockAsk && "clarificationRequired" in parsedComplexFromUser
+        ? undefined
+        : parsedComplexFromUser,
     readOnlyRequest,
     callerRole,
   };
@@ -503,10 +519,218 @@ export async function runHeuristicAgent(
 
   const parsed = (await run("parse_need", { text: userText })) as
     | { clarificationRequired: string }
-    | Record<string, unknown>;
+    | (Record<string, unknown> & { needs?: Need[]; isMultiItem?: boolean });
 
   if ("clarificationRequired" in parsed) {
+    // Check if the buyer is asking to source a kitchen recipe by name (e.g. "Order ingredients for buttermilk pancakes")
+    const recipeData = (await run("get_recipes", {})) as {
+      recipes?: Array<{ recipeId: string; name: string; servingsPerBatch: number; batchesPerWeek: number }>;
+    };
+    const lowerText = userText.toLowerCase();
+    const matchedRecipes = (recipeData.recipes ?? []).filter((r) => {
+      const words = r.name
+        .toLowerCase()
+        .replace(/\([^)]*\)/g, " ")
+        .split(/[^\p{L}\p{N}]+/u)
+        .filter((w) => w.length >= 4 && !["hotel", "daily", "lobby", "evening", "milk", "cream"].includes(w));
+      return words.some((w) => lowerText.includes(w) || (w.endsWith("s") && lowerText.includes(w.slice(0, -1))));
+    });
+    if (matchedRecipes.length > 0) {
+      const batchMatch = lowerText.match(/\b(\d+)\s*batch(?:es)?\b/);
+      const guestMatch = lowerText.match(/\b(\d+)\s*(?:guests?|people|servings?|portions?)\b/);
+      const planRes = (await run("plan_menu_sourcing", {
+        neededBy: parseComplexNeedFromText(`1 pack item ${userText}`) && !("clarificationRequired" in parseComplexNeedFromText(`1 pack item ${userText}`))
+          ? (parseComplexNeedFromText(`1 pack item ${userText}`) as { needs: Need[] }).needs[0].neededBy
+          : new Date(Date.now() + 3 * 86_400_000).toISOString().slice(0, 10),
+        recipes: matchedRecipes.map((r) => ({
+          recipeId: r.recipeId,
+          batches: batchMatch
+            ? Math.max(1, Number(batchMatch[1]))
+            : guestMatch
+              ? Math.max(1, Math.ceil(Number(guestMatch[1]) / Math.max(1, r.servingsPerBatch)))
+              : undefined,
+        })),
+        createIntents: !readOnlyRequest,
+      })) as {
+        summary?: string;
+        lines?: Array<{
+          name: string;
+          status: string;
+          shortfall: number;
+          unit: string;
+          chosen?: { productName: string; totalPrice: number };
+          intent?: { id: string; status: string };
+        }>;
+      };
+      const committedIds: string[] = [];
+      for (const ln of planRes.lines ?? []) {
+        if (!readOnlyRequest && ln.intent?.status === "auto_eligible") {
+          const c = (await run("commit_order", {
+            intentId: ln.intent.id,
+            idempotencyKey: `agent-recipe-${ln.intent.id}`,
+          })) as { committedOrderId?: string };
+          if (c.committedOrderId) committedIds.push(c.committedOrderId);
+        }
+      }
+      const lineSummaries = (planRes.lines ?? []).map((ln) =>
+        ln.status === "covered"
+          ? `• ${ln.name}: covered in fridge`
+          : `• ${ln.name} (${ln.shortfall} ${ln.unit}): ${ln.chosen?.productName ?? ln.status}${ln.chosen ? ` · €${ln.chosen.totalPrice.toFixed(2)}` : ""}${ln.intent ? ` [${ln.intent.status}]` : ""}`,
+      );
+      const reply = [
+        planRes.summary ?? `Planned recipe ingredients for ${matchedRecipes.map((r) => r.name).join(", ")}.`,
+        ...lineSummaries,
+        committedIds.length > 0 ? `Auto-committed ${committedIds.length} order(s): ${committedIds.join(", ")}.` : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+      messages.push({ role: "assistant", content: reply });
+      return {
+        reply,
+        messages,
+        toolTrace,
+        provider: "heuristic",
+        model: "deterministic-fallback",
+      };
+    }
+
     const reply = `I need a clearer purchase request before I can order. ${parsed.clarificationRequired}`;
+    messages.push({ role: "assistant", content: reply });
+    return {
+      reply,
+      messages,
+      toolTrace,
+      provider: "heuristic",
+      model: "deterministic-fallback",
+    };
+  }
+
+  if (parsed.isMultiItem && Array.isArray(parsed.needs) && parsed.needs.length > 1) {
+    const batchRanked = (await run("rank_offers", { needs: parsed.needs })) as {
+      explanation?: string;
+      items?: Array<{
+        need: Need;
+        explanation?: string;
+        offers?: Array<{ productId: string; productName: string; canFulfil: boolean; totalPrice: number }>;
+      }>;
+    };
+    const items = batchRanked.items ?? [];
+    const chosenItems: Array<{ need: Need; offerProductId: string; productName: string; totalPrice: number }> = [];
+    const missingItems: string[] = [];
+
+    for (const entry of items) {
+      const pick = entry.offers?.find((o) => o.canFulfil) ?? entry.offers?.[0];
+      if (!pick) {
+        missingItems.push(`${entry.need.quantity} ${entry.need.unit} ${entry.need.productIntent}`);
+      } else {
+        chosenItems.push({
+          need: entry.need,
+          offerProductId: pick.productId,
+          productName: pick.productName,
+          totalPrice: pick.totalPrice,
+        });
+      }
+    }
+
+    if (chosenItems.length === 0) {
+      const reply = "No fulfilable Valio offers found for the requested items.";
+      messages.push({ role: "assistant", content: reply });
+      return {
+        reply,
+        messages,
+        toolTrace,
+        provider: "heuristic",
+        model: "deterministic-fallback",
+      };
+    }
+
+    const bundleSummary = chosenItems
+      .map(
+        (c, idx) =>
+          `${idx + 1}. **${c.need.quantity} ${c.need.unit} ${c.need.productIntent}** → ${c.productName} (€${c.totalPrice.toFixed(2)})`,
+      )
+      .join("\n");
+    const combinedEst = chosenItems.reduce((s, c) => s + c.totalPrice, 0);
+
+    if (readOnlyRequest) {
+      const reply = [
+        `Ranked ${chosenItems.length}-item bundle (combined €${combinedEst.toFixed(2)}):`,
+        bundleSummary,
+        missingItems.length ? `Unmatched: ${missingItems.join(", ")}.` : "",
+        "Read-only request: no quote or order intent was created.",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      messages.push({ role: "assistant", content: reply });
+      return {
+        reply,
+        messages,
+        toolTrace,
+        provider: "heuristic",
+        model: "deterministic-fallback",
+      };
+    }
+
+    const intentRes = (await run("create_order_intent", {
+      items: chosenItems.map((c) => ({ need: c.need, offerProductId: c.offerProductId })),
+    })) as {
+      intent?: {
+        id: string;
+        status: string;
+        totalPrice: number;
+        snapshotHash: string;
+        runId: string;
+        policy: { decision: string; failingRules: string[]; reasons: string[] };
+      };
+    };
+
+    const intent = intentRes.intent;
+    if (!intent) {
+      const reply = "Failed to create consolidated multi-item order intent.";
+      messages.push({ role: "assistant", content: reply });
+      return {
+        reply,
+        messages,
+        toolTrace,
+        provider: "heuristic",
+        model: "deterministic-fallback",
+      };
+    }
+
+    if (intent.status === "auto_eligible") {
+      const committed = (await run("commit_order", {
+        intentId: intent.id,
+        idempotencyKey: `agent-${intent.id}`,
+      })) as { committedOrderId?: string };
+      const reply = [
+        `Bundled & ordered ${chosenItems.length} items in one consolidated order:`,
+        bundleSummary,
+        missingItems.length ? `Note — no catalog match for: ${missingItems.join(", ")}.` : "",
+        `Policy: auto_commit. Committed order ${committed.committedOrderId ?? "(see tools)"} · Total €${intent.totalPrice.toFixed(2)}.`,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      messages.push({ role: "assistant", content: reply });
+      return {
+        reply,
+        messages,
+        toolTrace,
+        provider: "heuristic",
+        model: "deterministic-fallback",
+      };
+    }
+
+    const reply = [
+      `Prepared ${chosenItems.length}-item bundle intent ${intent.id} (€${intent.totalPrice.toFixed(2)}):`,
+      bundleSummary,
+      missingItems.length ? `Note — no catalog match for: ${missingItems.join(", ")}.` : "",
+      `Policy: ${intent.policy.decision}. Failing rules: ${intent.policy.failingRules.join(", ") || "none"}.`,
+      ...intent.policy.reasons,
+      `Open Approval to review and authorize this multi-item bundle.`,
+      `Snapshot: ${intent.snapshotHash.slice(0, 16)}… · Run: ${intent.runId}`,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
     messages.push({ role: "assistant", content: reply });
     return {
       reply,

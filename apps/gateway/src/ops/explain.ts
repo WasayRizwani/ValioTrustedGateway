@@ -135,6 +135,20 @@ function timelineItem(e: AuditEvent, intent: OrderIntent): ExplainTimelineItem |
       return { at, actor: "system", event: "Replaced by a newer proposal", why: "A newer proposal for the same need took its place." };
     case "committed":
       return { at, actor: "agent", event: `Order ${p.orderId} placed for ${eur(p.totalPrice)}`, why: "All checks passed and the quote was still valid." };
+    case "fallback_cascade_executed":
+      return {
+        at,
+        actor: "agent",
+        event: `Pre-authorized backup cascade: swapped ${p.droppedProductName ?? p.droppedProductId} → ${p.backupProductName ?? p.backupProductId} (${eur(p.newTotalPrice ?? 0)})`,
+        why: "Primary SKU failed live availability at commit; switched to the backup SKU pre-authorized by the buyer.",
+      };
+    case "delivery_received":
+      return {
+        at,
+        actor: "human",
+        event: `Delivery ${p.orderId} received into kitchen stock`,
+        why: "On-hand kitchen inventory was updated upon physical receipt.",
+      };
     default:
       return null;
   }
@@ -189,8 +203,17 @@ export function explainOrder(intentId: string, customerId: string): OrderExplana
   const failedText = failing.map(failedPhrase);
   const by: "agent" | "human" = decidedByHuman || intent.policy.decision === "pending_approval" ? "human" : "agent";
   const parts: string[] = [];
-  parts.push(`The agent looked for ${intent.need.quantity} ${intent.need.unit} of ${intent.need.productIntent} needed by ${intent.need.neededBy}${meta ? ` and compared ${meta.consideredOffers} offer(s)` : ""}.`);
-  if (line) parts.push(`It chose ${line.productName} at ${eur(intent.totalPrice)}${chosenWhy[0] ? `, because ${chosenWhy[0].charAt(0).toLowerCase()}${chosenWhy[0].slice(1).replace(/\.$/, "")}` : ""}.`);
+  if (intent.basket.length > 1) {
+    const reqDesc =
+      meta?.itemNeeds && meta.itemNeeds.length > 1
+        ? meta.itemNeeds.map((n) => `${n.quantity} ${n.unit} of ${n.productIntent}`).join(" + ")
+        : `${intent.basket.length} items`;
+    parts.push(`The agent sourced a ${intent.basket.length}-item basket (${reqDesc}) needed by ${intent.need.neededBy}${meta ? ` and compared ${meta.consideredOffers} offer(s)` : ""}.`);
+    parts.push(`It assembled ${intent.basket.map((b) => `${b.packs}× ${b.productName} (${eur(b.totalPrice)})`).join(" + ")} for a combined total of ${eur(intent.totalPrice)}.`);
+  } else {
+    parts.push(`The agent looked for ${intent.need.quantity} ${intent.need.unit} of ${intent.need.productIntent} needed by ${intent.need.neededBy}${meta ? ` and compared ${meta.consideredOffers} offer(s)` : ""}.`);
+    if (line) parts.push(`It chose ${line.productName} at ${eur(intent.totalPrice)}${chosenWhy[0] ? `, because ${chosenWhy[0].charAt(0).toLowerCase()}${chosenWhy[0].slice(1).replace(/\.$/, "")}` : ""}.`);
+  }
   if (intent.policy.decision === "auto_commit") parts.push("Every rule in the purchasing mandate was met, so the agent was allowed to buy without asking.");
   else if (intent.policy.decision === "blocked") parts.push(`The mandate blocked this order: ${failedText.join("; ") || "policy"}.`);
   else parts.push(`A person had to decide because ${failedText.join("; ") || "the mandate requires approval"}.`);

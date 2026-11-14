@@ -1,5 +1,10 @@
 import type { BasketLine, Mandate, Need, Offer, PolicyVerdict } from "@tta/shared";
-import { getProduct, allergenConflicts } from "../catalog/index.js";
+import {
+  getProduct,
+  allergenConflicts,
+  extractMandateExcludedAllergens,
+  expandExcludedAllergens,
+} from "../catalog/index.js";
 import type { SpendSummary } from "./spend.js";
 
 const DAIRY_SUBSTRINGS = [
@@ -13,9 +18,12 @@ export function isDairyText(text: string): boolean {
   return DAIRY_SUBSTRINGS.some((w) => t.includes(w)) || VOI_RE.test(t);
 }
 
-function lineRequiresLactoseFree(line: BasketLine, need: Need): boolean {
-  if (need.constraints.lactoseFree) return true;
-  return isDairyText(`${need.productIntent} ${line.productName}`);
+function lineRequiresLactoseFree(line: BasketLine, lineNeed: Need, isMultiLine: boolean): boolean {
+  if (lineNeed.constraints.lactoseFree) {
+    // In a multi-line order without explicit per-line needs, only dairy lines inherit a summary lactose-free flag.
+    return isMultiLine ? isDairyText(`${line.productName}`) || isDairyText(lineNeed.productIntent) : true;
+  }
+  return isDairyText(`${lineNeed.productIntent} ${line.productName}`);
 }
 
 function isLactoseFree(line: BasketLine): boolean {
@@ -28,12 +36,13 @@ export function evaluatePolicy(
   mandate: Mandate,
   need: Need,
   lines: BasketLine[],
-  options?: { isSubstitution?: boolean; partialFulfil?: boolean; spend?: SpendSummary },
+  options?: { isSubstitution?: boolean; partialFulfil?: boolean; spend?: SpendSummary; lineNeeds?: Need[] },
 ): PolicyVerdict {
   const reasons: string[] = [];
   const failingRules: string[] = [];
   const total = lines.reduce((s, l) => s + l.totalPrice, 0);
-  const totalQty = lines.reduce((s, l) => s + l.totalQuantity, 0);
+  const hasExplicitLineNeeds = Boolean(options?.lineNeeds && options.lineNeeds.length === lines.length);
+  const needForLine = (idx: number): Need => options?.lineNeeds?.[idx] ?? need;
 
   if (new Date(mandate.expiresAt).getTime() < Date.now()) {
     failingRules.push("mandate_expired");
@@ -44,11 +53,13 @@ export function evaluatePolicy(
     };
   }
 
-  // Lactose restriction applies to dairy lines (or any line the need marks
+  // Lactose restriction applies to dairy lines (or any line its own need marks
   // lactose-free) — not to bananas or eggs. Prefer catalog labels over names.
   if (mandate.allergenRestrictions.includes("must_be_lactose_free")) {
-    for (const line of lines) {
-      if (!lineRequiresLactoseFree(line, need)) continue;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const ln = needForLine(i);
+      if (!lineRequiresLactoseFree(line, ln, lines.length > 1 && !hasExplicitLineNeeds)) continue;
       if (!isLactoseFree(line)) {
         failingRules.push("allergen_restrictions");
         reasons.push(
@@ -57,13 +68,25 @@ export function evaluatePolicy(
       }
     }
   }
-  // Explicitly excluded allergens: declared CONTAINS or MAY CONTAIN both fail (school / hospital rules).
-  if (need.constraints.excludeAllergens?.length) {
-    for (const line of lines) {
-      for (const c of allergenConflicts({ contains: line.allergens, mayContain: line.mayContain }, need.constraints.excludeAllergens)) {
-        failingRules.push("allergen_restrictions");
-        reasons.push(`${line.productName}: ${c.level} ${c.found} (excluded: ${c.excluded})`);
-      }
+  // Explicitly excluded allergens (from both mandate Kitchen Rules and per-need constraints):
+  // declared CONTAINS or MAY CONTAIN both fail (school / hospital / hotel safety rules).
+  const mandateExcluded = extractMandateExcludedAllergens(mandate.allergenRestrictions);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const ln = needForLine(i);
+    const combinedExcluded = [
+      ...new Set([
+        ...mandateExcluded,
+        ...expandExcludedAllergens(ln.constraints.excludeAllergens),
+      ]),
+    ];
+    if (combinedExcluded.length === 0) continue;
+    const catProd = getProduct(line.productId);
+    const contains = line.allergens?.length ? line.allergens : (catProd?.allergens ?? []);
+    const mayContain = line.mayContain?.length ? line.mayContain : (catProd?.mayContain ?? []);
+    for (const c of allergenConflicts({ contains, mayContain }, combinedExcluded)) {
+      failingRules.push("allergen_restrictions");
+      reasons.push(`${line.productName}: ${c.level} ${c.found} (excluded: ${c.excluded})`);
     }
   }
 
@@ -99,15 +122,16 @@ export function evaluatePolicy(
     }
   }
 
-  if (need.constraints.maxPricePerUnit !== undefined) {
-    for (const line of lines) {
-      const perUnit = line.comparisonPrice ?? (line.totalQuantity > 0 ? line.totalPrice / line.totalQuantity : null);
-      if (perUnit !== null && perUnit > need.constraints.maxPricePerUnit) {
-        failingRules.push("over_unit_price");
-        reasons.push(
-          `${line.productName}: €${perUnit.toFixed(2)}/unit exceeds max €${need.constraints.maxPricePerUnit}/unit`,
-        );
-      }
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const maxPpu = needForLine(i).constraints.maxPricePerUnit;
+    if (maxPpu === undefined) continue;
+    const perUnit = line.comparisonPrice ?? (line.totalQuantity > 0 ? line.totalPrice / line.totalQuantity : null);
+    if (perUnit !== null && perUnit > maxPpu) {
+      failingRules.push("over_unit_price");
+      reasons.push(
+        `${line.productName}: €${perUnit.toFixed(2)}/unit exceeds max €${maxPpu}/unit`,
+      );
     }
   }
 
@@ -140,21 +164,31 @@ export function evaluatePolicy(
     }
   }
 
-  const qtyCap =
-    mandate.maxQuantities?.[need.unit] ??
-    (mandate.maxQuantity.unit === need.unit ? mandate.maxQuantity.value : undefined);
-  if (qtyCap !== undefined && need.quantity > qtyCap) {
-    failingRules.push("over_quantity");
-    reasons.push(
-      `Requested ${need.quantity} ${need.unit} exceeds mandate max ${qtyCap} ${need.unit}`,
-    );
+  // Check quantity caps per unit across all requested needs in this order
+  const needsToCheck = options?.lineNeeds?.length ? options.lineNeeds : [need];
+  const qtyByUnit = new Map<Need["unit"], number>();
+  for (const n of needsToCheck) {
+    qtyByUnit.set(n.unit, (qtyByUnit.get(n.unit) ?? 0) + n.quantity);
+  }
+  for (const [unit, sumQty] of qtyByUnit.entries()) {
+    const qtyCap =
+      mandate.maxQuantities?.[unit] ??
+      (mandate.maxQuantity.unit === unit ? mandate.maxQuantity.value : undefined);
+    if (qtyCap !== undefined && sumQty > qtyCap) {
+      failingRules.push("over_quantity");
+      reasons.push(
+        `Requested ${sumQty} ${unit} exceeds mandate max ${qtyCap} ${unit}`,
+      );
+    }
   }
 
-  for (const line of lines) {
-    if (line.availableDate && line.availableDate > need.neededBy) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineDeadline = needForLine(i).neededBy;
+    if (line.availableDate && line.availableDate > lineDeadline) {
       failingRules.push("late_delivery");
       reasons.push(
-        `${line.productId} available ${line.availableDate} after needed ${need.neededBy}`,
+        `${line.productId} available ${line.availableDate} after needed ${lineDeadline}`,
       );
     }
     if (line.deliveryReliability == null) {

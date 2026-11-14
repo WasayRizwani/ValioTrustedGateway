@@ -9,9 +9,13 @@ export const NeedSchema = z.object({
     .object({
       lactoseFree: z.boolean().optional(),
       organic: z.boolean().optional(),
+      vegan: z.boolean().optional(),
+      origin: z.string().optional(),
       keywords: z.array(z.string()).optional(),
       excludeAllergens: z.array(z.string()).optional(),
       maxPricePerUnit: z.number().optional(),
+      minReliability: z.number().min(0).max(1).optional(),
+      maxCarbonKgPerKg: z.number().min(0).optional(),
     })
     .default({}),
   clarificationRequired: z.string().optional(),
@@ -22,6 +26,12 @@ export const NeedSchema = z.object({
   ingredientUnit: z.enum(["litre", "kg", "each", "pack"]).optional(),
 });
 export type Need = z.infer<typeof NeedSchema>;
+
+export const ComplexNeedResultSchema = z.object({
+  needs: z.array(NeedSchema).min(1),
+  isMultiItem: z.boolean(),
+});
+export type ComplexNeedResult = z.infer<typeof ComplexNeedResultSchema>;
 
 export const MandateSchema = z.object({
   mandateId: z.string(),
@@ -264,9 +274,12 @@ export const QuoteSchema = z.object({
   quoteId: z.string(),
   customerId: z.string(),
   need: NeedSchema,
-  /** Priced options for the need (one per shortlisted SKU); the first is the primary line. */
+  /** Per-line needs when this quote represents a consolidated multi-item basket. */
+  itemNeeds: z.array(NeedSchema).optional(),
+  isMultiItemBasket: z.boolean().optional(),
+  /** Priced options for the need (one per shortlisted SKU, or one per basket item when isMultiItemBasket is true). */
   lines: z.array(BasketLineSchema),
-  /** Total of the primary (first) line. */
+  /** Total of the primary (first) line, or sum of all lines when isMultiItemBasket is true. */
   totalPrice: z.number(),
   currency: z.string(),
   issuedAt: z.string(),

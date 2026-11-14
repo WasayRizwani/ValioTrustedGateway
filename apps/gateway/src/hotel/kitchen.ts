@@ -707,25 +707,44 @@ export function recordCommittedOrder(
     quantity: number;
     unit: string;
     totalEur: number;
+    lines?: Array<{
+      ingredientId?: string;
+      productName: string;
+      quantity: number;
+      unit: string;
+      totalEur: number;
+    }>;
   },
 ) {
   ensureSeeded(customerId);
   const k = getKitchen(customerId);
-  const ingredientId = order.ingredientId ?? (k ? inferIngredientId(k.inventory, order.productName) : undefined);
+  const resolvedLines =
+    order.lines && order.lines.length > 0
+      ? order.lines.map((l) => ({
+          productName: l.productName,
+          quantity: l.quantity,
+          unit: l.unit,
+          totalEur: l.totalEur,
+          ingredientId:
+            l.ingredientId ?? (k ? inferIngredientId(k.inventory, l.productName) : undefined),
+        }))
+      : [
+          {
+            productName: order.productName,
+            quantity: order.quantity,
+            unit: order.unit,
+            totalEur: order.totalEur,
+            ingredientId:
+              order.ingredientId ??
+              (k ? inferIngredientId(k.inventory, order.productName) : undefined),
+          },
+        ];
   const entry: PastOrder = {
     orderId: order.orderId,
     orderedAt: iso().slice(0, 10),
     status: "committed",
     intentId: order.intentId,
-    lines: [
-      {
-        productName: order.productName,
-        quantity: order.quantity,
-        unit: order.unit,
-        totalEur: order.totalEur,
-        ingredientId,
-      },
-    ],
+    lines: resolvedLines,
   };
   db()
     .prepare(

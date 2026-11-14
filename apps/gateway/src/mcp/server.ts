@@ -9,7 +9,7 @@ import { NeedSchema, SignedClaimSchema, PreferencesSchema } from "@tta/shared";
 import { randomUUID } from "node:crypto";
 import { authenticate, getMandate } from "../auth/customers.js";
 import { searchProducts, searchFromNeed, loadCatalog } from "../catalog/index.js";
-import { buildOffers, explainOffers } from "../catalog/offers.js";
+import { buildOffers, buildOffersBatch, explainOffers } from "../catalog/offers.js";
 import { getPrices, getAvailability } from "../valio/client.js";
 import { verifyClaim, getPublicKeyPem } from "../claims/sign.js";
 import {
@@ -20,9 +20,9 @@ import {
   rejectOrder,
   commitOrder,
 } from "../orders/store.js";
-import { createQuote, getQuote } from "../orders/quotes.js";
+import { createMultiItemQuote, createQuote, getQuote } from "../orders/quotes.js";
 import { getAuditTrail, verifyAuditChain, appendAudit } from "../audit/chain.js";
-import { parseNeedFromText } from "../need/parse.js";
+import { parseComplexNeedFromText, parseNeedFromText } from "../need/parse.js";
 import {
   getInventory,
   getRecipes,
@@ -161,18 +161,18 @@ export async function startMcpServer() {
       },
       {
         name: "rank_offers",
-        description: "Deterministic offer ranking for a structured Need",
+        description: "Deterministic offer ranking for one structured Need (`need`) or a multi-item bundle (`needs` array)",
         inputSchema: {
           type: "object",
           properties: {
             need: { type: "object" },
+            needs: { type: "array", items: { type: "object" } },
             preferences: {
               type: "object",
               description: "Optional non-negative weights {price, reliability, carbon, delivery}; normalised. Omit for default ranking.",
               properties: { price: { type: "number" }, reliability: { type: "number" }, carbon: { type: "number" }, delivery: { type: "number" } },
             },
           },
-          required: ["need"],
         },
       },
       {
@@ -192,14 +192,21 @@ export async function startMcpServer() {
       {
         name: "request_quote",
         description:
-          "Request a firm-price quote for a need (optionally for shortlisted productIds). Price is guaranteed until validUntil (default 30 min); availability is not held. Next: create_order_intent with quoteId.",
+          "Request a firm-price quote for one need (`need`) or a multi-item bundle (`items: [{ need, productId }]`). Price is guaranteed until validUntil (default 30 min); availability is not held. Next: create_order_intent with quoteId.",
         inputSchema: {
           type: "object",
           properties: {
             need: { type: "object" },
             productIds: { type: "array", items: { type: "string" } },
+            items: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { need: { type: "object" }, productId: { type: "string" } },
+                required: ["need"],
+              },
+            },
           },
-          required: ["need"],
         },
       },
       {
@@ -210,13 +217,21 @@ export async function startMcpServer() {
       {
         name: "create_order_intent",
         description:
-          "Create fixed-price order intent (not a commitment). Pass quoteId to use a firm quote's lines and prices (no re-pricing; need optional then).",
+          "Create fixed-price order intent (not a commitment) for one item (`need`), a multi-item bundle (`items: [{ need, offerProductId }]`), or from `quoteId` (no re-pricing).",
         inputSchema: {
           type: "object",
           properties: {
             need: { type: "object" },
             offerProductId: { type: "string" },
             quoteId: { type: "string" },
+            items: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { need: { type: "object" }, offerProductId: { type: "string" } },
+                required: ["need"],
+              },
+            },
           },
         },
       },
@@ -423,10 +438,25 @@ export async function startMcpServer() {
             ),
           };
         case "rank_offers": {
+          const preferences = args.preferences ? PreferencesSchema.parse(args.preferences) : undefined;
+          if (Array.isArray(args.needs) && args.needs.length > 0) {
+            const parsedNeeds = args.needs.map((n) => NeedSchema.parse(n));
+            const batch = await buildOffersBatch(auth.customerId, parsedNeeds, {
+              includeSubstitutions: true,
+              preferences,
+              mandate,
+            });
+            return {
+              isMultiItem: parsedNeeds.length > 1,
+              items: batch.items,
+              offers: batch.items[0]?.offers ?? [],
+              explanation: batch.combinedExplanation,
+            };
+          }
           const need = NeedSchema.parse(args.need);
           const offers = await buildOffers(auth.customerId, need, {
             includeSubstitutions: true,
-            preferences: args.preferences ? PreferencesSchema.parse(args.preferences) : undefined,
+            preferences,
           });
           return { offers, explanation: explainOffers(offers, need, mandate) };
         }
@@ -436,19 +466,51 @@ export async function startMcpServer() {
           return mandate;
         case "create_order_intent": {
           if (!mandate) throw new Error("no mandate");
+          if (Array.isArray(args.items) && args.items.length > 0) {
+            const items = (args.items as Array<{ need: unknown; offerProductId?: string }>).map((it) => ({
+              need: NeedSchema.parse(it.need),
+              offerProductId: typeof it.offerProductId === "string" ? it.offerProductId : undefined,
+            }));
+            return createOrderIntent({
+              customerId: auth.customerId,
+              mandate,
+              items,
+            });
+          }
           const quoteId = args.quoteId as string | undefined;
+          const quote = quoteId ? getQuote(quoteId, auth.customerId) : undefined;
+          if (quoteId && quote?.isMultiItemBasket && quote.lines.length > 1) {
+            return createOrderIntent({
+              customerId: auth.customerId,
+              mandate,
+              quoteId,
+              offerProductId: args.offerProductId as string | undefined,
+            });
+          }
           return createOrderIntent({
             customerId: auth.customerId,
             mandate,
-            need: NeedSchema.parse(args.need ?? (quoteId ? getQuote(quoteId, auth.customerId)?.need : undefined)),
+            need: NeedSchema.parse(args.need ?? quote?.need),
             offerProductId: args.offerProductId as string | undefined,
             quoteId,
           });
         }
-        case "request_quote":
+        case "request_quote": {
+          if (Array.isArray(args.items) && args.items.length > 0) {
+            const items = (args.items as Array<{ need: unknown; productId?: string; offerProductId?: string }>).map((it) => ({
+              need: NeedSchema.parse(it.need),
+              productId: typeof it.offerProductId === "string"
+                ? it.offerProductId
+                : typeof it.productId === "string"
+                  ? it.productId
+                  : undefined,
+            }));
+            return createMultiItemQuote(auth.customerId, items);
+          }
           return createQuote(auth.customerId, NeedSchema.parse(args.need), {
             productIds: Array.isArray(args.productIds) ? (args.productIds as string[]) : undefined,
           });
+        }
         case "get_quote":
           return getQuote(String(args.quoteId), auth.customerId) ?? { error: "not_found" };
         case "list_pending_approvals":
@@ -491,8 +553,17 @@ export async function startMcpServer() {
           };
         case "verify_audit_chain":
           return verifyAuditChain(String(args.runId), auth.customerId);
-        case "parse_need":
-          return parseNeedFromText(String(args.text), args.neededBy as string | undefined);
+        case "parse_need": {
+          const complex = parseComplexNeedFromText(String(args.text), args.neededBy as string | undefined);
+          if ("clarificationRequired" in complex) {
+            return parseNeedFromText(String(args.text), args.neededBy as string | undefined);
+          }
+          return {
+            ...complex.needs[0],
+            needs: complex.needs,
+            isMultiItem: complex.isMultiItem,
+          };
+        }
         case "get_public_key":
           return { pem: getPublicKeyPem(), keyId: process.env.CLAIM_KEY_ID };
         case "plan_menu_sourcing": {

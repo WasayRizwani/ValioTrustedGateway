@@ -23,7 +23,7 @@ loadEnvFile();
 
 export const config = {
   root,
-  port: Number(process.env.GATEWAY_PORT ?? 8787),
+  port: Number(process.env.PORT ?? process.env.GATEWAY_PORT ?? 8787),
   publicUrl: process.env.GATEWAY_PUBLIC_URL ?? "http://localhost:8787",
   valioBaseUrl: process.env.VALIO_BASE_URL ?? "https://junction26.valioaimo.fi",
   valioApiKey: process.env.VALIO_API_KEY ?? "",

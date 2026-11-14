@@ -99,7 +99,7 @@ test("buildOffers: carbon-heavy preferences change ranking, defaults do not (stu
     return new Response(JSON.stringify({ currency: "EUR", products }), { status: 200 });
   }) as unknown as typeof fetch;
   try {
-    const n = { ...need, neededBy: "2026-11-16" };
+    const n: Need = { ...need, unit: "litre", neededBy: "2026-11-16" };
     const base1 = await buildOffers("HOTEL-001", n, { productIds: ids, now: new Date(NOW) });
     const base2 = await buildOffers("HOTEL-001", n, { productIds: ids, now: new Date(NOW), preferences: {} });
     assert.deepEqual(base1.map((o) => o.productId), base2.map((o) => o.productId));

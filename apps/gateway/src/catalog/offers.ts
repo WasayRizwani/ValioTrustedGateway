@@ -6,11 +6,21 @@ import {
   getReliability,
   getValioSubstitutes,
   allergenConflicts,
+  extractMandateExcludedAllergens,
+  expandExcludedAllergens,
   isLactoseFree,
   searchFromNeed,
   type Product,
 } from "./index.js";
-import { getAvailability, getPrices } from "../valio/client.js";
+import {
+  getAvailability,
+  getPrices,
+  type AvailabilityResult,
+  type PriceResult,
+} from "../valio/client.js";
+import { getMandate } from "../auth/customers.js";
+import { isDairyText } from "../policy/engine.js";
+import { isDeterministicallyCompatible } from "./substituteJudge.js";
 
 function dateOnly(d: string): string {
   return d.slice(0, 10);
@@ -67,11 +77,8 @@ export function computeCriteria(offers: Offer[], need: Need, nowMs: number): voi
   const dMin = Math.min(...dates), dMax = Math.max(...dates);
   const carbons = offers.map((o) => o.carbonKgPerKg).filter((c): c is number => c != null);
   const cMin = Math.min(...carbons), cMax = Math.max(...carbons);
-  const cheapestByCat = new Map<string, number>();
-  for (const o of offers) {
-    const k = o.category ?? "";
-    if (o.totalPrice > 0) cheapestByCat.set(k, Math.min(cheapestByCat.get(k) ?? Infinity, o.totalPrice));
-  }
+  const validPrices = offers.map((o) => o.totalPrice).filter((p) => p > 0);
+  const cheapestOverall = validPrices.length ? Math.min(...validPrices) : null;
   for (const o of offers) {
     o.criteria = {
       price: o.totalPrice,
@@ -80,8 +87,7 @@ export function computeCriteria(offers: Offer[], need: Need, nowMs: number): voi
       carbonKgPerKg: o.carbonKgPerKg,
       certifications: o.certifications,
     };
-    const cheapest = cheapestByCat.get(o.category ?? "");
-    const price = cheapest && o.totalPrice > 0 ? cheapest / o.totalPrice : 0.5;
+    const price = cheapestOverall && o.totalPrice > 0 ? cheapestOverall / o.totalPrice : 0.5;
     const earliness = dMax === dMin ? 1 : 1 - (eff(o) - dMin) / (dMax - dMin);
     const delivery = isOnTime(o, need.neededBy, nowMs) ? earliness : earliness * 0.3;
     const carbon =
@@ -133,8 +139,17 @@ export async function buildOffers(
     includeSubstitutions?: boolean;
     /** Optional criterion weights; when absent the default ranking is unchanged. */
     preferences?: Preferences;
+    /** Optional mandate so offer ranking prefers allergen-safe products under Kitchen Rules. */
+    mandate?: Mandate | null;
     /** Injectable clock (tests). */
     now?: Date;
+    /** Pre-fetched Valio maps from buildOffersBatch to avoid duplicate upstream requests. */
+    preloaded?: {
+      prices: Map<string, PriceResult>;
+      avails: Map<string, AvailabilityResult>;
+    };
+    /** Secondary search hints (e.g. ingredient synonym phrases like "oat flakes" for "rolled oats"). */
+    extraSearchHints?: string[];
   },
 ): Promise<Offer[]> {
   const nowMs = (options?.now ?? new Date()).getTime();
@@ -146,31 +161,69 @@ export async function buildOffers(
       .map((id) => getProduct(id))
       .filter((p): p is Product => !!p);
   } else {
-    candidates = searchFromNeed(need, 20);
+    candidates = searchFromNeed(need, 20, options?.extraSearchHints);
   }
 
   // Hard constraints come from the catalog's own facts, not from product-name guesses.
   if (need.constraints.lactoseFree) candidates = candidates.filter((p) => isLactoseFree(p));
   if (need.constraints.excludeAllergens?.length) {
+    const excl = expandExcludedAllergens(need.constraints.excludeAllergens);
     candidates = candidates.filter(
       (p) =>
         allergenConflicts(
           { contains: p.allergens ?? [], mayContain: p.mayContain ?? [] },
-          need.constraints.excludeAllergens ?? [],
+          excl,
         ).length === 0,
     );
+  }
+
+  // Prefer allergen-safe candidates when mandate rules are active (without dropping explicit test productIds
+  // unless `options.mandate` was explicitly supplied).
+  const effectiveMandate =
+    options?.mandate !== undefined
+      ? options.mandate
+      : !options?.productIds?.length
+        ? getMandate(customerId)
+        : null;
+  const mandateExcluded = extractMandateExcludedAllergens(effectiveMandate?.allergenRestrictions);
+  const mandateMustLf = Boolean(effectiveMandate?.allergenRestrictions?.includes("must_be_lactose_free"));
+  const candidateSafeForMandate = (p: Product): boolean => {
+    if (
+      mandateExcluded.length > 0 &&
+      allergenConflicts({ contains: p.allergens ?? [], mayContain: p.mayContain ?? [] }, mandateExcluded).length > 0
+    ) {
+      return false;
+    }
+    if (mandateMustLf && (need.constraints.lactoseFree || isDairyText(`${need.productIntent} ${p.name}`)) && !isLactoseFree(p)) {
+      return false;
+    }
+    return true;
+  };
+  if (effectiveMandate && !options?.productIds?.length && (mandateExcluded.length > 0 || mandateMustLf)) {
+    const safeOnly = candidates.filter(candidateSafeForMandate);
+    if (safeOnly.length > 0) candidates = safeOnly;
   }
   const searched = candidates;
 
   if (candidates.length === 0) return [];
 
   const ids = candidates.map((c) => c.productId);
-  const [prices, avails] = await Promise.all([
-    getPrices(customerId, need.neededBy, ids),
-    getAvailability(customerId, need.neededBy, ids),
-  ]);
-  const priceMap = new Map(prices.map((p) => [p.productId, p]));
-  const availMap = new Map(avails.map((a) => [a.productId, a]));
+  let priceMap: Map<string, PriceResult>;
+  let availMap: Map<string, AvailabilityResult>;
+  if (
+    options?.preloaded &&
+    ids.every((id) => options.preloaded!.prices.has(id) && options.preloaded!.avails.has(id))
+  ) {
+    priceMap = options.preloaded.prices;
+    availMap = options.preloaded.avails;
+  } else {
+    const [prices, avails] = await Promise.all([
+      getPrices(customerId, need.neededBy, ids),
+      getAvailability(customerId, need.neededBy, ids),
+    ]);
+    priceMap = new Map(prices.map((p) => [p.productId, p]));
+    availMap = new Map(avails.map((a) => [a.productId, a]));
+  }
 
   const offers: Offer[] = [];
   for (const product of candidates) {
@@ -246,6 +299,10 @@ export async function buildOffers(
       score += Math.max(0, 5 - carbonKgPerKg);
       softParts += Math.max(0, 5 - carbonKgPerKg);
       scoreReasons.push(`Carbon ~${carbonKgPerKg.toFixed(2)} kg/kg`);
+    }
+    if (effectiveMandate && !candidateSafeForMandate(product)) {
+      score -= 60;
+      scoreReasons.push("Conflicts with mandate allergen / lactose rule");
     }
     const offer: Offer = {
       productId: product.productId,
@@ -331,29 +388,47 @@ export async function buildOffers(
 
   if (options?.includeSubstitutions && offers.length > 0) {
     const labels: Array<"best" | "better" | "good"> = ["best", "better", "good"];
-    const anyFull = offers.some((o) => o.canFulfil);
+    const anchorCat = offers[0]?.category ?? null;
+    const isSubCompatible = (o: Offer) =>
+      Boolean(options?.productIds?.length) ||
+      isDeterministicallyCompatible({
+        queryText: need.productIntent,
+        anchorCategory: anchorCat,
+        candidate: {
+          productId: o.productId,
+          name: o.productName,
+          category: o.category,
+          isValioDeclaredSub: o.substitutionSource === "valio_catalog",
+        },
+        veganRequested: need.constraints.vegan,
+      }).ok;
+
+    const anyFull = offers.some((o) => o.canFulfil && isSubCompatible(o));
     if (!anyFull) {
-      // Partial-availability path: label top 3 partial options as GBB alternatives
-      offers.slice(0, 3).forEach((o, i) => {
-        o.isSubstitution = true;
-        o.substitutionLabel = labels[i];
-        o.scoreReasons = [
-          `Partial availability · substitution (${labels[i]})`,
-          ...o.scoreReasons,
-        ];
-      });
+      // Partial-availability path: label top 3 compatible partial options as GBB alternatives
+      offers
+        .filter(isSubCompatible)
+        .slice(0, 3)
+        .forEach((o, i) => {
+          o.isSubstitution = true;
+          o.substitutionLabel = labels[i];
+          o.scoreReasons = [
+            `Partial availability · substitution (${labels[i]})`,
+            ...o.scoreReasons,
+          ];
+        });
     } else if (!offers[0].canFulfil) {
-      // Primary ranked can't fulfil — mark fulfilable alternatives as GBB
-      const fulfilable = offers.filter((o) => o.canFulfil).slice(0, 3);
+      // Primary ranked can't fulfil — mark fulfilable compatible alternatives as GBB
+      const fulfilable = offers.filter((o) => o.canFulfil && isSubCompatible(o)).slice(0, 3);
       fulfilable.forEach((o, i) => {
         o.isSubstitution = true;
         o.substitutionLabel = labels[i];
         o.scoreReasons = [`Substitution (${labels[i]})`, ...o.scoreReasons];
       });
     } else if (offers.length >= 2) {
-      // Still surface next-best fulfilable options as GBB for explainability
+      // Still surface next-best fulfilable compatible options as GBB for explainability
       offers
-        .filter((o) => o.canFulfil)
+        .filter((o) => o.canFulfil && isSubCompatible(o))
         .slice(0, 3)
         .forEach((o, i) => {
           o.substitutionLabel = labels[i];
@@ -428,4 +503,115 @@ export function explainOffers(offers: Offer[], need: Need, mandate?: Mandate | n
     );
   }
   return lines.join(" ");
+}
+
+export type BatchOfferItem = {
+  need: Need;
+  offers: Offer[];
+  explanation: string;
+};
+
+/**
+ * Rank offers for multiple Needs in one coordinated batch.
+ * Groups shortlisted SKUs by neededBy date so Valio price/availability APIs are called once per date.
+ */
+export async function buildOffersBatch(
+  customerId: string,
+  needs: Need[],
+  options?: {
+    includeSubstitutions?: boolean;
+    preferences?: Preferences;
+    mandate?: Mandate | null;
+    now?: Date;
+  },
+): Promise<{ items: BatchOfferItem[]; combinedExplanation: string }> {
+  if (needs.length === 0) return { items: [], combinedExplanation: "No items requested." };
+  if (needs.length === 1) {
+    const offers = await buildOffers(customerId, needs[0], {
+      includeSubstitutions: options?.includeSubstitutions ?? true,
+      preferences: options?.preferences,
+      mandate: options?.mandate,
+      now: options?.now,
+    });
+    const explanation = explainOffers(offers, needs[0], options?.mandate);
+    return {
+      items: [{ need: needs[0], offers, explanation }],
+      combinedExplanation: explanation,
+    };
+  }
+
+  // Shortlist per need; keep each date-bucket <= 25 unique SKUs to stay light on upstream Valio APIs
+  const perNeedCap = Math.max(4, Math.min(12, Math.floor(24 / needs.length)));
+  const shortlistedByIdx: Product[][] = needs.map((need) => {
+    let cands = searchFromNeed(need, perNeedCap);
+    if (need.constraints.lactoseFree) cands = cands.filter((p) => isLactoseFree(p));
+    if (need.constraints.excludeAllergens?.length) {
+      cands = cands.filter(
+        (p) =>
+          allergenConflicts(
+            { contains: p.allergens ?? [], mayContain: p.mayContain ?? [] },
+            need.constraints.excludeAllergens ?? [],
+          ).length === 0,
+      );
+    }
+    return cands.slice(0, perNeedCap);
+  });
+
+  const idsByDate = new Map<string, Set<string>>();
+  needs.forEach((need, idx) => {
+    const set = idsByDate.get(need.neededBy) ?? new Set<string>();
+    for (const c of shortlistedByIdx[idx]) set.add(c.productId);
+    idsByDate.set(need.neededBy, set);
+  });
+
+  const preloadedByDate = new Map<
+    string,
+    { prices: Map<string, PriceResult>; avails: Map<string, AvailabilityResult> }
+  >();
+
+  for (const [date, idSet] of idsByDate.entries()) {
+    const ids = [...idSet];
+    if (!ids.length) continue;
+    const [prices, avails] = await Promise.all([
+      getPrices(customerId, date, ids),
+      getAvailability(customerId, date, ids),
+    ]);
+    preloadedByDate.set(date, {
+      prices: new Map(prices.map((p) => [p.productId, p])),
+      avails: new Map(avails.map((a) => [a.productId, a])),
+    });
+  }
+
+  const items: BatchOfferItem[] = [];
+  for (let i = 0; i < needs.length; i++) {
+    const need = needs[i];
+    const cands = shortlistedByIdx[i];
+    const preloaded = preloadedByDate.get(need.neededBy);
+    const offers = cands.length
+      ? await buildOffers(customerId, need, {
+          productIds: cands.map((c) => c.productId),
+          includeSubstitutions: options?.includeSubstitutions ?? true,
+          preferences: options?.preferences,
+          mandate: options?.mandate,
+          now: options?.now,
+          preloaded,
+        })
+      : [];
+    items.push({
+      need,
+      offers,
+      explanation: explainOffers(offers, need, options?.mandate),
+    });
+  }
+
+  const combinedTotal = items.reduce((s, it) => s + (it.offers[0]?.totalPrice ?? 0), 0);
+  const summaryParts = items.map((it, idx) => {
+    const top = it.offers[0];
+    return top
+      ? `Item ${idx + 1} (${it.need.quantity} ${it.need.unit} ${it.need.productIntent}): ${top.productName} €${top.totalPrice.toFixed(2)}`
+      : `Item ${idx + 1} (${it.need.quantity} ${it.need.unit} ${it.need.productIntent}): no matching offer`;
+  });
+  const combinedExplanation = `${summaryParts.join(" · ")}. Combined top total: €${combinedTotal.toFixed(2)}.`;
+
+  return { items, combinedExplanation };
 }

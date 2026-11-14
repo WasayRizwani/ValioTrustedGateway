@@ -20,6 +20,13 @@ COPY apps ./apps
 RUN npm run build \
   && mkdir -p /app/data /app/keys
 
-EXPOSE 8787 5173
+ENV NODE_ENV=production \
+    PORT=8787 \
+    GATEWAY_PORT=8787
 
-CMD ["npm", "run", "start", "-w", "@tta/gateway"]
+EXPOSE 8787
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 8787) + '/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+
+CMD ["sh", "-c", "if [ ! -f /app/data/products.json ] && [ -n \"$VALIO_API_KEY\" ]; then npm run download-data -w @tta/gateway || true; fi && exec npm run start -w @tta/gateway"]
