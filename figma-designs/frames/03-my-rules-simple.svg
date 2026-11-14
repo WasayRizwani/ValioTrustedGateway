@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" fill="none" id="Frame-03-My-Rules-Simple">
+  <defs>
+    <filter id="softShadow" x="-5%" y="-5%" width="110%" height="114%">
+      <feDropShadow dx="0" dy="4" stdDeviation="10" flood-color="#0F172A" flood-opacity="0.05"/>
+    </filter>
+  </defs>
+  <rect id="Background" width="1440" height="900" fill="#F8FAFC"/>
+  <g id="Simple-Top-Navigation">
+  <rect x="0" y="0" width="1440" height="76" rx="0" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1"/>
+  <rect x="48" y="18" width="40" height="40" rx="10" fill="#003882"/>
+  <text x="68" y="44" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="15" font-weight="800" fill="#FFFFFF" text-anchor="middle">VA</text>
+  <text x="100" y="38" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="17" font-weight="800" fill="#003882" text-anchor="start">Valio Aimo®</text>
+  <text x="100" y="55" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#64748B" text-anchor="start">Kitchen Ordering Assistant</text>
+  <rect x="430" y="14" width="580" height="48" rx="14" fill="#F1F5F9"/>
+  <text x="499.0" y="43" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13.5" font-weight="600" fill="#475569" text-anchor="middle">New Order</text>
+  <text x="653.0" y="43" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13.5" font-weight="600" fill="#475569" text-anchor="middle">Needs Your OK (1)</text>
+  <rect x="744" y="18" width="126" height="40" rx="10" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1" filter="url(#softShadow)"/>
+  <text x="807.0" y="43" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13.5" font-weight="700" fill="#0052CC" text-anchor="middle">My Rules</text>
+  <text x="942.0" y="43" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13.5" font-weight="600" fill="#475569" text-anchor="middle">Past Orders</text>
+  <g id="Pill-Hotel Katajanokka Kitchen">
+    <rect x="1176" y="24" width="216" height="30" rx="15" fill="#F1F5F9" stroke="#E2E8F0" stroke-width="1"/>
+    <text x="1284.0" y="43.5" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12" font-weight="700" fill="#475569" text-anchor="middle">Hotel Katajanokka Kitchen</text>
+  </g>
+  </g>
+  <text x="720" y="134" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="28" font-weight="800" fill="#0F172A" text-anchor="middle">What Can Your Assistant Do Automatically?</text>
+  <text x="720" y="162" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="15" font-weight="500" fill="#475569" text-anchor="middle">Set simple boundaries once. Whenever an order crosses a rule, we pause and ask you first.</text>
+  <rect id="Rule-1-Spending-Limit" x="240" y="194" width="960" height="186" rx="20" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1" filter="url(#softShadow)"/>
+  <text x="280" y="238" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="19" font-weight="800" fill="#0F172A" text-anchor="start">1. Automatic Order Limit</text>
+  <text x="280" y="264" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14.5" font-weight="500" fill="#475569" text-anchor="start">Orders up to this amount are placed automatically. Larger orders wait for your OK.</text>
+  <text x="1160" y="248" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="32" font-weight="800" fill="#0052CC" text-anchor="end">€800</text>
+  <rect x="280" y="298" width="880" height="14" rx="7" fill="#E2E8F0"/>
+  <rect x="280" y="298" width="420" height="14" rx="7" fill="#0052CC"/>
+  <circle cx="700" cy="305" r="13" fill="#FFFFFF" stroke="#0052CC" stroke-width="4"/>
+  <text x="280" y="342" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#64748B" text-anchor="start">€100 (Ask almost always)</text>
+  <text x="1160" y="342" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#64748B" text-anchor="end">€2,000 (High automation)</text>
+  <rect id="Rule-2-Substitutions" x="240" y="400" width="960" height="198" rx="20" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1" filter="url(#softShadow)"/>
+  <text x="280" y="444" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="19" font-weight="800" fill="#0F172A" text-anchor="start">2. If an Item Runs Low in Stock</text>
+  <text x="280" y="470" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14.5" font-weight="500" fill="#475569" text-anchor="start">How should your assistant handle missing quantities?</text>
+  <rect x="280" y="494" width="276" height="78" rx="14" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="1"/>
+  <text x="302" y="526" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14.5" font-weight="700" fill="#0F172A" text-anchor="start">○  Never swap products</text>
+  <text x="324" y="550" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12.5" font-weight="500" fill="#64748B" text-anchor="start">Always ask me before changing</text>
+  <rect x="576" y="494" width="304" height="78" rx="14" fill="#EFF6FF" stroke="#0052CC" stroke-width="2"/>
+  <text x="598" y="526" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14.5" font-weight="800" fill="#003882" text-anchor="start">●  Allow close Valio match</text>
+  <text x="620" y="550" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12.5" font-weight="500" fill="#1E40AF" text-anchor="start">Only if price is within +5%</text>
+  <rect x="900" y="494" width="260" height="78" rx="14" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="1"/>
+  <text x="922" y="526" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14.5" font-weight="700" fill="#0F172A" text-anchor="start">○  Prioritize full delivery</text>
+  <text x="944" y="550" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12.5" font-weight="500" fill="#64748B" text-anchor="start">Pick best available match</text>
+  <rect id="Rule-3-Safety-Locks" x="240" y="618" width="960" height="184" rx="20" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1" filter="url(#softShadow)"/>
+  <text x="280" y="660" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="19" font-weight="800" fill="#0F172A" text-anchor="start">3. Kitchen Safety Promises (Always Active)</text>
+  <text x="280" y="704" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="15" font-weight="700" fill="#0F172A" text-anchor="start">Strict Allergen Protection</text>
+  <text x="280" y="724" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13.5" font-weight="500" fill="#475569" text-anchor="start">Never replace lactose-free, gluten-free, or nut-free items with standard ones.</text>
+  <rect x="1100" y="694" width="58" height="32" rx="16" fill="#059669"/>
+  <circle cx="1142" cy="710" r="12" fill="#FFFFFF"/>
+  <text x="280" y="764" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="15" font-weight="700" fill="#0F172A" text-anchor="start">Unusual Weekly Cost Alert</text>
+  <text x="280" y="784" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13.5" font-weight="500" fill="#475569" text-anchor="start">Pause automatic weekly orders if the total jumps more than 10% above normal.</text>
+  <rect x="1100" y="754" width="58" height="32" rx="16" fill="#059669"/>
+  <circle cx="1142" cy="770" r="12" fill="#FFFFFF"/>
+  <g id="Button-Save My Rules">
+    <rect x="240" y="822" width="240" height="50" rx="12" fill="#0052CC" stroke="#0052CC" stroke-width="1.2"/>
+    <text x="360.0" y="852.0" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="700" fill="#FFFFFF" text-anchor="middle">Save My Rules</text>
+  </g>
+  <g id="Button-Pause Assistant Anytime">
+    <rect x="960" y="822" width="240" height="50" rx="12" fill="#FFFFFF" stroke="#FCA5A5" stroke-width="1.2"/>
+    <text x="1080.0" y="852.0" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="700" fill="#B91C1C" text-anchor="middle">Pause Assistant Anytime</text>
+  </g>
+</svg>

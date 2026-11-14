@@ -1,0 +1,14 @@
+{
+  "_comment": "Set 'cwd' to the absolute path of this repository root (e.g. /Users/abdul.wasay/Fun) so external MCP clients (Claude Desktop, Cursor) can locate apps/gateway/src/mcp/stdio.ts. Set VALIO_GATEWAY_API_KEY to a customer or scoped agent key.",
+  "mcpServers": {
+    "valio-aimo-gateway": {
+      "command": "npx",
+      "args": ["tsx", "apps/gateway/src/mcp/stdio.ts"],
+      "cwd": "/ABSOLUTE/PATH/TO/Fun",
+      "env": {
+        "VALIO_GATEWAY_API_KEY": "hotel_demo_key_001",
+        "DEMO_API_KEY_HOTEL": "hotel_demo_key_001"
+      }
+    }
+  }
+}

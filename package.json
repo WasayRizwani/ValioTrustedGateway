@@ -1,0 +1,25 @@
+{
+  "name": "trusted-trade-agents",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:gateway": "npm run dev -w @tta/gateway",
+    "dev:desk": "npm run dev -w @tta/desk",
+    "demo:a": "npm run demo:a -w @tta/external-agent",
+    "demo:b": "npm run demo:b -w @tta/external-agent",
+    "mcp": "npm run mcp -w @tta/gateway",
+    "build": "npm run build -w @tta/shared && npm run typecheck -w @tta/gateway && npm run build -w @tta/desk",
+    "download-data": "npm run download-data -w @tta/gateway",
+    "test": "npm run test -w @tta/gateway",
+    "demo:team": "npm run demo:team -w @tta/external-agent"
+  },
+  "allowScripts": {
+    "better-sqlite3@11.10.0": true,
+    "esbuild@0.28.2": true,
+    "esbuild@0.25.12": true,
+    "fsevents@2.3.3": true
+  }
+}

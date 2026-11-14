@@ -1,0 +1,11 @@
+node_modules/
+dist/
+data/*.json
+data/*.csv
+data/*.db
+data/*.db-*
+keys/*.pem
+.env
+.DS_Store
+*.log
+apps/desk/dist/

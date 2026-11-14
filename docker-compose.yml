@@ -1,0 +1,66 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${GATEWAY_PORT:-8787}:8787"
+    env_file:
+      - path: .env.example
+        required: false
+      - path: .env
+        required: false
+    environment:
+      GATEWAY_PORT: "8787"
+    volumes:
+      - ./data:/app/data
+      - ./keys:/app/keys
+    command: >
+      sh -c 'if [ ! -f /app/data/products.json ] && [ -n "$$VALIO_API_KEY" ]; then
+        npm run download-data -w @tta/gateway || true;
+      fi && exec npm run start -w @tta/gateway'
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:8787/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  desk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${DESK_PORT:-5173}:5173"
+    environment:
+      GATEWAY_PROXY_TARGET: http://gateway:8787
+    command: ["npm", "run", "preview", "-w", "@tta/desk"]
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+  demo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles:
+      - demo
+    env_file:
+      - path: .env.example
+        required: false
+      - path: .env
+        required: false
+    environment:
+      GATEWAY_PUBLIC_URL: http://gateway:8787
+    command: ["npm", "run", "demo:a"]
+    depends_on:
+      gateway:
+        condition: service_healthy

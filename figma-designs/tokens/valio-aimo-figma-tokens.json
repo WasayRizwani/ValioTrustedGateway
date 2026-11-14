@@ -1,0 +1,116 @@
+{
+  "$schema": "https://tr.designtokens.org/format/",
+  "meta": {
+    "name": "Valio Aimo OpenAgent Design System",
+    "version": "1.0.0",
+    "description": "W3C Design Tokens for Figma Variables / Tokens Studio import"
+  },
+  "primitive": {
+    "color": {
+      "valio-navy": {
+        "900": { "$value": "#002659", "$type": "color" },
+        "800": { "$value": "#003882", "$type": "color" },
+        "600": { "$value": "#0057CC", "$type": "color" },
+        "500": { "$value": "#1D70F5", "$type": "color" },
+        "100": { "$value": "#E0ECFF", "$type": "color" },
+        "50": { "$value": "#F0F6FF", "$type": "color" }
+      },
+      "nordic-slate": {
+        "950": { "$value": "#090E1A", "$type": "color" },
+        "900": { "$value": "#0F172A", "$type": "color" },
+        "800": { "$value": "#1E293B", "$type": "color" },
+        "600": { "$value": "#475569", "$type": "color" },
+        "400": { "$value": "#94A3B8", "$type": "color" },
+        "200": { "$value": "#E2E8F0", "$type": "color" },
+        "100": { "$value": "#F1F5F9", "$type": "color" },
+        "50": { "$value": "#F8FAFC", "$type": "color" },
+        "0": { "$value": "#FFFFFF", "$type": "color" }
+      },
+      "emerald": {
+        "800": { "$value": "#065F46", "$type": "color" },
+        "600": { "$value": "#059669", "$type": "color" },
+        "500": { "$value": "#10B981", "$type": "color" },
+        "100": { "$value": "#D1FAE5", "$type": "color" },
+        "50": { "$value": "#ECFDF5", "$type": "color" }
+      },
+      "amber": {
+        "800": { "$value": "#92400E", "$type": "color" },
+        "600": { "$value": "#D97706", "$type": "color" },
+        "500": { "$value": "#F59E0B", "$type": "color" },
+        "100": { "$value": "#FEF3C7", "$type": "color" },
+        "50": { "$value": "#FFFBEB", "$type": "color" }
+      },
+      "coral": {
+        "800": { "$value": "#991B1B", "$type": "color" },
+        "600": { "$value": "#DC2626", "$type": "color" },
+        "100": { "$value": "#FEE2E2", "$type": "color" },
+        "50": { "$value": "#FEF2F2", "$type": "color" }
+      }
+    },
+    "space": {
+      "1": { "$value": "4px", "$type": "dimension" },
+      "2": { "$value": "8px", "$type": "dimension" },
+      "3": { "$value": "12px", "$type": "dimension" },
+      "4": { "$value": "16px", "$type": "dimension" },
+      "5": { "$value": "20px", "$type": "dimension" },
+      "6": { "$value": "24px", "$type": "dimension" },
+      "8": { "$value": "32px", "$type": "dimension" }
+    },
+    "radius": {
+      "sm": { "$value": "6px", "$type": "dimension" },
+      "md": { "$value": "8px", "$type": "dimension" },
+      "lg": { "$value": "12px", "$type": "dimension" },
+      "xl": { "$value": "16px", "$type": "dimension" },
+      "pill": { "$value": "9999px", "$type": "dimension" }
+    },
+    "fontFamily": {
+      "sans": { "$value": "Plus Jakarta Sans", "$type": "fontFamily" },
+      "mono": { "$value": "JetBrains Mono", "$type": "fontFamily" }
+    }
+  },
+  "semantic": {
+    "surface": {
+      "canvas": { "$value": "{primitive.color.nordic-slate.50}", "$type": "color" },
+      "card": { "$value": "{primitive.color.nordic-slate.0}", "$type": "color" },
+      "subtle": { "$value": "{primitive.color.nordic-slate.100}", "$type": "color" },
+      "protocol": { "$value": "{primitive.color.nordic-slate.900}", "$type": "color" },
+      "brand-header": { "$value": "{primitive.color.valio-navy.800}", "$type": "color" }
+    },
+    "text": {
+      "primary": { "$value": "{primitive.color.nordic-slate.900}", "$type": "color" },
+      "secondary": { "$value": "{primitive.color.nordic-slate.600}", "$type": "color" },
+      "on-brand": { "$value": "{primitive.color.nordic-slate.0}", "$type": "color" },
+      "brand": { "$value": "{primitive.color.valio-navy.600}", "$type": "color" }
+    },
+    "status": {
+      "autonomous-bg": { "$value": "{primitive.color.emerald.50}", "$type": "color" },
+      "autonomous-border": { "$value": "{primitive.color.emerald.600}", "$type": "color" },
+      "autonomous-fg": { "$value": "{primitive.color.emerald.800}", "$type": "color" },
+      "signoff-bg": { "$value": "{primitive.color.amber.50}", "$type": "color" },
+      "signoff-border": { "$value": "{primitive.color.amber.600}", "$type": "color" },
+      "signoff-fg": { "$value": "{primitive.color.amber.800}", "$type": "color" },
+      "blocked-bg": { "$value": "{primitive.color.coral.50}", "$type": "color" },
+      "blocked-border": { "$value": "{primitive.color.coral.600}", "$type": "color" },
+      "blocked-fg": { "$value": "{primitive.color.coral.800}", "$type": "color" }
+    },
+    "border": {
+      "default": { "$value": "{primitive.color.nordic-slate.200}", "$type": "color" },
+      "focus": { "$value": "{primitive.color.valio-navy.600}", "$type": "color" }
+    }
+  },
+  "component": {
+    "offer-card": {
+      "bg": { "$value": "{semantic.surface.card}", "$type": "color" },
+      "border": { "$value": "{semantic.border.default}", "$type": "color" },
+      "best-border": { "$value": "{primitive.color.valio-navy.600}", "$type": "color" },
+      "radius": { "$value": "{primitive.radius.lg}", "$type": "dimension" },
+      "padding": { "$value": "{primitive.space.4}", "$type": "dimension" }
+    },
+    "cta-primary": {
+      "bg": { "$value": "{primitive.color.valio-navy.600}", "$type": "color" },
+      "hover-bg": { "$value": "{primitive.color.valio-navy.800}", "$type": "color" },
+      "fg": { "$value": "{primitive.color.nordic-slate.0}", "$type": "color" },
+      "radius": { "$value": "{primitive.radius.md}", "$type": "dimension" }
+    }
+  }
+}

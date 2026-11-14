@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" fill="none" id="Frame-02-Needs-Your-OK-Simple">
+  <defs>
+    <filter id="softShadow" x="-5%" y="-5%" width="110%" height="114%">
+      <feDropShadow dx="0" dy="4" stdDeviation="10" flood-color="#0F172A" flood-opacity="0.05"/>
+    </filter>
+  </defs>
+  <rect id="Background" width="1440" height="900" fill="#F8FAFC"/>
+  <g id="Simple-Top-Navigation">
+  <rect x="0" y="0" width="1440" height="76" rx="0" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1"/>
+  <rect x="48" y="18" width="40" height="40" rx="10" fill="#003882"/>
+  <text x="68" y="44" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="15" font-weight="800" fill="#FFFFFF" text-anchor="middle">VA</text>
+  <text x="100" y="38" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="17" font-weight="800" fill="#003882" text-anchor="start">Valio Aimo®</text>
+  <text x="100" y="55" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#64748B" text-anchor="start">Kitchen Ordering Assistant</text>
+  <rect x="430" y="14" width="580" height="48" rx="14" fill="#F1F5F9"/>
+  <text x="499.0" y="43" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13.5" font-weight="600" fill="#475569" text-anchor="middle">New Order</text>
+  <rect x="566" y="18" width="174" height="40" rx="10" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1" filter="url(#softShadow)"/>
+  <text x="653.0" y="43" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13.5" font-weight="700" fill="#0052CC" text-anchor="middle">Needs Your OK (1)</text>
+  <text x="807.0" y="43" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13.5" font-weight="600" fill="#475569" text-anchor="middle">My Rules</text>
+  <text x="942.0" y="43" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13.5" font-weight="600" fill="#475569" text-anchor="middle">Past Orders</text>
+  <g id="Pill-Hotel Katajanokka Kitchen">
+    <rect x="1176" y="24" width="216" height="30" rx="15" fill="#F1F5F9" stroke="#E2E8F0" stroke-width="1"/>
+    <text x="1284.0" y="43.5" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12" font-weight="700" fill="#475569" text-anchor="middle">Hotel Katajanokka Kitchen</text>
+  </g>
+  </g>
+  <rect id="Simple-Approval-Card" x="140" y="116" width="720" height="728" rx="24" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1" filter="url(#softShadow)"/>
+  <g id="Pill-Waiting for Your OK">
+    <rect x="180" y="150" width="186" height="32" rx="16" fill="#FFFBEB" stroke="#FDE68A" stroke-width="1"/>
+    <text x="273.0" y="170.5" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12" font-weight="700" fill="#92400E" text-anchor="middle">Waiting for Your OK</text>
+  </g>
+  <g id="Pill-Price held for 14 min">
+    <rect x="620" y="150" width="200" height="32" rx="16" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1"/>
+    <text x="720.0" y="170.5" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12" font-weight="700" fill="#1D4ED8" text-anchor="middle">Price held for 14 min</text>
+  </g>
+  <text x="180" y="222" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="26" font-weight="800" fill="#0F172A" text-anchor="start">Approve Monday&#x27;s Milk Order?</text>
+  <text x="180" y="252" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="15" font-weight="500" fill="#475569" text-anchor="start">Your assistant prepared everything and checked your lactose-free requirement.</text>
+  <rect x="180" y="278" width="640" height="108" rx="16" fill="#FFFBEB" stroke="#FDE68A" stroke-width="1"/>
+  <text x="204" y="308" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="800" fill="#92400E" text-anchor="start">Why your assistant asked you before ordering:</text>
+  <text x="204" y="336" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="500" fill="#78350F" text-anchor="start">1. The total (€1,184) is above your €800 automatic spending limit.</text>
+  <text x="204" y="362" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="500" fill="#78350F" text-anchor="start">2. 200 L was topped up with Valio Organic Lactose-Free (+€14 difference).</text>
+  <text x="180" y="422" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="16" font-weight="800" fill="#0F172A" text-anchor="start">Order Summary</text>
+  <rect x="180" y="438" width="640" height="226" rx="16" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="208" y="476" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="15" font-weight="700" fill="#0F172A" text-anchor="start">40 × Valio Eila® Lactose-Free Milk (20 L box)</text>
+  <text x="208" y="498" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#64748B" text-anchor="start">800 litres · €1.17 / L</text>
+  <text x="792" y="486" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="16" font-weight="700" fill="#0F172A" text-anchor="end">€936.00</text>
+  <line x1="208" y1="518" x2="792" y2="518" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="208" y="550" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="15" font-weight="700" fill="#0F172A" text-anchor="start">20 × Valio Organic Lactose-Free Milk (10 L box)</text>
+  <text x="208" y="572" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#059669" text-anchor="start">200 litres · €1.24 / L · Added to complete your 1,000 L</text>
+  <text x="792" y="560" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="16" font-weight="700" fill="#0F172A" text-anchor="end">€248.00</text>
+  <line x1="208" y1="594" x2="792" y2="594" stroke="#CBD5E1" stroke-width="1.2"/>
+  <text x="208" y="626" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#059669" text-anchor="start">Delivery: Monday, Nov 16 at 05:30 AM</text>
+  <text x="208" y="646" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#475569" text-anchor="start">✓ 100% Lactose-Free Verified   ✓ Contract Price Guaranteed</text>
+  <text x="650" y="636" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="15" font-weight="700" fill="#475569" text-anchor="start">Total:</text>
+  <text x="792" y="638" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="22" font-weight="800" fill="#0F172A" text-anchor="end">€1,184.00</text>
+  <g id="Button-Yes, Place Order (€1,184)">
+    <rect x="180" y="694" width="340" height="56" rx="12" fill="#059669" stroke="#059669" stroke-width="1.2"/>
+    <text x="350.0" y="727.0" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="700" fill="#FFFFFF" text-anchor="middle">Yes, Place Order (€1,184)</text>
+  </g>
+  <g id="Button-Only Order 800 L (€936)">
+    <rect x="536" y="694" width="284" height="56" rx="12" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.2"/>
+    <text x="678.0" y="727.0" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="700" fill="#0F172A" text-anchor="middle">Only Order 800 L (€936)</text>
+  </g>
+  <text x="500" y="788" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13.5" font-weight="600" fill="#64748B" text-anchor="middle">Or cancel this order and adjust quantities</text>
+  <text x="1090" y="134" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="700" fill="#64748B" text-anchor="middle">On Head Chef&#x27;s Phone</text>
+  <rect id="Mobile-Phone-Preview" x="916" y="152" width="348" height="692" rx="40" fill="#0F172A"/>
+  <rect x="1036" y="166" width="108" height="18" rx="9" fill="#020617"/>
+  <rect x="930" y="194" width="320" height="636" rx="28" fill="#F8FAFC"/>
+  <rect x="930" y="194" width="320" height="76" rx="28" fill="#003882"/>
+  <text x="956" y="230" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="16" font-weight="800" fill="#FFFFFF" text-anchor="start">Valio Aimo® Kitchen</text>
+  <text x="956" y="252" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12.5" font-weight="500" fill="#BFDBFE" text-anchor="start">1 order needs your quick OK</text>
+  <rect x="948" y="290" width="284" height="290" rx="18" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1" filter="url(#softShadow)"/>
+  <g id="Pill-Mon 5:30 AM Delivery">
+    <rect x="966" y="310" width="168" height="28" rx="14" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="1"/>
+    <text x="1050.0" y="328.5" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12" font-weight="700" fill="#065F46" text-anchor="middle">Mon 5:30 AM Delivery</text>
+  </g>
+  <text x="966" y="368" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="18" font-weight="800" fill="#0F172A" text-anchor="start">1,000 L Lactose-Free Milk</text>
+  <text x="966" y="400" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="26" font-weight="800" fill="#0052CC" text-anchor="start">€1,184.00</text>
+  <text x="966" y="434" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13.5" font-weight="500" fill="#334155" text-anchor="start">• 800 L Valio Eila LF (20 L)</text>
+  <text x="966" y="458" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13.5" font-weight="500" fill="#065F46" text-anchor="start">• 200 L Valio Organic LF (10 L)</text>
+  <rect x="966" y="482" width="248" height="76" rx="12" fill="#FFFBEB"/>
+  <text x="980" y="510" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="13" font-weight="700" fill="#92400E" text-anchor="start">Over your €800 auto-limit</text>
+  <text x="980" y="534" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="12.5" font-weight="500" fill="#065F46" text-anchor="start">100% Lactose-Free checked ✓</text>
+  <g id="Button-Approve Order (€1,184)">
+    <rect x="948" y="686" width="284" height="56" rx="12" fill="#059669" stroke="#059669" stroke-width="1.2"/>
+    <text x="1090.0" y="719.0" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="700" fill="#FFFFFF" text-anchor="middle">Approve Order (€1,184)</text>
+  </g>
+  <g id="Button-Only Order 800 L (€936)">
+    <rect x="948" y="754" width="284" height="50" rx="12" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.2"/>
+    <text x="1090.0" y="784.0" font-family="Plus Jakarta Sans, Inter, -apple-system, sans-serif" font-size="14" font-weight="700" fill="#0F172A" text-anchor="middle">Only Order 800 L (€936)</text>
+  </g>
+</svg>

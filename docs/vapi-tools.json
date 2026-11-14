@@ -1,0 +1,41 @@
+{
+  "list_saved_recipes": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false
+  },
+  "create_event_proposal": {
+    "type": "object",
+    "properties": {
+      "confirmed": {
+        "type": "boolean",
+        "description": "True only after the caller explicitly confirms the complete read-back."
+      },
+      "name": {
+        "type": "string",
+        "description": "A short name for the event."
+      },
+      "date": {
+        "type": "string",
+        "description": "Event date in YYYY-MM-DD format."
+      },
+      "guests": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 50000,
+        "description": "Number of guests."
+      },
+      "recipeIds": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 20,
+        "uniqueItems": true,
+        "items": { "type": "string" },
+        "description": "Recipe IDs returned by list_saved_recipes for this account."
+      }
+    },
+    "required": ["confirmed", "name", "date", "guests", "recipeIds"],
+    "additionalProperties": false
+  }
+}

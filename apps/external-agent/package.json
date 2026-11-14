@@ -1,0 +1,19 @@
+{
+  "name": "@tta/external-agent",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "echo ok",
+    "demo:a": "tsx src/demo.ts --scenario a",
+    "demo:b": "tsx src/demo.ts --scenario b",
+    "demo:team": "tsx src/team-demo.ts"
+  },
+  "dependencies": {
+    "@tta/shared": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}

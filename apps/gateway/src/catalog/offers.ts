@@ -1,0 +1,431 @@
+import type { Need, Offer, Mandate, Preferences } from "@tta/shared";
+import {
+  computePacks,
+  getCarbon,
+  getProduct,
+  getReliability,
+  getValioSubstitutes,
+  allergenConflicts,
+  isLactoseFree,
+  searchFromNeed,
+  type Product,
+} from "./index.js";
+import { getAvailability, getPrices } from "../valio/client.js";
+
+function dateOnly(d: string): string {
+  return d.slice(0, 10);
+}
+
+/** Cut-off within this window counts as "at risk" (order may not make it into the picking run). */
+export const CUTOFF_RISK_WINDOW_MS = 2 * 3600_000;
+
+/**
+ * Order cut-off assumptions: Valio's availability `closingTime` is the last moment to order for the requested
+ * (needed-by) delivery date. Passed cut-off => the offer cannot be delivered on time. Within 2h => cutoffRisk.
+ * Products without closingTime (e.g. non-terminal / no schedule) are assumed to have no known cut-off.
+ */
+export function cutoffInfo(
+  closingAt: string | null | undefined,
+  nowMs: number,
+): { orderByAt: string | null; passed: boolean; risk: boolean } {
+  if (!closingAt) return { orderByAt: null, passed: false, risk: false };
+  const t = Date.parse(closingAt);
+  if (Number.isNaN(t)) return { orderByAt: null, passed: false, risk: false };
+  return { orderByAt: new Date(t).toISOString(), passed: t <= nowMs, risk: t - nowMs <= CUTOFF_RISK_WINDOW_MS };
+}
+
+/** Delivered on/before neededBy AND order cut-off not passed. */
+export function isOnTime(o: Offer, neededBy: string, nowMs: number): boolean {
+  if (o.orderByAt && Date.parse(o.orderByAt) <= nowMs) return false;
+  return !o.availableDate || o.availableDate <= neededBy;
+}
+
+const WEIGHT_KEYS = ["price", "reliability", "carbon", "delivery"] as const;
+
+/** Validates (non-negative, finite) and normalises weights to sum 1. Returns null when absent / all zero. */
+export function normalizePreferences(p?: Preferences | null): Record<(typeof WEIGHT_KEYS)[number], number> | null {
+  if (!p) return null;
+  let sum = 0;
+  for (const k of WEIGHT_KEYS) {
+    const v = p[k];
+    if (v == null) continue;
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) throw new Error(`preferences.${k} must be a non-negative number`);
+    sum += v;
+  }
+  if (sum === 0) return null;
+  const out = {} as Record<(typeof WEIGHT_KEYS)[number], number>;
+  for (const k of WEIGHT_KEYS) out[k] = (p[k] ?? 0) / sum;
+  return out;
+}
+
+const dayNum = (d: string) => Date.parse(d.slice(0, 10)) / 86400_000;
+
+/** Fills criteria + normalised 0..1 criteriaScores (1 = best, unknown = 0.5). Mutates offers. */
+export function computeCriteria(offers: Offer[], need: Need, nowMs: number): void {
+  const eff = (o: Offer) => dayNum(o.availableDate ?? need.neededBy);
+  const dates = offers.map(eff);
+  const dMin = Math.min(...dates), dMax = Math.max(...dates);
+  const carbons = offers.map((o) => o.carbonKgPerKg).filter((c): c is number => c != null);
+  const cMin = Math.min(...carbons), cMax = Math.max(...carbons);
+  const cheapestByCat = new Map<string, number>();
+  for (const o of offers) {
+    const k = o.category ?? "";
+    if (o.totalPrice > 0) cheapestByCat.set(k, Math.min(cheapestByCat.get(k) ?? Infinity, o.totalPrice));
+  }
+  for (const o of offers) {
+    o.criteria = {
+      price: o.totalPrice,
+      deliveryDate: o.availableDate,
+      reliability: o.deliveryReliability,
+      carbonKgPerKg: o.carbonKgPerKg,
+      certifications: o.certifications,
+    };
+    const cheapest = cheapestByCat.get(o.category ?? "");
+    const price = cheapest && o.totalPrice > 0 ? cheapest / o.totalPrice : 0.5;
+    const earliness = dMax === dMin ? 1 : 1 - (eff(o) - dMin) / (dMax - dMin);
+    const delivery = isOnTime(o, need.neededBy, nowMs) ? earliness : earliness * 0.3;
+    const carbon =
+      o.carbonKgPerKg == null ? 0.5 : cMax === cMin ? 1 : 1 - (o.carbonKgPerKg - cMin) / (cMax - cMin);
+    o.criteriaScores = {
+      price,
+      delivery,
+      reliability: o.deliveryReliability ?? 0.5,
+      carbon,
+    };
+  }
+}
+
+/**
+ * Pareto flag over offers that can be fulfilled (and on time, when any are): price lower, reliability higher,
+ * carbon lower, delivery earlier. Unknown reliability/carbon count as worst. Others get false.
+ */
+export function markPareto(offers: Offer[], need: Need, nowMs: number): void {
+  const fulfil = offers.filter((o) => o.canFulfil);
+  const onTimeSet = fulfil.filter((o) => isOnTime(o, need.neededBy, nowMs));
+  const pool = onTimeSet.length ? onTimeSet : fulfil;
+  // vector where lower is better on every axis
+  const vec = (o: Offer) => [
+    o.totalPrice,
+    o.deliveryReliability == null ? Infinity : -o.deliveryReliability,
+    o.carbonKgPerKg ?? Infinity,
+    dayNum(o.availableDate ?? need.neededBy),
+  ];
+  const vs = new Map(pool.map((o) => [o, vec(o)]));
+  for (const o of offers) {
+    if (!vs.has(o)) {
+      o.paretoOptimal = false;
+      continue;
+    }
+    const a = vs.get(o)!;
+    o.paretoOptimal = !pool.some((p) => {
+      if (p === o) return false;
+      const b = vs.get(p)!;
+      return b.every((x, i) => x <= a[i]) && b.some((x, i) => x < a[i]);
+    });
+  }
+}
+
+export async function buildOffers(
+  customerId: string,
+  need: Need,
+  options?: {
+    productIds?: string[];
+    includeSubstitutions?: boolean;
+    /** Optional criterion weights; when absent the default ranking is unchanged. */
+    preferences?: Preferences;
+    /** Injectable clock (tests). */
+    now?: Date;
+  },
+): Promise<Offer[]> {
+  const nowMs = (options?.now ?? new Date()).getTime();
+  const prefs = normalizePreferences(options?.preferences);
+  const soft = new WeakMap<Offer, number>(); // default-score part that preferences replace
+  let candidates: Product[];
+  if (options?.productIds?.length) {
+    candidates = options.productIds
+      .map((id) => getProduct(id))
+      .filter((p): p is Product => !!p);
+  } else {
+    candidates = searchFromNeed(need, 20);
+  }
+
+  // Hard constraints come from the catalog's own facts, not from product-name guesses.
+  if (need.constraints.lactoseFree) candidates = candidates.filter((p) => isLactoseFree(p));
+  if (need.constraints.excludeAllergens?.length) {
+    candidates = candidates.filter(
+      (p) =>
+        allergenConflicts(
+          { contains: p.allergens ?? [], mayContain: p.mayContain ?? [] },
+          need.constraints.excludeAllergens ?? [],
+        ).length === 0,
+    );
+  }
+  const searched = candidates;
+
+  if (candidates.length === 0) return [];
+
+  const ids = candidates.map((c) => c.productId);
+  const [prices, avails] = await Promise.all([
+    getPrices(customerId, need.neededBy, ids),
+    getAvailability(customerId, need.neededBy, ids),
+  ]);
+  const priceMap = new Map(prices.map((p) => [p.productId, p]));
+  const availMap = new Map(avails.map((a) => [a.productId, a]));
+
+  const offers: Offer[] = [];
+  for (const product of candidates) {
+    const pack = computePacks(need.quantity, need.unit, product);
+    if (!pack.compatible) continue;
+    const price = priceMap.get(product.productId);
+    const avail = availMap.get(product.productId);
+    if (!price || price.error || price.unitPrice == null) continue;
+    if (!avail || avail.salesBlock) continue;
+
+    const availableQuantity = avail.availableAmount;
+    const availabilityUnknown = avail.availabilityUnknown;
+    const canFulfil = availabilityUnknown || (
+      availableQuantity != null &&
+      availableQuantity > 0 &&
+      availableQuantity >= pack.requiredPacks
+    );
+
+    const shortfall = canFulfil
+      ? null
+      : availableQuantity == null
+        ? pack.requiredPacks
+        : Math.max(0, pack.requiredPacks - availableQuantity);
+
+    const totalPrice = price.unitPrice * pack.requiredPacks;
+    const comparisonPrice =
+      price.comparisonPrice ??
+      (pack.quantityUnit === "L" || pack.quantityUnit === "KG"
+        ? totalPrice / pack.totalQuantity
+        : null);
+
+    const deliveryReliability = getReliability(product.productId);
+    const carbonKgPerKg = getCarbon(product.productId);
+    const availableDate = avail.availableDate
+      ? dateOnly(avail.availableDate)
+      : null;
+    const cut = cutoffInfo(avail.closingAt, nowMs);
+    const onTime =
+      (!availableDate || availableDate <= need.neededBy) && !cut.passed;
+
+    const scoreReasons: string[] = [];
+    let score = 0;
+    let softParts = 0;
+    if (canFulfil) {
+      score += 40;
+      scoreReasons.push(availabilityUnknown
+        ? "Valio availability is unknown; this terminal product is not quantity-capped"
+        : "Can fulfil requested quantity");
+    } else {
+      scoreReasons.push("Cannot fully fulfil quantity");
+    }
+    if (onTime) {
+      score += 25;
+      scoreReasons.push(`Delivery on/before ${need.neededBy}`);
+    } else if (cut.passed) {
+      scoreReasons.push(`Order cut-off passed (${cut.orderByAt}) — cannot arrive by ${need.neededBy}`);
+    } else {
+      scoreReasons.push(`Earliest delivery ${availableDate}`);
+    }
+    if (!cut.passed && cut.risk) {
+      score -= 5;
+      scoreReasons.push(`Order cut-off imminent (order by ${cut.orderByAt})`);
+    }
+    if (deliveryReliability != null) {
+      score += deliveryReliability * 12;
+      softParts += deliveryReliability * 12;
+      scoreReasons.push(`Delivery reliability ${(deliveryReliability * 100).toFixed(0)}%`);
+    } else {
+      scoreReasons.push("Delivery reliability unknown");
+    }
+    if (carbonKgPerKg != null) {
+      // Lower carbon is better — small sustainability tilt
+      score += Math.max(0, 5 - carbonKgPerKg);
+      softParts += Math.max(0, 5 - carbonKgPerKg);
+      scoreReasons.push(`Carbon ~${carbonKgPerKg.toFixed(2)} kg/kg`);
+    }
+    const offer: Offer = {
+      productId: product.productId,
+      productName: product.name,
+      brand: product.brand ?? null,
+      category: product.category ?? null,
+      packSize: product.packSize,
+      packUnit: product.packUnit,
+      requiredPacks: pack.requiredPacks,
+      totalQuantity: pack.totalQuantity,
+      quantityUnit: pack.quantityUnit,
+      unitPrice: price.unitPrice,
+      totalPrice,
+      comparisonPrice,
+      comparisonUnit: price.comparisonUnit ?? pack.quantityUnit,
+      availableQuantity,
+      availabilityUnknown,
+      availableDate,
+      canFulfil,
+      shortfall,
+      deliveryReliability,
+      carbonKgPerKg,
+      score,
+      scoreReasons,
+      labels: product.labels ?? [],
+      allergens: product.allergens ?? [],
+      mayContain: product.mayContain ?? [],
+      certifications: product.certifications ?? [],
+      origin: product.origin ? product.origin.toUpperCase() : null,
+      producer: product.producer ?? null,
+      claims: product.claims ?? [],
+      isSubstitution: false,
+      priceClaim: price.claim,
+      availabilityClaim: avail.claim,
+      orderByAt: cut.orderByAt,
+      cutoffRisk: cut.risk,
+    };
+    soft.set(offer, softParts);
+    offers.push(offer);
+  }
+
+  // Price is the primary differentiator: cost per requested unit (what you actually pay, pack rounding included)
+  // relative to the cheapest offer that can really be delivered in time.
+  const deliverable = offers.filter((o) => o.canFulfil && isOnTime(o, need.neededBy, nowMs));
+  const catCount = new Map<string, number>();
+  for (const o of deliverable) catCount.set(o.category ?? "", (catCount.get(o.category ?? "") ?? 0) + 1);
+  const mainCat = [...catCount.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+  const pool = deliverable.filter((o) => (o.category ?? "") === mainCat);
+  const cheapest = pool.length ? Math.min(...pool.map((o) => o.totalPrice)) : null;
+  for (const o of offers) {
+    if (cheapest != null && o.totalPrice > 0 && (o.category ?? "") === mainCat) {
+      const ratio = cheapest / o.totalPrice;
+      o.score += 45 * ratio;
+      soft.set(o, (soft.get(o) ?? 0) + 45 * ratio);
+      o.scoreReasons.unshift(
+        ratio >= 0.9995
+          ? `Cheapest deliverable offer (€${o.totalPrice.toFixed(2)})`
+          : `${Math.round((1 / ratio - 1) * 100)}% more expensive than the cheapest deliverable offer (€${cheapest.toFixed(2)})`,
+      );
+    }
+    if (o.requiredPacks > 150) o.score -= Math.min(6, o.requiredPacks / 200); // tie-break: hundreds of tiny packs are a handling burden
+  }
+
+  computeCriteria(offers, need, nowMs);
+  markPareto(offers, need, nowMs);
+
+  if (prefs) {
+    // Replace the default soft part (price 45 + reliability 12 + carbon ~5 = ~62) with the caller's weighting,
+    // keeping fulfilment / on-time / cut-off hard parts untouched.
+    const label = WEIGHT_KEYS.filter((k) => prefs[k] > 0)
+      .map((k) => `${k} ${Math.round(prefs[k] * 100)}%`)
+      .join(", ");
+    for (const o of offers) {
+      const cs = o.criteriaScores!;
+      const weighted = prefs.price * cs.price + prefs.reliability * cs.reliability + prefs.carbon * cs.carbon + prefs.delivery * cs.delivery;
+      o.score = o.score - (soft.get(o) ?? 0) + 62 * weighted;
+      o.scoreReasons.unshift(`Preference-weighted (${label}): ${(weighted * 100).toFixed(0)}/100`);
+    }
+  }
+
+  // Fulfilable first, then score
+  offers.sort((a, b) => Number(b.canFulfil) - Number(a.canFulfil) || b.score - a.score);
+
+  if (options?.includeSubstitutions && offers.length > 0) {
+    const labels: Array<"best" | "better" | "good"> = ["best", "better", "good"];
+    const anyFull = offers.some((o) => o.canFulfil);
+    if (!anyFull) {
+      // Partial-availability path: label top 3 partial options as GBB alternatives
+      offers.slice(0, 3).forEach((o, i) => {
+        o.isSubstitution = true;
+        o.substitutionLabel = labels[i];
+        o.scoreReasons = [
+          `Partial availability · substitution (${labels[i]})`,
+          ...o.scoreReasons,
+        ];
+      });
+    } else if (!offers[0].canFulfil) {
+      // Primary ranked can't fulfil — mark fulfilable alternatives as GBB
+      const fulfilable = offers.filter((o) => o.canFulfil).slice(0, 3);
+      fulfilable.forEach((o, i) => {
+        o.isSubstitution = true;
+        o.substitutionLabel = labels[i];
+        o.scoreReasons = [`Substitution (${labels[i]})`, ...o.scoreReasons];
+      });
+    } else if (offers.length >= 2) {
+      // Still surface next-best fulfilable options as GBB for explainability
+      offers
+        .filter((o) => o.canFulfil)
+        .slice(0, 3)
+        .forEach((o, i) => {
+          o.substitutionLabel = labels[i];
+          if (i > 0) {
+            o.scoreReasons = [`Alternative (${labels[i]})`, ...o.scoreReasons];
+          }
+        });
+    }
+  }
+
+  // Nothing fulfilable on time? Ask the catalog what Valio itself declares as a substitute — then
+  // re-check constraints, price and stock for those, instead of guessing a swap.
+  const onTime = (o: Offer) => isOnTime(o, need.neededBy, nowMs);
+  if (
+    options?.includeSubstitutions &&
+    !options.productIds?.length &&
+    !offers.some((o) => o.canFulfil && onTime(o))
+  ) {
+    const origin = new Map<string, string>();
+    for (const c of searched.slice(0, 8))
+      for (const id of getValioSubstitutes(c.productId))
+        if (!candidates.some((x) => x.productId === id) && !origin.has(id)) origin.set(id, c.name);
+    if (origin.size) {
+      const extra = await buildOffers(customerId, need, {
+        productIds: [...origin.keys()].slice(0, 12),
+        includeSubstitutions: false,
+        preferences: options.preferences,
+        now: options.now,
+      });
+      for (const e of extra) {
+        e.isSubstitution = true;
+        e.substitutionSource = "valio_catalog";
+        e.substituteFor = origin.get(e.productId);
+        e.scoreReasons = [`Valio-declared substitute for "${e.substituteFor}"`, ...e.scoreReasons];
+      }
+      offers.push(...extra);
+      offers.sort((a, b) => Number(b.canFulfil) - Number(a.canFulfil) || b.score - a.score);
+    }
+  }
+
+  return offers;
+}
+
+export function explainOffers(offers: Offer[], need: Need, mandate?: Mandate | null): string {
+  if (offers.length === 0) {
+    return `No offers matched "${need.productIntent}" for ${need.quantity} ${need.unit} by ${need.neededBy}.`;
+  }
+  const top = offers[0];
+  const lines = [
+    `Top offer: ${top.productName} (${top.productId}).`,
+    `Need ${need.quantity} ${need.unit} → ${top.requiredPacks} packs × ${top.packSize}${top.packUnit} = ${top.totalQuantity}${top.quantityUnit}.`,
+    `Unit price €${top.unitPrice.toFixed(2)}, total €${top.totalPrice.toFixed(2)}.`,
+    top.canFulfil
+      ? "Quantity can be fulfilled."
+      : `Partial availability: shortfall of ${top.shortfall} packs (avail ${top.availableQuantity ?? 0}).`,
+    ...top.scoreReasons.slice(0, 4),
+  ];
+  const gbb = offers.filter((o) => o.substitutionLabel);
+  if (gbb.length) {
+    lines.push(
+      `Good/better/best: ${gbb
+        .map(
+          (o) =>
+            `${o.substitutionLabel}=${o.productId}${o.canFulfil ? "" : " (partial)"}`,
+        )
+        .join(", ")}.`,
+    );
+  }
+  if (mandate) {
+    lines.push(
+      `Mandate ${mandate.mandateId} max order €${mandate.maxOrderValueEur}; this offer is €${top.totalPrice.toFixed(2)}.`,
+    );
+  }
+  return lines.join(" ");
+}

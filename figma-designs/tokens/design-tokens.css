@@ -1,0 +1,90 @@
+/* Valio Aimo® OpenAgent™ — Three-Layer Design Tokens (Primitive → Semantic → Component) */
+
+:root {
+  /* === LAYER 1: PRIMITIVES === */
+  --color-valio-navy-900: #002659;
+  --color-valio-navy-800: #003882;
+  --color-valio-navy-600: #0057CC;
+  --color-valio-navy-500: #1D70F5;
+  --color-valio-navy-100: #E0ECFF;
+  --color-valio-navy-50: #F0F6FF;
+
+  --color-slate-950: #090E1A;
+  --color-slate-900: #0F172A;
+  --color-slate-800: #1E293B;
+  --color-slate-600: #475569;
+  --color-slate-400: #94A3B8;
+  --color-slate-200: #E2E8F0;
+  --color-slate-100: #F1F5F9;
+  --color-slate-50: #F8FAFC;
+  --color-white: #FFFFFF;
+
+  --color-emerald-800: #065F46;
+  --color-emerald-600: #059669;
+  --color-emerald-100: #D1FAE5;
+  --color-emerald-50: #ECFDF5;
+
+  --color-amber-800: #92400E;
+  --color-amber-600: #D97706;
+  --color-amber-100: #FEF3C7;
+  --color-amber-50: #FFFBEB;
+
+  --color-coral-800: #991B1B;
+  --color-coral-600: #DC2626;
+  --color-coral-100: #FEE2E2;
+  --color-coral-50: #FEF2F2;
+
+  --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-pill: 9999px;
+
+  --shadow-card: 0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-elevated: 0 10px 25px -5px rgba(0, 56, 130, 0.08), 0 4px 10px -4px rgba(15, 23, 42, 0.05);
+
+  /* === LAYER 2: SEMANTIC === */
+  --surface-canvas: var(--color-slate-50);
+  --surface-card: var(--color-white);
+  --surface-subtle: var(--color-slate-100);
+  --surface-protocol: var(--color-slate-900);
+  --surface-brand: var(--color-valio-navy-800);
+
+  --text-primary: var(--color-slate-900);
+  --text-secondary: var(--color-slate-600);
+  --text-brand: var(--color-valio-navy-600);
+  --text-on-brand: var(--color-white);
+
+  --border-default: var(--color-slate-200);
+  --border-focus: var(--color-valio-navy-600);
+
+  --status-auto-bg: var(--color-emerald-50);
+  --status-auto-border: var(--color-emerald-600);
+  --status-auto-fg: var(--color-emerald-800);
+
+  --status-signoff-bg: var(--color-amber-50);
+  --status-signoff-border: var(--color-amber-600);
+  --status-signoff-fg: var(--color-amber-800);
+
+  --status-block-bg: var(--color-coral-50);
+  --status-block-border: var(--color-coral-600);
+  --status-block-fg: var(--color-coral-800);
+
+  /* === LAYER 3: COMPONENT === */
+  --btn-primary-bg: var(--color-valio-navy-600);
+  --btn-primary-hover: var(--color-valio-navy-800);
+  --btn-primary-fg: var(--color-white);
+  --card-radius: var(--radius-lg);
+  --card-padding: var(--space-4);
+}
