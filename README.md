@@ -15,76 +15,90 @@ We do **not** compete on how smart our LLM is. We compete on **how safely someon
 3. **Verifiable Facts & Non-Repudiation:** Outbound price, stock, allergen, and origin claims are wrapped in canonical **Ed25519 v2 envelopes** (verifiable offline via `/.well-known/jwks.json`). Human mandate overrides bind a **WebAuthn / ECDSA P-256 cryptographic signature** to the basket's `snapshotHash` and failing rules, and every state transition or `403` refusal is recorded in an append-only **SHA-256 hash-chained SQLite audit log**.
 4. **Upstream ERP Protection:** Catalog search runs locally against 17,546 indexed SKUs; live Valio `/api/price` and `/api/availability` calls are restricted to shortlisted SKUs (`MAX_SHORTLIST_SIZE = 25`) and paced through a serialized `<10 req/s` upstream queue.
 
-### High-Level Component Topology
+### 1. Entry Points & Gateway Overview
 
-![Valio Aimo Agent Gateway — System Architecture](docs/assets/system-architecture.svg)
-
-<details>
-<summary><strong>View interactive Mermaid component graph</strong></summary>
+External agents, the human Web UI, MCP clients, and phone/voice callers all connect through the same deterministic Gateway boundary:
 
 ```mermaid
-flowchart TB
-  subgraph Clients["External Agents & Human Clients"]
-    ExtMCP["External Agent (MCP stdio)"]
-    ExtREST["External Agent / ERP (REST)"]
-    Desk["React Approval & Kitchen Desk (:5173)"]
-    Voice["Phone / Vapi Voice Caller"]
+flowchart LR
+  subgraph Entry["Ways to Use the System"]
+    UI["Web UI / Approval Desk (:5173)"]
+    MCP["MCP Client (Claude / Cursor / stdio)"]
+    Voice["Voice Assistant (Phone / Vapi)"]
+    REST["External REST Agent"]
   end
 
-  subgraph Gateway["@tta/gateway — Hono Node Server (:8787)"]
-    subgraph Ingress["Transport & Ingress Layer"]
-      REST["OpenAPI 3.1 REST Routes (/v1/*)"]
-      MCP["MCP Server (@modelcontextprotocol/sdk)"]
-      SSE["Real-Time SSE Push (/v1/stream)"]
-      Vapi["Voice Proposal Webhooks (/vapi/*)"]
-    end
-
-    subgraph Security["Identity, Guardrails & AI Safety"]
-      Auth["Tenant Binding & 4-Agent Scope Guard (auth · agents)"]
-      RL["Per-Key Token Buckets & Shortlist Cap (ratelimit.ts)"]
-      Sanitize["Prompt-Injection Fences & NL Floor (sanitize.ts · parse.ts)"]
-    end
-
-    subgraph Core["Deterministic Trade & Policy Core"]
-      Cat["Catalog & Pareto Offer Engine — 17,546 SKUs · Reliability · Carbon"]
-      Policy["17-Rule Mandate Engine & Simulator — Spend · Velocity · Allergens"]
-      Tx["Two-Phase Transaction Engine — Quote → Intent → Commit & Fallback Cascade"]
-      HumanSig["Cryptographic Human Proof — WebAuthn Passkey / ECDSA P-256"]
-    end
-
-    subgraph Trust["Cryptographic Trust & Persistence"]
-      Claims["Ed25519 Claim Signer v2 + JWKS (claims/sign.ts)"]
-      Audit["SHA-256 Hash-Chained Audit Log + Tamper X-Ray (audit/chain.ts)"]
-      DB[("SQLite (data/gateway.db) — quotes · intents · audit · mandates · kitchen")]
-    end
-
-    subgraph Kitchen["Buyer Kitchen Ops & Schedulers"]
-      Ops["Inventory · Recipes · Smart Restock · Standing Orders · Banquet Planner"]
-    end
+  subgraph GW["Valio Aimo Agent Gateway (:8787)"]
+    Guard["Auth + Scope Guard + Mandate Policy"]
+    Core["Multi-Agent Coordinator & Schedulers"]
+    Audit["Ed25519 Claims + SHA-256 Audit Log"]
   end
 
-  subgraph Upstream["Valio Aimo Backend"]
-    ValioAPI["Valio Price & Availability API (<10 req/s paced queue + Retry-After)"]
+  subgraph Data["Storage & Supplier"]
+    DB[("SQLite (Kitchen, Quotes, Orders, Audit)")]
+    Valio["Valio Price & Stock API (<10 req/s)"]
   end
 
-  ExtMCP --> MCP
-  ExtREST --> REST
-  Desk <-->|"REST + SSE /v1/stream"| REST
-  Desk <--> SSE
-  Voice --> Vapi
+  UI <-->|"REST + Live SSE"| Guard
+  MCP -->|"Scoped MCP Tools"| Guard
+  Voice -->|"Locked Event Drafts"| Guard
+  REST -->|"OpenAPI /v1/*"| Guard
 
-  REST & MCP & Vapi --> Auth --> RL
-  RL --> Sanitize & Cat & Policy & Tx & Ops
-  Tx --> Policy
-  Tx --> HumanSig
-  Cat & Tx -->|"Shortlisted SKUs only (≤25)"| ValioAPI
-  Cat & Tx --> Claims
-  Auth & Policy & Tx & Ops --> Audit --> DB
-  Audit -.->|"auditBus event fan-out"| SSE
-  Ops --> DB
+  Guard --> Core
+  Core --> Audit --> DB
+  Core -->|"Shortlisted SKUs only"| Valio
 ```
 
-</details>
+### 2. Multi-Agent Roles & Handoffs
+
+Inside the Gateway, four specialist agents each perform a single task — enforced by `403` middleware on every call — while only the Human Buyer can approve overrides or edit Mandate rules:
+
+```mermaid
+flowchart TD
+  Planner["1. Kitchen Planner — Reads pantry stock, recipes & events; computes shortfalls (Cannot spend)"]
+  Sourcing["2. Sourcing Agent — Searches 17.5k SKUs, checks live Valio price/stock & issues Quotes (No kitchen/orders)"]
+  Procurement["3. Procurement Agent — Creates Order Intents & commits ONLY within Mandate (Cannot self-approve)"]
+  ValioAgent["4. Valio Account Agent — Supplier-side stock-out & savings watcher (Never sees private kitchen)"]
+
+  Mandate{"17-Rule Mandate Gate"}
+  Auto["Committed Order (ORD-*)"]
+  Human["Human Buyer (Web UI) — Approves Overrides, Unlocks Voice Drafts & Edits Rules"]
+
+  Planner -->|"What & when we need it"| Sourcing
+  ValioAgent -.->|"Stock-out / savings suggestion"| Human
+  Human -.->|"Accepts suggestion"| Sourcing
+  Sourcing -->|"Signed Quote (QUO-*)"| Procurement
+  Procurement --> Mandate
+
+  Mandate -->|"Within limits (auto_eligible)"| Auto
+  Mandate -->|"Over budget / substitution (pending_approval)"| Human
+  Human -->|"Passkey / Rule Override"| Auto
+```
+
+### 3. Background Scheduling & Automation
+
+Three background schedulers run inside the Gateway (`apps/gateway/src/index.ts`), and every scheduled trigger flows through the exact same Mandate policy gate:
+
+```mermaid
+flowchart LR
+  subgraph Schedulers["Background Schedulers in Gateway"]
+    S1["Restock Scheduler (per-customer interval) — Syncs POS/inventory & checks low/expiring stock"]
+    S2["Standing Order Scheduler (every 10m) — Checks recurring weekday orders vs leadTimeDays"]
+    S3["Event / Banquet Scheduler (every 30m) — Refreshes plans ≤21d out; orders on orderBy date"]
+  end
+
+  VoiceLock["Voice Event Guard — Phone drafts stay locked (autoOrder = false) until Buyer approves"]
+
+  Pipeline["Planner → Sourcing → Procurement"]
+  Policy{"Within Mandate?"}
+  Commit["Auto-Committed + Kitchen Stock-on-Order Updated"]
+  Queue["Queued in Needs Your OK + Live SSE Alert to UI"]
+
+  VoiceLock -.->|"Unlocks after email/UI OK"| S3
+  S1 & S2 & S3 --> Pipeline --> Policy
+  Policy -->|"Yes"| Commit
+  Policy -->|"No (over cap / sub / late)"| Queue
+```
 
 ### Monorepo Structure
 
@@ -136,62 +150,6 @@ The repository is organized as an npm workspaces monorepo (`apps/*`, `packages/*
    - Buyer-owned kitchen state (`inventory` with `shelfLifeDays`/`expiresOn`, `recipes`, `order_history`, `standing_orders`, `events`) lives in SQLite and syncs automatically when orders commit or deliveries/cooking runs are logged.
    - Three background schedulers (`startRestockScheduler`, `startStandingScheduler`, `startEventScheduler`) monitor low stock, recurring schedules, and upcoming event `orderBy` deadlines.
    - **Voice Event Proposals (`hotel/voice.ts`):** Handles Vapi phone calls (`/vapi/tools`) and simulated presets (`/v1/voice/simulate`) to draft banquet events with `autoOrder: false`, issuing a hashed single-use POST approval link (`/approval/voice/:token`) so a phone call can **never** spend money without explicit buyer confirmation.
-
-### End-to-End Transaction Sequence
-
-![Two-Phase Transaction Safety Pipeline](docs/assets/transaction-lifecycle.svg)
-
-<details>
-<summary><strong>View step-by-step Mermaid sequence diagram</strong></summary>
-
-```mermaid
-sequenceDiagram
-  autonumber
-  participant Agent as External / Scoped Agent
-  participant GW as Agent Gateway (:8787)
-  participant Valio as Valio Price & Stock API
-  participant Desk as Human Buyer Desk (:5173)
-
-  Agent->>GW: POST /v1/quotes (shortlisted need / multi-item basket)
-  GW->>Valio: Fetch live /api/price & /api/availability (≤25 SKUs, <10 req/s)
-  Valio-->>GW: Live unit prices, scheduleLines, salesBlock
-  GW-->>Agent: Signed Quote (QUO-*, validUntil, Ed25519 v2 claims, availabilityHeld=false)
-
-  Agent->>GW: POST /v1/orders/intent { quoteId }
-  GW->>GW: Evaluate 17-rule Mandate Policy + compute snapshotHash
-
-  alt Within Mandate (auto_eligible)
-    GW-->>Agent: Intent status = auto_eligible
-  else Exceeds Mandate / Policy Rule Fails (pending_approval)
-    GW-->>Agent: Intent status = pending_approval (failingRules)
-    GW-->>Desk: SSE /v1/stream push notification
-    Desk->>GW: POST /v1/orders/:id/approve-challenge
-    GW-->>Desk: Deterministic SHA-256 challenge (intentId:snapshotHash:failingRules)
-    Desk->>GW: POST /v1/orders/:id/approve (buyer key + acknowledgedRules + WebAuthn/P-256 sig + optional authorizedFallback)
-    GW->>GW: Verify signature & snapshotHash → status = approved (append human_approved audit)
-  end
-
-  Agent->>GW: POST /v1/orders/:id/commit { idempotencyKey }
-  GW->>Valio: Live revalidation (/api/price & /api/availability)
-  alt Primary SKU stocked out & authorizedFallback configured
-    GW->>Valio: Check fallback SKU stock & maxTotalPrice ceiling
-    GW->>GW: Execute cold-chain fallback cascade (cascadeExecuted)
-  end
-  GW->>GW: Enforce firm quote window / priceDriftTolerancePct + idempotency lock
-  GW-->>Agent: Committed Order (ORD-*) + append SHA-256 hash-chained audit event
-```
-
-</details>
-
-### Buyer & Kitchen Desk Interface (`@tta/desk`)
-
-While external agents transact over machine-strict REST/MCP contracts, the human buyer plane translates cryptographic claims, `snapshotHash` locks, and 17-rule policy verdicts into calm, zero-jargon kitchen screens:
-
-| 1 · Natural-Language Sourcing & Ranked Options | 2 · Accountable Human Sign-Off (`pending_approval`) |
-| :---: | :---: |
-| ![New Order View](figma-designs/frames/01-new-order-simple.svg) | ![Approval View](figma-designs/frames/02-needs-your-ok-simple.svg) |
-| **3 · Mandate Governance & Spend Boundaries** | **4 · Order History & Verifiable Audit Receipts** |
-| ![Mandate Rules View](figma-designs/frames/03-my-rules-simple.svg) | ![Order History View](figma-designs/frames/04-past-orders-simple.svg) |
 
 ### Data & Storage Architecture
 
@@ -340,8 +298,6 @@ Order-flow hardening: identical open intents are reused (no duplicates), stale i
 ## The agent team (multi-agent, least privilege)
 
 Four specialist agents, each with its own credential and a narrow capability set that the **gateway enforces on every request** (not prompt wording). See `apps/gateway/src/agents/registry.ts`.
-
-![Least-Privilege Multi-Agent Isolation Matrix](docs/assets/multi-agent-isolation.svg)
 
 | Agent | Side | Key | Can | Cannot |
 |-------|------|-----|-----|--------|
