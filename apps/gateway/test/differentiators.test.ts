@@ -1,13 +1,50 @@
 import "./setup-db.js";
-import { test, before } from "node:test";
+import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { generateKeyPairSync, sign } from "node:crypto";
 import { config } from "../src/config.js";
 
+const realFetch = globalThis.fetch;
 let app: { request: (path: string, init?: RequestInit) => Promise<Response> };
 
 before(async () => {
+  const { getProduct } = await import("../src/catalog/index.js");
+  const tomorrowIso = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const u = String(url);
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    const ids: string[] = Array.isArray(body.products) ? body.products : [];
+    const json = u.endsWith("/api/price")
+      ? {
+          currency: "EUR",
+          products: ids.map((id, idx) => {
+            const packSize = Math.max(1, getProduct(id)?.packSize ?? 1);
+            return {
+              productId: id,
+              catalogPrice: { value: Math.round(packSize * (1.55 + idx * 0.02) * 100) / 100 },
+            };
+          }),
+        }
+      : {
+          products: ids.map((id) => ({
+            productId: id,
+            salesBlock: false,
+            scheduleLines: [
+              { availableAmount: 5000, availableDate: tomorrowIso, salesUnit: "pack" },
+            ],
+          })),
+        };
+    return new Response(JSON.stringify(json), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+
   app = (await import("../src/routes/api.js")).createApi() as typeof app;
+});
+
+after(() => {
+  globalThis.fetch = realFetch;
 });
 
 const buyerHeaders = {
@@ -90,7 +127,7 @@ test("mandate Time-Machine simulator returns counterfactual flipped orders and s
   assert.ok(sim.flippedOrders.length >= 1);
 });
 
-test("Security Arena runs all 5 scenarios and audit tamper X-ray never mutates SQLite", async () => {
+test("Security Arena runs all 5 scenarios and audit tamper X-ray never mutates Postgres", async () => {
   const allRes = await app.request("/v1/arena/run", {
     method: "POST",
     headers: buyerHeaders,

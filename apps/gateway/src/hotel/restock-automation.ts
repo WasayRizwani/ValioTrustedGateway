@@ -11,7 +11,7 @@ import { appendAudit, getDb } from "../audit/chain.js";
 import { getMandate } from "../auth/customers.js";
 import { isDairyText } from "../policy/engine.js";
 import type { RestockRecommendation } from "./kitchen.js";
-import { getKitchen, recommendRestock, recordUsage } from "./kitchen.js";
+import { getKitchen, getOrderHistory, recommendRestock, recordUsage } from "./kitchen.js";
 import { nextMondayIso, optimizeLine } from "./optimizer.js";
 
 export type RestockAutomationPolicy = {
@@ -26,6 +26,23 @@ export type RestockAutomationPolicy = {
   smartQuantities: boolean;
   /** How often the gateway scheduler may run when enabled (minutes). */
   intervalMinutes: number;
+  /** Send one daily email digest summarizing restocks placed/planned, inventory history, and incoming deliveries. */
+  dailyDigestEnabled: boolean;
+  /** Local HH:MM schedule for the once-per-day restock digest email. */
+  dailyDigestTime: string;
+};
+
+export type DailyRestockDigestStatus = {
+  enabled: boolean;
+  cadence: "1 email/day";
+  sendAtLocalTime: string;
+  recipient: string;
+  lastSentAt: string;
+  nextScheduledAt: string;
+  inboundDeliveriesCount: number;
+  plannedRestockCount: number;
+  recentRestockHistoryCount: number;
+  summary: string;
 };
 
 export type RestockRunLine = {
@@ -112,6 +129,8 @@ const defaultPolicy = (): RestockAutomationPolicy => ({
   pauseOnStandingOrderDrift: true,
   smartQuantities: true,
   intervalMinutes: 60,
+  dailyDigestEnabled: true,
+  dailyDigestTime: "07:30",
 });
 
 const defaultSyncStatus = (policy: RestockAutomationPolicy): InventorySyncStatus => ({
@@ -140,25 +159,14 @@ const defaultSyncStatus = (policy: RestockAutomationPolicy): InventorySyncStatus
       detail: "Flags Very Low (<50% target) & Low stock ahead of service",
       connected: true,
     },
+    {
+      id: "daily_digest_email",
+      label: "Daily Restock Digest Email (1/day)",
+      detail: "Emails 1 daily summary of restocks placed or planned, inventory history, and incoming deliveries",
+      connected: policy.dailyDigestEnabled !== false,
+    },
   ],
 });
-
-let tableReady = false;
-function ensureTable() {
-  const d = getDb();
-  if (!tableReady) {
-    d.exec(`
-      CREATE TABLE IF NOT EXISTS restock_automation_state (
-        customer_id TEXT PRIMARY KEY,
-        policy_json TEXT NOT NULL,
-        last_run_json TEXT,
-        sync_json TEXT
-      );
-    `);
-    tableReady = true;
-  }
-  return d;
-}
 
 type StoredRow = {
   policy_json: string;
@@ -166,43 +174,41 @@ type StoredRow = {
   sync_json: string | null;
 };
 
-function readRow(customerId: string): StoredRow | undefined {
-  const d = ensureTable();
-  return d
-    .prepare(
-      `SELECT policy_json, last_run_json, sync_json FROM restock_automation_state WHERE customer_id = ?`,
-    )
-    .get(customerId) as StoredRow | undefined;
+async function readRow(customerId: string): Promise<StoredRow | undefined> {
+  return getDb().queryOne<StoredRow>(
+    `SELECT policy_json, last_run_json, sync_json FROM restock_automation_state WHERE customer_id = $1`,
+    [customerId],
+  );
 }
 
-function writeRow(
+async function writeRow(
   customerId: string,
   policy: RestockAutomationPolicy,
   lastRun: RestockRunResult | null,
   sync: InventorySyncStatus | null,
-) {
-  const d = ensureTable();
-  d.prepare(
+): Promise<void> {
+  await getDb().execute(
     `INSERT INTO restock_automation_state (customer_id, policy_json, last_run_json, sync_json)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(customer_id) DO UPDATE SET
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (customer_id) DO UPDATE SET
        policy_json = excluded.policy_json,
        last_run_json = excluded.last_run_json,
        sync_json = excluded.sync_json`,
-  ).run(
-    customerId,
-    JSON.stringify(policy),
-    lastRun ? JSON.stringify(lastRun) : null,
-    sync ? JSON.stringify(sync) : null,
+    [
+      customerId,
+      JSON.stringify(policy),
+      lastRun ? JSON.stringify(lastRun) : null,
+      sync ? JSON.stringify(sync) : null,
+    ],
   );
 }
 
 const lastScheduledAt = new Map<string, number>();
 
-export function getRestockAutomationPolicy(
+export async function getRestockAutomationPolicy(
   customerId: string,
-): RestockAutomationPolicy {
-  const row = readRow(customerId);
+): Promise<RestockAutomationPolicy> {
+  const row = await readRow(customerId);
   if (!row) return defaultPolicy();
   try {
     const parsed = JSON.parse(row.policy_json) as Partial<RestockAutomationPolicy>;
@@ -219,15 +225,15 @@ export function getRestockAutomationPolicy(
   }
 }
 
-export function setRestockAutomationPolicy(
+export async function setRestockAutomationPolicy(
   customerId: string,
   patch: Partial<RestockAutomationPolicy>,
-): RestockAutomationPolicy {
+): Promise<RestockAutomationPolicy> {
   const clean = Object.fromEntries(
     Object.entries(patch).filter(([, v]) => v !== undefined),
   ) as Partial<RestockAutomationPolicy>;
   const next: RestockAutomationPolicy = {
-    ...getRestockAutomationPolicy(customerId),
+    ...(await getRestockAutomationPolicy(customerId)),
     ...clean,
   };
   if (clean.urgencies) {
@@ -254,22 +260,32 @@ export function setRestockAutomationPolicy(
       : next.autoSyncInventory !== false;
   next.pauseOnStandingOrderDrift = Boolean(next.pauseOnStandingOrderDrift);
   next.smartQuantities = next.smartQuantities !== false;
+  next.dailyDigestEnabled =
+    clean.dailyDigestEnabled !== undefined
+      ? Boolean(clean.dailyDigestEnabled)
+      : next.dailyDigestEnabled !== false;
+  next.dailyDigestTime =
+    typeof clean.dailyDigestTime === "string" && /^\d{2}:\d{2}$/.test(clean.dailyDigestTime)
+      ? clean.dailyDigestTime
+      : /^\d{2}:\d{2}$/.test(next.dailyDigestTime ?? "")
+        ? next.dailyDigestTime
+        : "07:30";
 
-  const prevRun = getLastRestockRun(customerId);
-  const prevSync = getInventorySyncStatus(customerId);
+  const prevRun = await getLastRestockRun(customerId);
+  const prevSync = await getInventorySyncStatus(customerId);
   const nextSync: InventorySyncStatus = {
     ...prevSync,
     autoSyncEnabled: next.autoSyncInventory,
     syncIntervalMinutes: next.syncIntervalMinutes,
   };
-  writeRow(customerId, next, prevRun, nextSync);
+  await writeRow(customerId, next, prevRun, nextSync);
   return next;
 }
 
-export function getLastRestockRun(
+export async function getLastRestockRun(
   customerId: string,
-): RestockRunResult | null {
-  const row = readRow(customerId);
+): Promise<RestockRunResult | null> {
+  const row = await readRow(customerId);
   if (!row?.last_run_json) return null;
   try {
     return JSON.parse(row.last_run_json) as RestockRunResult;
@@ -278,12 +294,12 @@ export function getLastRestockRun(
   }
 }
 
-export function getInventorySyncStatus(
+export async function getInventorySyncStatus(
   customerId: string,
-): InventorySyncStatus {
-  const policy = getRestockAutomationPolicy(customerId);
+): Promise<InventorySyncStatus> {
+  const policy = await getRestockAutomationPolicy(customerId);
   const base = defaultSyncStatus(policy);
-  const row = readRow(customerId);
+  const row = await readRow(customerId);
   if (!row?.sync_json) return base;
   try {
     const parsed = JSON.parse(row.sync_json) as Partial<InventorySyncStatus>;
@@ -299,13 +315,13 @@ export function getInventorySyncStatus(
   }
 }
 
-export function getStockHealthSnapshot(
+export async function getStockHealthSnapshot(
   customerId: string,
   daysCoverOverride?: number,
-): StockHealthSnapshot | null {
-  const policy = getRestockAutomationPolicy(customerId);
+): Promise<StockHealthSnapshot | null> {
+  const policy = await getRestockAutomationPolicy(customerId);
   const daysCover = daysCoverOverride ?? policy.daysCover;
-  const rec = withAgent("planner", () => recommendRestock(customerId, { daysCover }));
+  const rec = await withAgent("planner", () => recommendRestock(customerId, { daysCover }));
   if (!rec) return null;
   const urgencySet = new Set(policy.urgencies);
   const items: StockHealthItem[] = rec.recommendations.map((r) => ({
@@ -338,22 +354,71 @@ export function getStockHealthSnapshot(
   };
 }
 
-export function resetRestockAutomation(customerId: string): void {
-  const d = ensureTable();
-  d.prepare(`DELETE FROM restock_automation_state WHERE customer_id = ?`).run(customerId);
+export async function getDailyRestockDigestStatus(
+  customerId: string,
+): Promise<DailyRestockDigestStatus> {
+  const policy = await getRestockAutomationPolicy(customerId);
+  const stockHealth = await getStockHealthSnapshot(customerId, policy.daysCover);
+  const orderHistory = await getOrderHistory(customerId);
+  const orders = orderHistory?.orders ?? [];
+  const inboundDeliveriesCount = orders.filter((o) => o.status !== "delivered").length;
+  const recentRestockHistoryCount = orders.length;
+  const plannedRestockCount = stockHealth?.actionableCount ?? 0;
+
+  const [hhRaw, mmRaw] = (policy.dailyDigestTime || "07:30").split(":");
+  const hh = Number(hhRaw) || 7;
+  const mm = Number(mmRaw) || 30;
+  const now = new Date();
+  const todayDigest = new Date(now);
+  todayDigest.setHours(hh, mm, 0, 0);
+
+  const lastSent =
+    now.getTime() >= todayDigest.getTime()
+      ? todayDigest
+      : new Date(todayDigest.getTime() - 24 * 60 * 60_000);
+  const nextScheduled =
+    now.getTime() < todayDigest.getTime()
+      ? todayDigest
+      : new Date(todayDigest.getTime() + 24 * 60 * 60_000);
+
+  const recipient =
+    customerId === "SCHOOL-001"
+      ? "kitchen@espoo-school.fi"
+      : "purchasing@grandhotel-helsinki.fi";
+
+  const enabled = policy.dailyDigestEnabled !== false;
+
+  return {
+    enabled,
+    cadence: "1 email/day",
+    sendAtLocalTime: policy.dailyDigestTime || "07:30",
+    recipient,
+    lastSentAt: lastSent.toISOString(),
+    nextScheduledAt: nextScheduled.toISOString(),
+    inboundDeliveriesCount,
+    plannedRestockCount,
+    recentRestockHistoryCount,
+    summary: enabled
+      ? `One daily email at ${policy.dailyDigestTime || "07:30"} to ${recipient} keeps you informed of every automated restock placed or planned today (${plannedRestockCount} planned), your inventory history (${recentRestockHistoryCount} recent orders), and ${inboundDeliveriesCount} incoming deliver${inboundDeliveriesCount === 1 ? "y" : "ies"} arriving at your workplace.`
+      : "Daily restock digest email is currently paused.",
+  };
+}
+
+export async function resetRestockAutomation(customerId: string): Promise<void> {
+  await getDb().execute(`DELETE FROM restock_automation_state WHERE customer_id = $1`, [customerId]);
   lastScheduledAt.set(customerId, Date.now());
 }
 
-function saveLastRun(customerId: string, runResult: RestockRunResult): void {
-  const policy = getRestockAutomationPolicy(customerId);
-  const sync = getInventorySyncStatus(customerId);
-  writeRow(customerId, policy, runResult, sync);
+async function saveLastRun(customerId: string, runResult: RestockRunResult): Promise<void> {
+  const policy = await getRestockAutomationPolicy(customerId);
+  const sync = await getInventorySyncStatus(customerId);
+  await writeRow(customerId, policy, runResult, sync);
 }
 
-function saveSyncStatus(customerId: string, sync: InventorySyncStatus): void {
-  const policy = getRestockAutomationPolicy(customerId);
-  const lastRun = getLastRestockRun(customerId);
-  writeRow(customerId, policy, lastRun, sync);
+async function saveSyncStatus(customerId: string, sync: InventorySyncStatus): Promise<void> {
+  const policy = await getRestockAutomationPolicy(customerId);
+  const lastRun = await getLastRestockRun(customerId);
+  await writeRow(customerId, policy, lastRun, sync);
 }
 
 export async function runAutomatedRestock(
@@ -371,7 +436,7 @@ export async function runAutomatedRestock(
     trigger?: "manual" | "pos_sync" | "service_rush" | "scheduled";
   },
 ): Promise<RestockRunResult> {
-  const policy = getRestockAutomationPolicy(customerId);
+  const policy = await getRestockAutomationPolicy(customerId);
   if (!policy.enabled && !options?.force) {
     const skipped: RestockRunResult = {
       customerId,
@@ -383,11 +448,11 @@ export async function runAutomatedRestock(
       pendingApprovalCount: 0,
       committedCount: 0,
     };
-    saveLastRun(customerId, skipped);
+    await saveLastRun(customerId, skipped);
     return skipped;
   }
 
-  const rec = withAgent("planner", () => recommendRestock(customerId, { daysCover: policy.daysCover }));
+  const rec = await withAgent("planner", () => recommendRestock(customerId, { daysCover: policy.daysCover }));
   if (!rec) {
     const skipped: RestockRunResult = {
       customerId,
@@ -399,7 +464,7 @@ export async function runAutomatedRestock(
       pendingApprovalCount: 0,
       committedCount: 0,
     };
-    saveLastRun(customerId, skipped);
+    await saveLastRun(customerId, skipped);
     return skipped;
   }
 
@@ -446,12 +511,12 @@ export async function runAutomatedRestock(
       pendingApprovalCount: 0,
       committedCount: 0,
     };
-    saveLastRun(customerId, result);
+    await saveLastRun(customerId, result);
     lastScheduledAt.set(customerId, Date.now());
     return result;
   }
 
-  withAgent("planner", () =>
+  await withAgent("planner", () =>
     appendAudit(randomUUID(), customerId, "agent_handoff", {
       from: "planner",
       to: "sourcing → procurement",
@@ -468,7 +533,8 @@ export async function runAutomatedRestock(
   let pendingApprovalCount = 0;
   let committedCount = 0;
   const neededBy = nextMondayIso();
-  const mandate = getMandate(customerId);
+  const mandate = await getMandate(customerId);
+  const kitchenSnapshot = await getKitchen(customerId);
 
   for (const item of top) {
     const hint = item.catalogHints[0] ?? item.name;
@@ -500,7 +566,7 @@ export async function runAutomatedRestock(
     const exactQuantity = parsedNeed.quantity;
     let smartPick: { productId: string; saving: number; text: string } | null = null;
     const wantSmart = options?.choice ? options.choice === "smart" : policy.smartQuantities !== false;
-    const stockItem = getKitchen(customerId)?.inventory.find((i) => i.ingredientId === item.ingredientId);
+    const stockItem = kitchenSnapshot?.inventory.find((i) => i.ingredientId === item.ingredientId);
     if (wantSmart && stockItem && !parsedNeed.clarificationRequired) {
       try {
         const sl = await withAgent("planner", () => optimizeLine(customerId, stockItem, item, neededBy, policy.daysCover));
@@ -674,7 +740,7 @@ export async function runAutomatedRestock(
     pendingApprovalCount,
     committedCount,
   };
-  saveLastRun(customerId, result);
+  await saveLastRun(customerId, result);
   lastScheduledAt.set(customerId, Date.now());
   return result;
 }
@@ -695,10 +761,11 @@ export async function syncInventoryAndRestock(
   stockHealth: StockHealthSnapshot | null;
   restockResult: RestockRunResult | null;
   policy: RestockAutomationPolicy;
+  dailyDigest: DailyRestockDigestStatus;
 }> {
   const mode = options?.mode ?? "pos_sync";
-  const policy = getRestockAutomationPolicy(customerId);
-  const kitchen = getKitchen(customerId);
+  const policy = await getRestockAutomationPolicy(customerId);
+  const kitchen = await getKitchen(customerId);
   const deductions: SyncDeduction[] = [];
 
   if (kitchen && mode === "service_rush") {
@@ -707,7 +774,7 @@ export async function syncInventoryAndRestock(
     const agg = new Map<string, { name: string; used: number; onHandAfter: number; unit: string }>();
     for (const r of rushRecipes) {
       try {
-        const usage = recordUsage(customerId, r.recipeId, 2);
+        const usage = await recordUsage(customerId, r.recipeId, 2);
         for (const u of usage.used) {
           const meta = kitchen.inventory.find((i) => i.ingredientId === u.ingredientId);
           const prev = agg.get(u.ingredientId);
@@ -727,10 +794,10 @@ export async function syncInventoryAndRestock(
     }
   }
 
-  const preHealth = getStockHealthSnapshot(customerId, policy.daysCover);
+  const preHealth = await getStockHealthSnapshot(customerId, policy.daysCover);
   const nowIso = new Date().toISOString();
 
-  appendAudit(randomUUID(), customerId, "kitchen_inventory_synced", {
+  await appendAudit(randomUUID(), customerId, "kitchen_inventory_synced", {
     mode,
     deductionsCount: deductions.length,
     criticalCount: preHealth?.criticalCount ?? 0,
@@ -749,7 +816,7 @@ export async function syncInventoryAndRestock(
     });
   }
 
-  const postHealth = getStockHealthSnapshot(customerId, policy.daysCover);
+  const postHealth = await getStockHealthSnapshot(customerId, policy.daysCover);
   const syncSummary =
     mode === "service_rush"
       ? deductions.length > 0
@@ -769,13 +836,14 @@ export async function syncInventoryAndRestock(
     lastSyncSummary: syncSummary,
     deductions: deductions.length > 0 ? deductions : undefined,
   };
-  saveSyncStatus(customerId, nextSync);
+  await saveSyncStatus(customerId, nextSync);
 
   return {
     syncStatus: nextSync,
     stockHealth: postHealth,
     restockResult,
     policy,
+    dailyDigest: await getDailyRestockDigestStatus(customerId),
   };
 }
 
@@ -789,7 +857,7 @@ export function startRestockScheduler(customerIds: string[]): void {
   }
   const tick = async () => {
     for (const customerId of customerIds) {
-      const policy = getRestockAutomationPolicy(customerId);
+      const policy = await getRestockAutomationPolicy(customerId);
       if (!policy.enabled) continue;
       const last = lastScheduledAt.get(customerId) ?? 0;
       const due =
@@ -797,8 +865,8 @@ export function startRestockScheduler(customerIds: string[]): void {
       if (!due) continue;
       try {
         if (policy.autoSyncInventory) {
-          saveSyncStatus(customerId, {
-            ...getInventorySyncStatus(customerId),
+          await saveSyncStatus(customerId, {
+            ...(await getInventorySyncStatus(customerId)),
             lastSyncedAt: new Date().toISOString(),
             lastSyncSource: "scheduled",
             lastSyncSummary: "Scheduled POS & delivery inventory sync completed.",

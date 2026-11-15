@@ -65,6 +65,10 @@ test("GET /v1/kitchen/restock/automation exposes active auto-sync, low/critical 
   assert.ok(json.stockHealth);
   assert.ok(json.stockHealth.criticalCount >= 1);
   assert.ok(Array.isArray(json.stockHealth.items));
+  assert.equal(json.policy.dailyDigestEnabled, true);
+  assert.equal(json.dailyDigest.enabled, true);
+  assert.equal(json.dailyDigest.cadence, "1 email/day");
+  assert.match(json.dailyDigest.summary, /One daily email/i);
 });
 
 test("PUT /v1/kitchen/restock/automation persists urgency filter and sync cadence", async () => {

@@ -13,37 +13,40 @@ const intentId = randomUUID();
 const otherRun = randomUUID();
 const otherId = randomUUID();
 
-function seed(id: string, run: string, customer: string, status: string, policy: object, extra: { approve?: boolean; commit?: boolean } = {}) {
+async function seed(id: string, run: string, customer: string, status: string, policy: object, extra: { approve?: boolean; commit?: boolean } = {}) {
   const need = { productIntent: "milk", quantity: 800, unit: "litre", neededBy: "2030-01-10", constraints: {} };
   const basket = [{ productId: "P1", productName: "Valio milk 1 l", packs: 800, packSize: 1, packUnit: "L", totalQuantity: 800, quantityUnit: "L", unitPrice: 1, totalPrice: 800, comparisonPrice: null, comparisonUnit: null, availableQuantity: 5000, availableDate: "2030-01-08", deliveryReliability: 0.97, claimIds: ["sigA", "sigB"], isSubstitution: false, labels: [], allergens: [], mayContain: [], certifications: [], origin: null, producer: null }];
   const meta = { rationale: ["Cheapest offer that arrives in time."], consideredOffers: 3, alternatives: [{ productId: "P2", productName: "Pricey milk", totalPrice: 900, deltaEur: 100, availableDate: "2030-01-08", deliveryReliability: 0.9, canFulfil: true, isSubstitution: false, certifications: [], origin: null, note: "" }] };
   const now = new Date().toISOString();
-  getDb().prepare(`INSERT INTO order_intents (id,customer_id,run_id,status,need_json,basket_json,snapshot_hash,policy_json,total_price,needed_by,expires_at,created_at,updated_at,meta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(id, customer, run, status, JSON.stringify(need), JSON.stringify(basket), "h", JSON.stringify(policy), 800, "2030-01-10", "2999-01-01T00:00:00Z", now, now, JSON.stringify(meta));
-  appendAudit(run, customer, "need_validated", need);
-  appendAudit(run, customer, "offers_built", { count: 3, top: [] });
-  appendAudit(run, customer, "intent_created", { intentId: id, productName: "Valio milk 1 l", totalPrice: 800, why: meta.rationale, alternatives: 1 });
-  appendAudit(run, customer, "policy_evaluated", policy);
-  if (extra.approve) appendAudit(run, customer, "human_approved", { intentId: id, mandateOverride: true, acknowledgedRules: ["over_spend"] });
+  await getDb().execute(
+    `INSERT INTO order_intents (id,customer_id,run_id,status,need_json,basket_json,snapshot_hash,policy_json,total_price,needed_by,expires_at,created_at,updated_at,meta_json)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+    [id, customer, run, status, JSON.stringify(need), JSON.stringify(basket), "h", JSON.stringify(policy), 800, "2030-01-10", "2999-01-01T00:00:00Z", now, now, JSON.stringify(meta)],
+  );
+  await appendAudit(run, customer, "need_validated", need);
+  await appendAudit(run, customer, "offers_built", { count: 3, top: [] });
+  await appendAudit(run, customer, "intent_created", { intentId: id, productName: "Valio milk 1 l", totalPrice: 800, why: meta.rationale, alternatives: 1 });
+  await appendAudit(run, customer, "policy_evaluated", policy);
+  if (extra.approve) await appendAudit(run, customer, "human_approved", { intentId: id, mandateOverride: true, acknowledgedRules: ["over_spend"] });
   if (extra.commit) {
-    appendAudit(run, customer, "revalidating", { intentId: id });
-    appendAudit(run, customer, "committed", { orderId: "ORD-1", intentId: id, totalPrice: 800 });
+    await appendAudit(run, customer, "revalidating", { intentId: id });
+    await appendAudit(run, customer, "committed", { orderId: "ORD-1", intentId: id, totalPrice: 800 });
   }
 }
 
 before(async () => {
   configureRateLimits({ generalPerMin: 1000, sensitivePerMin: 1000 });
   const pol = { decision: "pending_approval", reasons: ["Total €800.00 exceeds mandate max €500"], failingRules: ["over_spend"] };
-  seed(intentId, runId, "HOTEL-001", "committed", pol, { approve: true, commit: true });
-  seed(otherId, otherRun, "SCHOOL-001", "pending_approval", pol);
+  await seed(intentId, runId, "HOTEL-001", "committed", pol, { approve: true, commit: true });
+  await seed(otherId, otherRun, "SCHOOL-001", "pending_approval", pol);
   const { createApi } = await import("../src/routes/api.js");
   app = createApi() as typeof app;
 });
 
 const get = (key: string, path: string) => app.request(path, { headers: { "x-api-key": key } });
 
-test("explain: plain-English summary, timeline, decision and facts", () => {
-  const x = explainOrder(intentId, "HOTEL-001")!;
+test("explain: plain-English summary, timeline, decision and facts", async () => {
+  const x = (await explainOrder(intentId, "HOTEL-001"))!;
   assert.ok(x);
   assert.match(x.summary, /milk/);
   assert.match(x.summary, /overrode/);
@@ -77,24 +80,23 @@ test("explain: allowed for roles that can read orders, refused for others (REST 
   assert.equal(mcpToolAllowed({ role: "buyer" }, "explain_order"), true);
 });
 
-test("explain: tampering with an audit event's payload in SQLite invalidates verifyAuditChain", () => {
+test("explain: tampering with an audit event's payload in Postgres invalidates verifyAuditChain", async () => {
   const db = getDb();
-  const cols = (db.prepare("PRAGMA table_info(audit_events)").all() as Array<{ name: string }>).map((c) => c.name);
-  const payloadCol = cols.includes("payload_json") ? "payload_json" : "payload";
-  const row = db
-    .prepare(`SELECT id, ${payloadCol} AS payload FROM audit_events WHERE run_id = ? ORDER BY id ASC LIMIT 1`)
-    .get(runId) as { id: number; payload: string };
+  const row = await db.queryOne<{ id: number; payload: string }>(
+    `SELECT id, payload FROM audit_events WHERE run_id = $1 ORDER BY id ASC LIMIT 1`,
+    [runId],
+  );
   assert.ok(row);
   try {
-    db.prepare(`UPDATE audit_events SET ${payloadCol} = ? WHERE id = ?`).run(
+    await db.execute(`UPDATE audit_events SET payload = $1 WHERE id = $2`, [
       JSON.stringify({ tampered: true }),
       row.id,
-    );
-    const verify = verifyAuditChain(runId, "HOTEL-001");
+    ]);
+    const verify = await verifyAuditChain(runId, "HOTEL-001");
     assert.equal(verify.valid, false);
-    assert.equal(verify.brokenAt, row.id);
+    assert.equal(verify.brokenAt, Number(row.id));
   } finally {
-    db.prepare(`UPDATE audit_events SET ${payloadCol} = ? WHERE id = ?`).run(row.payload, row.id);
+    await db.execute(`UPDATE audit_events SET payload = $1 WHERE id = $2`, [row.payload, row.id]);
   }
-  assert.equal(verifyAuditChain(runId, "HOTEL-001").valid, true);
+  assert.equal((await verifyAuditChain(runId, "HOTEL-001")).valid, true);
 });

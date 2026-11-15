@@ -1,6 +1,4 @@
-// Imported FIRST by tests that statically import app modules: points the gateway at a throwaway database so
-// tests can never write into the real data/gateway.db.
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-process.env.GATEWAY_DB_PATH = join(mkdtempSync(join(tmpdir(), "gw-test-")), "t.db");
+// Imported FIRST by tests that statically import app modules: points the gateway at an isolated in-memory
+// PostgreSQL instance (@electric-sql/pglite) so tests run fast in the sandbox without touching external DBs.
+process.env.DATABASE_URL = "";
+process.env.PGLITE_DATA_DIR = "memory://";

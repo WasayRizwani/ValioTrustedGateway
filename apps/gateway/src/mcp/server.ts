@@ -5,13 +5,23 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { NeedSchema, SignedClaimSchema, PreferencesSchema } from "@tta/shared";
+import {
+  NeedSchema,
+  SignedClaimSchema,
+  PreferencesSchema,
+  DetachedBuyerSignatureInputSchema,
+  DisputePresetSchema,
+  SimulatedInvoiceDocumentSchema,
+  type TradeReceipt,
+} from "@tta/shared";
+import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { authenticate, getMandate } from "../auth/customers.js";
 import { searchProducts, searchFromNeed, loadCatalog } from "../catalog/index.js";
 import { buildOffers, buildOffersBatch, explainOffers } from "../catalog/offers.js";
 import { getPrices, getAvailability } from "../valio/client.js";
 import { verifyClaim, getPublicKeyPem } from "../claims/sign.js";
+import { verifyTradeReceipt, arbitrateTradeDispute } from "../claims/receipt.js";
 import {
   createOrderIntent,
   listPending,
@@ -19,6 +29,7 @@ import {
   approveOrder,
   rejectOrder,
   commitOrder,
+  ensureReceiptForCommittedOrder,
 } from "../orders/store.js";
 import { createMultiItemQuote, createQuote, getQuote } from "../orders/quotes.js";
 import { getAuditTrail, verifyAuditChain, appendAudit } from "../audit/chain.js";
@@ -292,14 +303,137 @@ export async function startMcpServer() {
       },
       {
         name: "commit_order",
-        description: "Revalidate price/availability and commit with idempotency key",
+        description:
+          "Revalidate price/availability, commit with idempotency key, and issue a dual-signed Bilateral Liability Receipt (.vtr.json). Optionally accepts a detached buyerSignature (Ed25519 or ECDSA-P256).",
         inputSchema: {
           type: "object",
           properties: {
             intentId: { type: "string" },
             idempotencyKey: { type: "string" },
+            buyerSignature: {
+              type: "object",
+              description:
+                "Optional detached buyer cryptographic signature (Ed25519 or ECDSA-P256) over canonical BuyerReceiptPayload",
+              properties: {
+                algorithm: { type: "string", enum: ["Ed25519", "ECDSA-P256"] },
+                keyId: { type: "string" },
+                publicKeyPem: { type: "string" },
+                signedAt: { type: "string" },
+                authorizedMaxTotalEur: { type: "number" },
+                actingAgentId: { type: "string" },
+                signature: { type: "string" },
+              },
+              required: ["algorithm", "keyId", "publicKeyPem", "signedAt", "signature"],
+            },
           },
           required: ["intentId", "idempotencyKey"],
+        },
+      },
+      {
+        name: "get_trade_receipt",
+        description:
+          "Fetch (or issue if missing) the dual-signed Bilateral Liability Receipt (.vtr.json) for a committed order by Order ID (ORD-...), Intent ID, or Receipt ID (VTR-...).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            id: {
+              type: "string",
+              description: "Order ID (ORD-...), Intent ID, or Receipt ID (VTR-...)",
+            },
+          },
+          required: ["id"],
+        },
+      },
+      {
+        name: "verify_trade_receipt",
+        description:
+          "Offline cryptographic verification of a portable .vtr.json Bilateral Liability Receipt (SHA-256 receiptHash, buyer Ed25519/ECDSA-P256 signature, supplier Ed25519 signature, bilateral cross-hash binding, and human override proof).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            receipt: {
+              type: "object",
+              description: "Portable .vtr.json TradeReceipt object",
+            },
+          },
+          required: ["receipt"],
+        },
+      },
+      {
+        name: "arbitrate_dispute",
+        description:
+          "Deterministic (<10 ms) 3-Way Invoice & Bilateral Liability Dispute Arbitrator. Resolves a .vtr.json TradeReceipt (inline or by Order/Intent/Receipt ID) against a preset scenario or simulated invoice/delivery document and returns a DisputeRuling.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            id: {
+              type: "string",
+              description:
+                "Order ID (ORD-...), Intent ID, or Receipt ID (VTR-...) used to resolve the receipt when inline receipt is omitted",
+            },
+            receipt: {
+              type: "object",
+              description: "Optional inline portable .vtr.json TradeReceipt object",
+            },
+            preset: {
+              type: "string",
+              enum: [
+                "price_hike_012",
+                "late_delivery",
+                "rogue_agent_chargeback",
+                "allergen_breach",
+                "tampered_receipt",
+                "clean_3way_match",
+              ],
+              description: "Optional deterministic dispute simulation preset",
+            },
+            document: {
+              type: "object",
+              description: "Optional simulated e-invoice / delivery note document for 3-way matching",
+              properties: {
+                documentId: { type: "string" },
+                documentType: {
+                  type: "string",
+                  enum: ["e_invoice", "delivery_note", "combined_3way"],
+                },
+                deliveredAt: { type: "string" },
+                buyerDisputeClaim: {
+                  type: "string",
+                  enum: [
+                    "none",
+                    "rogue_agent_hallucination",
+                    "price_overcharge",
+                    "late_delivery",
+                    "allergen_breach",
+                  ],
+                },
+                buyerDisputeNote: { type: "string" },
+                billedTotalEur: { type: "number" },
+                currency: { type: "string" },
+                lines: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      productId: { type: "string" },
+                      productName: { type: "string" },
+                      billedPacks: { type: "number" },
+                      deliveredPacks: { type: "number" },
+                      billedQuantity: { type: "number" },
+                      deliveredQuantity: { type: "number" },
+                      billedUnitPriceEur: { type: "number" },
+                      billedPricePerQtyUnitEur: { type: "number" },
+                      billedLineTotalEur: { type: "number" },
+                      deliveredAllergens: { type: "array", items: { type: "string" } },
+                      deliveredLactoseFree: { type: "boolean" },
+                    },
+                    required: ["productId", "billedLineTotalEur"],
+                  },
+                },
+              },
+              required: ["billedTotalEur", "lines"],
+            },
+          },
         },
       },
       {
@@ -373,11 +507,11 @@ export async function startMcpServer() {
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const name = req.params.name;
     const args = (req.params.arguments ?? {}) as Record<string, unknown>;
-    const mandate = getMandate(auth.customerId);
+    const mandate = await getMandate(auth.customerId);
 
     // Least privilege over MCP too: the key's role/agent decides which tools it may call.
     if (!mcpToolAllowed(auth, name)) {
-      appendAudit(randomUUID(), auth.customerId, "forbidden_action", {
+      await appendAudit(randomUUID(), auth.customerId, "forbidden_action", {
         action: `MCP tool ${name}`,
         role: auth.agentId ? `${AGENTS[auth.agentId as AgentId].short} agent` : auth.role,
         agent: auth.agentId ?? null,
@@ -395,7 +529,7 @@ export async function startMcpServer() {
     // Rate limit per API key (stable code `rate_limited`) and cap price/availability shortlists.
     const limited = checkLimit(apiKey ?? "", SENSITIVE_TOOLS.has(name), auth.role);
     if (!limited.ok) {
-      auditRefusal(apiKey ?? "", auth.customerId, limited, `MCP tool ${name}`, auth.agentId);
+      await auditRefusal(apiKey ?? "", auth.customerId, limited, `MCP tool ${name}`, auth.agentId);
       return { isError: true, content: [{ type: "text", text: JSON.stringify(rateLimitBody(limited)) }] };
     }
     if (name === "get_prices" || name === "get_availability" || name === "rank_offers" || name === "request_quote") {
@@ -478,7 +612,7 @@ export async function startMcpServer() {
             });
           }
           const quoteId = args.quoteId as string | undefined;
-          const quote = quoteId ? getQuote(quoteId, auth.customerId) : undefined;
+          const quote = quoteId ? await getQuote(quoteId, auth.customerId) : undefined;
           if (quoteId && quote?.isMultiItemBasket && quote.lines.length > 1) {
             return createOrderIntent({
               customerId: auth.customerId,
@@ -512,13 +646,13 @@ export async function startMcpServer() {
           });
         }
         case "get_quote":
-          return getQuote(String(args.quoteId), auth.customerId) ?? { error: "not_found" };
+          return (await getQuote(String(args.quoteId), auth.customerId)) ?? { error: "not_found" };
         case "list_pending_approvals":
-          return { intents: listPending(auth.customerId) };
+          return { intents: await listPending(auth.customerId) };
         case "get_order_intent":
-          return getIntent(String(args.intentId), auth.customerId);
+          return await getIntent(String(args.intentId), auth.customerId);
         case "explain_order":
-          return explainOrder(String(args.intentId), auth.customerId) ?? { error: "not_found" };
+          return (await explainOrder(String(args.intentId), auth.customerId)) ?? { error: "not_found" };
         case "approve_order":
           if (auth.role !== "buyer") throw new Error("forbidden: agent credentials cannot approve orders");
           return approveOrder(
@@ -540,16 +674,114 @@ export async function startMcpServer() {
             String(args.snapshotHash),
             args.reason as string | undefined,
           );
-        case "commit_order":
-          return commitOrder({
+        case "commit_order": {
+          const buyerSignature = DetachedBuyerSignatureInputSchema.optional().parse(
+            args.buyerSignature,
+          );
+          const intent = await commitOrder({
             intentId: String(args.intentId),
             customerId: auth.customerId,
             idempotencyKey: String(args.idempotencyKey ?? randomUUID()),
+            buyerSignature,
           });
+          const receipt = await ensureReceiptForCommittedOrder(intent.id, auth.customerId);
+          return {
+            ...intent,
+            orderId: intent.committedOrderId,
+            confirmation: {
+              orderId: intent.committedOrderId,
+              status: intent.status,
+              lines: intent.basket,
+              totalPrice: intent.totalPrice,
+              confirmedAt: intent.updatedAt,
+              runId: intent.runId,
+            },
+            intent,
+            receipt,
+          };
+        }
+        case "get_trade_receipt": {
+          const { id } = z
+            .object({
+              id: z
+                .string()
+                .min(1)
+                .describe("Order ID (ORD-...), Intent ID, or Receipt ID (VTR-...)"),
+            })
+            .parse({
+              id: args.id ?? args.orderId ?? args.intentId ?? args.receiptId,
+            });
+          return (
+            (await ensureReceiptForCommittedOrder(id, auth.customerId)) ?? {
+              error: "not_found",
+            }
+          );
+        }
+        case "verify_trade_receipt": {
+          const { receipt } = z
+            .object({
+              receipt: z.record(z.unknown()).describe("Portable .vtr.json TradeReceipt object"),
+            })
+            .parse(args);
+          const target =
+            "receipt" in receipt &&
+            !("receiptId" in receipt) &&
+            receipt.receipt &&
+            typeof receipt.receipt === "object"
+              ? (receipt.receipt as TradeReceipt)
+              : (receipt as unknown as TradeReceipt);
+          return verifyTradeReceipt(target);
+        }
+        case "arbitrate_dispute": {
+          const parsed = z
+            .object({
+              id: z.string().optional(),
+              receipt: z.record(z.unknown()).optional(),
+              preset: DisputePresetSchema.optional(),
+              document: SimulatedInvoiceDocumentSchema.optional(),
+            })
+            .parse({
+              ...args,
+              id: args.id ?? args.orderId ?? args.receiptId ?? args.intentId,
+            });
+          let receipt: TradeReceipt | null = null;
+          if (parsed.receipt) {
+            const raw = parsed.receipt;
+            receipt =
+              "receipt" in raw &&
+              !("receiptId" in raw) &&
+              raw.receipt &&
+              typeof raw.receipt === "object"
+                ? (raw.receipt as TradeReceipt)
+                : (raw as unknown as TradeReceipt);
+          } else if (parsed.id) {
+            receipt = await ensureReceiptForCommittedOrder(parsed.id, auth.customerId);
+            if (!receipt) {
+              throw new Error(
+                `receipt_not_found: No committed order or bilateral receipt found for ${parsed.id}`,
+              );
+            }
+          } else {
+            throw new Error(
+              "receipt_required: Provide either `id` (Order ID, Intent ID, or Receipt ID) or `receipt` (.vtr.json)",
+            );
+          }
+          const fallbackDoc =
+            !parsed.preset &&
+            !parsed.document &&
+            !(receipt as unknown as { supplier?: { payload?: unknown } })?.supplier?.payload
+              ? SimulatedInvoiceDocumentSchema.parse({ billedTotalEur: 0, lines: [] })
+              : undefined;
+          return arbitrateTradeDispute({
+            receipt,
+            preset: parsed.preset,
+            document: parsed.document ?? fallbackDoc,
+          });
+        }
         case "get_audit_trail":
           return {
-            events: getAuditTrail(String(args.runId), auth.customerId),
-            verification: verifyAuditChain(String(args.runId), auth.customerId),
+            events: await getAuditTrail(String(args.runId), auth.customerId),
+            verification: await verifyAuditChain(String(args.runId), auth.customerId),
           };
         case "verify_audit_chain":
           return verifyAuditChain(String(args.runId), auth.customerId);
@@ -567,7 +799,7 @@ export async function startMcpServer() {
         case "get_public_key":
           return { pem: getPublicKeyPem(), keyId: process.env.CLAIM_KEY_ID };
         case "plan_menu_sourcing": {
-          const m = getMandate(auth.customerId);
+          const m = await getMandate(auth.customerId);
           if (!m) throw new Error("no mandate");
           return planSourcing(auth.customerId, m, {
             neededBy: String(args.neededBy),
@@ -576,7 +808,7 @@ export async function startMcpServer() {
           });
         }
         case "handle_stockout": {
-          const m = getMandate(auth.customerId);
+          const m = await getMandate(auth.customerId);
           if (!m) throw new Error("no mandate");
           return handleStockout(auth.customerId, m, {
             ingredientId: String(args.ingredientId),
@@ -586,7 +818,7 @@ export async function startMcpServer() {
           });
         }
         case "list_suggestions":
-          return { suggestions: listSuggestions(auth.customerId) };
+          return { suggestions: await listSuggestions(auth.customerId) };
         case "run_account_check":
           return runValioAgent(auth.customerId);
         case "accept_suggestion":
@@ -595,20 +827,20 @@ export async function startMcpServer() {
         case "dismiss_suggestion":
           return dismissSuggestion(auth.customerId, String(args.suggestionId));
         case "list_events":
-          return { events: listEvents(auth.customerId) };
+          return { events: await listEvents(auth.customerId) };
         case "list_recurring_orders":
-          return { recurringOrders: listStanding(auth.customerId) };
+          return { recurringOrders: await listStanding(auth.customerId) };
         case "get_inventory":
-          return getInventory(auth.customerId) ?? { error: "no_kitchen_profile" };
+          return (await getInventory(auth.customerId)) ?? { error: "no_kitchen_profile" };
         case "get_recipes":
-          return getRecipes(auth.customerId) ?? { error: "no_kitchen_profile" };
+          return (await getRecipes(auth.customerId)) ?? { error: "no_kitchen_profile" };
         case "get_order_history":
-          return getOrderHistory(auth.customerId) ?? { error: "no_kitchen_profile" };
+          return (await getOrderHistory(auth.customerId)) ?? { error: "no_kitchen_profile" };
         case "recommend_restock":
           return (
-            recommendRestock(auth.customerId, {
+            (await recommendRestock(auth.customerId, {
               daysCover: Number(args.daysCover ?? 7),
-            }) ?? { error: "no_kitchen_profile" }
+            })) ?? { error: "no_kitchen_profile" }
           );
         case "smart_restock":
           return (

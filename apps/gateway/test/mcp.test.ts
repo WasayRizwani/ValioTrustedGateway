@@ -1,21 +1,23 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve, dirname } from "node:path";
+import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const db = join(mkdtempSync(join(tmpdir(), "gw-mcp-")), "t.db");
 const clients: Client[] = [];
 
 async function connect(apiKey: string) {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: ["--import", "tsx", resolve(here, "../src/mcp/stdio.ts")],
-    env: { ...(process.env as Record<string, string>), VALIO_GATEWAY_API_KEY: apiKey, GATEWAY_DB_PATH: db },
+    env: {
+      ...(process.env as Record<string, string>),
+      VALIO_GATEWAY_API_KEY: apiKey,
+      DATABASE_URL: "",
+      PGLITE_DATA_DIR: "memory://",
+    },
     stderr: "ignore",
   });
   const client = new Client({ name: "test", version: "0" });

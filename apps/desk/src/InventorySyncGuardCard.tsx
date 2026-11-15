@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   api,
   timeAgoShort,
+  type DailyRestockDigestStatus,
   type InventorySyncStatus,
   type Mandate,
   type RestockAutomationBundle,
@@ -16,6 +17,7 @@ type SyncRunResponse = {
   stockHealth: StockHealthSnapshot | null;
   restockResult: RestockRunResult | null;
   policy: RestockAutomationPolicy;
+  dailyDigest?: DailyRestockDigestStatus;
 };
 
 export function InventorySyncGuardCard(props: {
@@ -84,6 +86,7 @@ export function InventorySyncGuardCard(props: {
         lastRun: res.restockResult ?? bundle?.lastRun ?? null,
         syncStatus: res.syncStatus,
         stockHealth: res.stockHealth,
+        dailyDigest: res.dailyDigest ?? bundle?.dailyDigest,
       });
       setLatestReceipt({
         syncStatus: res.syncStatus,
@@ -127,7 +130,9 @@ export function InventorySyncGuardCard(props: {
 
   if (!bundle) return null;
 
-  const { policy, syncStatus, stockHealth } = bundle;
+  const { policy, syncStatus, stockHealth, dailyDigest } = bundle;
+  const dailyDigestOn = policy.dailyDigestEnabled !== false;
+  const digestTime = dailyDigest?.sendAtLocalTime ?? policy.dailyDigestTime ?? "07:30";
   const activeRun = latestReceipt?.run ?? bundle.lastRun;
   const activeDeductions = latestReceipt?.syncStatus?.deductions ?? syncStatus?.deductions;
 
@@ -209,6 +214,7 @@ export function InventorySyncGuardCard(props: {
               )}
               <span style={{ color: "var(--text-soft)", marginLeft: 8, fontSize: 12.5 }}>
                 · Synced {timeAgoShort(syncStatus?.lastSyncedAt)}
+                {dailyDigestOn ? ` · ✉️ Daily digest (${digestTime})` : ""}
               </span>
             </span>
           </div>
@@ -548,14 +554,74 @@ export function InventorySyncGuardCard(props: {
                 />
                 <span>Ask OK on +50% spikes</span>
               </label>
+
+              <label style={{ display: "inline-flex", alignItems: "center", gap: 7, fontWeight: 600, cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={dailyDigestOn}
+                  disabled={busyAction !== null}
+                  onChange={(e) =>
+                    void updatePolicy(
+                      { dailyDigestEnabled: e.target.checked },
+                      e.target.checked
+                        ? "Daily restock digest email enabled (1 email/day)."
+                        : "Daily restock digest email paused.",
+                    )
+                  }
+                />
+                <span>Daily digest email (1/day)</span>
+              </label>
             </div>
 
             <span style={{ fontSize: 12.5, color: "var(--green-text)", fontWeight: 700 }}>
-              ✓ Connected: Kitchen POS · Valio Deliveries · Fridge Par
+              ✓ Connected: Kitchen POS · Valio Deliveries · Fridge Par · Daily Email
             </span>
           </div>
         </div>
       )}
+
+      {/* Always-Visible Daily Restock Awareness Digest Notice */}
+      <div
+        style={{
+          marginTop: 12,
+          padding: "9px 13px",
+          borderRadius: 11,
+          background: dailyDigestOn ? "var(--bg-blue-soft)" : "var(--bg-subtle)",
+          border: `1px solid ${dailyDigestOn ? "var(--blue-border, var(--border-light))" : "var(--border-light)"}`,
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: 10,
+          flexWrap: "wrap",
+          fontSize: 12.8,
+          color: "var(--text-main)",
+        }}
+      >
+        <div>
+          <strong>
+            ✉️ Daily Restock Digest ({dailyDigestOn ? `1 email/day at ${digestTime}` : "Paused"}):
+          </strong>{" "}
+          {dailyDigestOn ? (
+            <>
+              The gateway sends one daily email summarizing every restock placed or planned today,
+              your inventory history, and incoming deliveries arriving at your kitchen or workplace
+              {dailyDigest?.recipient ? (
+                <span style={{ color: "var(--text-muted)" }}> ({dailyDigest.recipient})</span>
+              ) : null}
+              .
+            </>
+          ) : (
+            <span style={{ color: "var(--text-muted)" }}>
+              Resume in Rules to receive 1 daily summary email of restocks, inventory history, and incoming deliveries.
+            </span>
+          )}
+        </div>
+        {dailyDigestOn && dailyDigest && (
+          <span className="pill blue" style={{ fontSize: 11.5 }}>
+            {dailyDigest.inboundDeliveriesCount} inbound · {dailyDigest.plannedRestockCount} planned
+          </span>
+        )}
+      </div>
 
       {/* Compact 1-Line Latest Receipt Strip (Expandable on Click) */}
       {activeRun && (activeRun.lines.length > 0 || latestReceipt !== null) && (

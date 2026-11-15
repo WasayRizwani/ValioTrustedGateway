@@ -8,7 +8,6 @@ type Caller = { customerId: string; buyerEmail: string };
 type VoiceState = { eventId: string; delivery: string; approval: string; attempts: number; updatedAt: string; approvalUrl?: string; errorCode?: string; retryAfterAt?: string };
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const now = () => new Date().toISOString();
-let schemaReady = false;
 
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical);
@@ -16,44 +15,17 @@ function canonical(value: unknown): unknown {
   return value;
 }
 
-function schema() {
-  if (schemaReady) return;
-  getDb().exec(`
-    CREATE TABLE IF NOT EXISTS voice_calls (
-      call_id TEXT NOT NULL, tool_call_id TEXT NOT NULL, payload_hash TEXT NOT NULL,
-      result_json TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL,
-      PRIMARY KEY(call_id, tool_call_id)
-    );
-    CREATE TABLE IF NOT EXISTS voice_approvals (
-      event_id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, buyer_email TEXT NOT NULL,
-      event_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
-      expires_at TEXT NOT NULL, consumed_at TEXT, status TEXT NOT NULL, updated_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS voice_outbox (
-      id TEXT PRIMARY KEY, event_id TEXT NOT NULL, customer_id TEXT NOT NULL, recipient TEXT NOT NULL,
-      status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT,
-      provider_id TEXT, error_code TEXT, mock_approval_url TEXT, retry_after_at TEXT, updated_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS voice_attempts (
-      caller_hash TEXT PRIMARY KEY, window_started TEXT NOT NULL, attempts INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_voice_outbox_event ON voice_outbox(event_id);
-  `);
-  try { getDb().exec("ALTER TABLE voice_outbox ADD COLUMN mock_approval_url TEXT"); } catch { /* already present */ }
-  try { getDb().exec("ALTER TABLE voice_outbox ADD COLUMN retry_after_at TEXT"); } catch { /* already present */ }
-  schemaReady = true;
-}
-const db = () => { schema(); return getDb(); };
+const db = () => getDb();
 
-function eventSnapshot(ev: ReturnType<typeof getEventRecord>) {
+function eventSnapshot(ev: EventRecord) {
   return sha(JSON.stringify({ id: ev.id, version: ev.version, name: ev.name, date: ev.date, guests: ev.guests, recipes: ev.recipes, extras: ev.extras, plan: ev.plan }));
 }
 function esc(value: unknown) { return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!); }
 
-function summaryHtml(ev: EventView, approvalUrl: string) {
+async function summaryHtml(ev: EventView, approvalUrl: string) {
   const lines = ev.plan?.lines ?? [];
   const needed = lines.filter((l) => l.shortfall > 0);
-  const dishes = eventDishNames(ev).map((dish) => `<li>${esc(dish.name)} · ${dish.servings} portion${dish.servings === 1 ? "" : "s"}</li>`).join("");
+  const dishes = (await eventDishNames(ev)).map((dish) => `<li>${esc(dish.name)} · ${dish.servings} portion${dish.servings === 1 ? "" : "s"}</li>`).join("");
   const unpriced = needed.filter((l) => !l.chosen).length;
   const hasPriced = needed.some((l) => l.chosen);
   const spend = unpriced ? hasPriced ? `At least €${(ev.plan?.estTotal ?? 0).toFixed(2)} for priced items · ${unpriced} item${unpriced === 1 ? "" : "s"} not priced` : `${unpriced} item${unpriced === 1 ? "" : "s"} not priced · total estimate unavailable` : `€${(ev.plan?.estTotal ?? 0).toFixed(2)}`;
@@ -123,28 +95,33 @@ export function resolveCaller(phone: string): Caller | null {
   return caller;
 }
 
-export function allowVoiceAttempt(phone: string) {
+export async function allowVoiceAttempt(phone: string): Promise<boolean> {
   const d = db();
   const key = sha(phone || "unknown");
-  const t = d.transaction(() => {
-    const row = d.prepare("SELECT window_started,attempts FROM voice_attempts WHERE caller_hash=?").get(key) as { window_started: string; attempts: number } | undefined;
+  return d.withTransaction(async (tx) => {
+    const row = await tx.queryOne<{ window_started: string; attempts: number }>(
+      "SELECT window_started, attempts FROM voice_attempts WHERE caller_hash = $1",
+      [key],
+    );
     if (!row || Date.now() - new Date(row.window_started).getTime() >= 5 * 60_000) {
-      d.prepare("INSERT INTO voice_attempts(caller_hash,window_started,attempts) VALUES(?,?,1) ON CONFLICT(caller_hash) DO UPDATE SET window_started=excluded.window_started,attempts=1").run(key, now());
+      await tx.execute(
+        "INSERT INTO voice_attempts (caller_hash, window_started, attempts) VALUES ($1, $2, 1) ON CONFLICT (caller_hash) DO UPDATE SET window_started = excluded.window_started, attempts = 1",
+        [key, now()],
+      );
       return true;
     }
     if (row.attempts >= 12) return false;
-    d.prepare("UPDATE voice_attempts SET attempts=attempts+1 WHERE caller_hash=?").run(key);
+    await tx.execute("UPDATE voice_attempts SET attempts = attempts + 1 WHERE caller_hash = $1", [key]);
     return true;
   });
-  return t();
 }
 
-export function getSavedRecipes(customerId: string) {
-  return (getRecipes(customerId)?.recipes ?? []).map((r) => ({ id: r.recipeId, name: r.name, servingsPerBatch: r.servingsPerBatch }));
+export async function getSavedRecipes(customerId: string) {
+  return ((await getRecipes(customerId))?.recipes ?? []).map((r) => ({ id: r.recipeId, name: r.name, servingsPerBatch: r.servingsPerBatch }));
 }
 
-export function eventDishNames(ev: Pick<EventRecord, "customerId" | "recipes" | "guests">) {
-  const names = new Map(getSavedRecipes(ev.customerId).map((recipe) => [recipe.id, recipe.name]));
+export async function eventDishNames(ev: Pick<EventRecord, "customerId" | "recipes" | "guests">) {
+  const names = new Map((await getSavedRecipes(ev.customerId)).map((recipe) => [recipe.id, recipe.name]));
   return ev.recipes.map((recipe) => ({ name: names.get(recipe.recipeId) ?? recipe.recipeId, servings: recipe.servings ?? ev.guests }));
 }
 
@@ -154,17 +131,23 @@ export async function createVoiceProposal(args: {
 }) {
   const database = db();
   const payloadHash = sha(JSON.stringify(canonical({ customerId: args.caller.customerId, payload: args.payload })));
-  const previous = database.prepare("SELECT payload_hash, result_json, status FROM voice_calls WHERE call_id=? AND tool_call_id=?").get(args.callId, args.toolCallId) as { payload_hash: string; result_json: string | null; status: string } | undefined;
+  const previous = await database.queryOne<{ payload_hash: string; result_json: string | null; status: string }>(
+    "SELECT payload_hash, result_json, status FROM voice_calls WHERE call_id = $1 AND tool_call_id = $2",
+    [args.callId, args.toolCallId],
+  );
   if (previous) {
     if (previous.payload_hash !== payloadHash) throw Object.assign(new Error("idempotency_conflict"), { code: "idempotency_conflict" });
     if (previous.result_json) return JSON.parse(previous.result_json) as { eventId: string; status: string; message: string };
     if (previous.status === "failed") {
-      database.prepare("DELETE FROM voice_calls WHERE call_id=? AND tool_call_id=?").run(args.callId, args.toolCallId);
+      await database.execute("DELETE FROM voice_calls WHERE call_id = $1 AND tool_call_id = $2", [args.callId, args.toolCallId]);
     } else {
       throw Object.assign(new Error("request_in_progress"), { code: "request_in_progress" });
     }
   }
-  database.prepare("INSERT INTO voice_calls(call_id,tool_call_id,payload_hash,status,created_at) VALUES(?,?,?,'processing',?)").run(args.callId, args.toolCallId, payloadHash, now());
+  await database.execute(
+    "INSERT INTO voice_calls (call_id, tool_call_id, payload_hash, status, created_at) VALUES ($1, $2, $3, 'processing', $4)",
+    [args.callId, args.toolCallId, payloadHash, now()],
+  );
   const token = randomBytes(32).toString("base64url");
   const tokenHash = sha(token);
   const expiresAt = new Date(Date.now() + 7 * 86400_000).toISOString();
@@ -175,58 +158,91 @@ export async function createVoiceProposal(args: {
     if (!approvalBaseUrl) throw Object.assign(new Error("approval_url_not_configured"), { code: "approval_url_not_configured" });
     const approvalOrigin = new URL(approvalBaseUrl);
     if (!config.voiceMockMode && approvalOrigin.protocol !== "https:") throw Object.assign(new Error("approval_url_requires_https"), { code: "approval_url_requires_https" });
-    const ev = await createEvent(args.caller.customerId, { ...args.event, autoOrder: false }, (created) => {
+    const ev = await createEvent(args.caller.customerId, { ...args.event, autoOrder: false }, async (created) => {
       eventId = created.id;
-      database.prepare("INSERT INTO voice_approvals(event_id,customer_id,buyer_email,event_version,snapshot_hash,token_hash,expires_at,status,updated_at) VALUES(?,?,?,?,?,?,?,'pending',?)")
-        .run(created.id, args.caller.customerId, args.caller.buyerEmail, created.version, eventSnapshot(created), tokenHash, expiresAt, now());
+      await database.execute(
+        "INSERT INTO voice_approvals (event_id, customer_id, buyer_email, event_version, snapshot_hash, token_hash, expires_at, status, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)",
+        [created.id, args.caller.customerId, args.caller.buyerEmail, created.version, eventSnapshot(created), tokenHash, expiresAt, now()],
+      );
       const baseUrl = config.voiceApprovalBaseUrl || (config.voiceMockMode ? "http://localhost:8787" : "");
       const mockLink = config.voiceMockMode ? `${baseUrl.replace(/\/$/, "")}/approval/voice/${token}` : null;
-      database.prepare("INSERT INTO voice_outbox(id,event_id,customer_id,recipient,status,mock_approval_url,updated_at) VALUES(?,?,?,?,'queued',?,?)")
-        .run(outboxId, created.id, args.caller.customerId, args.caller.buyerEmail, mockLink, now());
+      await database.execute(
+        "INSERT INTO voice_outbox (id, event_id, customer_id, recipient, status, mock_approval_url, updated_at) VALUES ($1, $2, $3, $4, 'queued', $5, $6)",
+        [outboxId, created.id, args.caller.customerId, args.caller.buyerEmail, mockLink, now()],
+      );
     });
     const snapshotHash = eventSnapshot(ev);
-    database.prepare("UPDATE voice_approvals SET event_version=?,snapshot_hash=?,updated_at=? WHERE event_id=?").run(ev.version, snapshotHash, now(), ev.id);
+    await database.execute(
+      "UPDATE voice_approvals SET event_version = $1, snapshot_hash = $2, updated_at = $3 WHERE event_id = $4",
+      [ev.version, snapshotHash, now(), ev.id],
+    );
     const approvalUrl = `${approvalBaseUrl.replace(/\/$/, "")}/approval/voice/${token}`;
-    database.prepare("UPDATE voice_outbox SET status='sending',updated_at=? WHERE id=?").run(now(), outboxId);
+    await database.execute("UPDATE voice_outbox SET status = 'sending', updated_at = $1 WHERE id = $2", [now(), outboxId]);
     try {
-      const sent = await sendEmail(args.caller.buyerEmail, `Approve event plan: ${ev.name}`, summaryHtml(ev, approvalUrl), outboxId);
-      database.prepare("UPDATE voice_outbox SET status=?,attempts=attempts+1,provider_id=?,updated_at=? WHERE id=?").run(config.voiceMockMode ? "mocked" : "sent", sent.providerId, now(), outboxId);
+      const sent = await sendEmail(args.caller.buyerEmail, `Approve event plan: ${ev.name}`, await summaryHtml(ev, approvalUrl), outboxId);
+      await database.execute(
+        "UPDATE voice_outbox SET status = $1, attempts = attempts + 1, provider_id = $2, updated_at = $3 WHERE id = $4",
+        [config.voiceMockMode ? "mocked" : "sent", sent.providerId, now(), outboxId],
+      );
     } catch (e) {
       const code = (e as { code?: string }).code ?? "email_failed";
       const status = code === "email_delivery_unknown" ? "unknown" : "failed";
       const retryAfter = (e as { retryAfterSeconds?: number }).retryAfterSeconds;
       const retryAt = retryAfter ? new Date(Date.now() + retryAfter * 1000).toISOString() : null;
-      database.prepare("UPDATE voice_outbox SET status=?,attempts=attempts+1,error_code=?,retry_after_at=?,updated_at=? WHERE id=?").run(status, code, retryAt, now(), outboxId);
+      await database.execute(
+        "UPDATE voice_outbox SET status = $1, attempts = attempts + 1, error_code = $2, retry_after_at = $3, updated_at = $4 WHERE id = $5",
+        [status, code, retryAt, now(), outboxId],
+      );
     }
-    const state = getVoiceState(args.caller.customerId, ev.id)!;
+    const state = (await getVoiceState(args.caller.customerId, ev.id))!;
     const result = { eventId: ev.id, status: state.delivery === "sent" ? "awaiting_approval" : state.delivery === "mocked" ? "mock_preview" : `email_${state.delivery}`, message: state.delivery === "sent" ? "Proposal saved. The buyer has been emailed to approve it; no order has been placed." : state.delivery === "mocked" ? "Mock mode only: no email was sent and no order was placed. The local preview is ready." : "Proposal saved, but approval email was not confirmed. No order has been placed; the buyer must retry delivery from the dashboard.", ...(config.voiceMockMode ? { mockApprovalUrl: approvalUrl } : {}) };
-    database.prepare("UPDATE voice_calls SET status='done',result_json=? WHERE call_id=? AND tool_call_id=?").run(JSON.stringify(result), args.callId, args.toolCallId);
-    appendAudit(randomUUID(), args.caller.customerId, "voice_event_proposed", { eventId: ev.id, callId: args.callId, toolCallId: args.toolCallId, emailStatus: state.delivery });
+    await database.execute(
+      "UPDATE voice_calls SET status = 'done', result_json = $1 WHERE call_id = $2 AND tool_call_id = $3",
+      [JSON.stringify(result), args.callId, args.toolCallId],
+    );
+    await appendAudit(randomUUID(), args.caller.customerId, "voice_event_proposed", { eventId: ev.id, callId: args.callId, toolCallId: args.toolCallId, emailStatus: state.delivery });
     return result;
   } catch (error) {
     if (eventId) {
       try {
-        database.prepare("DELETE FROM voice_outbox WHERE id=?").run(outboxId);
-        database.prepare("DELETE FROM voice_approvals WHERE event_id=?").run(eventId);
-        deleteEvent(args.caller.customerId, eventId);
+        await database.execute("DELETE FROM voice_outbox WHERE id = $1", [outboxId]);
+        await database.execute("DELETE FROM voice_approvals WHERE event_id = $1", [eventId]);
+        await deleteEvent(args.caller.customerId, eventId);
       } catch { /* preserve the original safe failure */ }
     }
-    database.prepare("UPDATE voice_calls SET status='failed' WHERE call_id=? AND tool_call_id=?").run(args.callId, args.toolCallId);
+    await database.execute("UPDATE voice_calls SET status = 'failed' WHERE call_id = $1 AND tool_call_id = $2", [args.callId, args.toolCallId]);
     throw error;
   }
 }
 
-export function getVoiceState(customerId: string, eventId: string): VoiceState | null {
-  const row = db().prepare(`SELECT o.event_id,o.status,o.attempts,o.updated_at,o.error_code,o.mock_approval_url,o.retry_after_at,a.status approval,a.token_hash,a.expires_at
-    FROM voice_outbox o JOIN voice_approvals a ON a.event_id=o.event_id WHERE o.customer_id=? AND o.event_id=? ORDER BY o.updated_at DESC LIMIT 1`).get(customerId, eventId) as { event_id: string; status: string; attempts: number; updated_at: string; error_code: string | null; mock_approval_url: string | null; retry_after_at: string | null; approval: string; token_hash: string; expires_at: string } | undefined;
+export async function getVoiceState(customerId: string, eventId: string): Promise<VoiceState | null> {
+  const row = await db().queryOne<{
+    event_id: string;
+    status: string;
+    attempts: number;
+    updated_at: string;
+    error_code: string | null;
+    mock_approval_url: string | null;
+    retry_after_at: string | null;
+    approval: string;
+    token_hash: string;
+    expires_at: string;
+  }>(
+    `SELECT o.event_id, o.status, o.attempts, o.updated_at, o.error_code, o.mock_approval_url, o.retry_after_at, a.status AS approval, a.token_hash, a.expires_at
+     FROM voice_outbox o JOIN voice_approvals a ON a.event_id = o.event_id WHERE o.customer_id = $1 AND o.event_id = $2 ORDER BY o.updated_at DESC LIMIT 1`,
+    [customerId, eventId],
+  );
   if (!row) return null;
   // Live bearer tokens are never stored in mock_approval_url; only explicit mock/simulated proposals set it.
   let approval = row.approval;
   try {
     if (approval === "approved") return { eventId: row.event_id, delivery: row.status, approval, attempts: row.attempts, updatedAt: row.updated_at, errorCode: row.error_code ?? undefined, retryAfterAt: row.retry_after_at ?? undefined, ...(row.mock_approval_url ? { approvalUrl: row.mock_approval_url } : {}) };
-    const ev = getEventRecord(customerId, eventId);
-    const tokenRow = db().prepare("SELECT event_version,snapshot_hash,expires_at FROM voice_approvals WHERE event_id=?").get(eventId) as { event_version: number; snapshot_hash: string; expires_at: string };
-    if (ev.version !== tokenRow.event_version || eventSnapshot(ev) !== tokenRow.snapshot_hash || new Date(tokenRow.expires_at).getTime() <= Date.now() || ev.status === "cancelled") approval = "stale";
+    const ev = await getEventRecord(customerId, eventId);
+    const tokenRow = await db().queryOne<{ event_version: number; snapshot_hash: string; expires_at: string }>(
+      "SELECT event_version, snapshot_hash, expires_at FROM voice_approvals WHERE event_id = $1",
+      [eventId],
+    );
+    if (!tokenRow || ev.version !== tokenRow.event_version || eventSnapshot(ev) !== tokenRow.snapshot_hash || new Date(tokenRow.expires_at).getTime() <= Date.now() || ev.status === "cancelled") approval = "stale";
   } catch { approval = "stale"; }
   const delivery = row.status === "sending" && Date.now() - new Date(row.updated_at).getTime() > 60_000 ? "unknown" : row.status;
   return { eventId: row.event_id, delivery, approval, attempts: row.attempts, updatedAt: row.updated_at, errorCode: row.error_code ?? undefined, retryAfterAt: row.retry_after_at ?? undefined, ...(row.mock_approval_url ? { approvalUrl: row.mock_approval_url } : {}) };
@@ -234,87 +250,116 @@ export function getVoiceState(customerId: string, eventId: string): VoiceState |
 
 export async function retryVoiceEmail(customerId: string, eventId: string) {
   const d = db();
-  const row = d.prepare(`SELECT o.id,o.recipient,o.status,o.attempts,o.retry_after_at,a.status approval,a.expires_at
-    FROM voice_outbox o JOIN voice_approvals a ON a.event_id=o.event_id WHERE o.customer_id=? AND o.event_id=? ORDER BY o.updated_at DESC LIMIT 1`).get(customerId, eventId) as { id: string; recipient: string; status: string; attempts: number; retry_after_at: string | null; approval: string; expires_at: string } | undefined;
+  const row = await d.queryOne<{ id: string; recipient: string; status: string; attempts: number; retry_after_at: string | null; approval: string; expires_at: string }>(
+    `SELECT o.id, o.recipient, o.status, o.attempts, o.retry_after_at, a.status AS approval, a.expires_at
+     FROM voice_outbox o JOIN voice_approvals a ON a.event_id = o.event_id WHERE o.customer_id = $1 AND o.event_id = $2 ORDER BY o.updated_at DESC LIMIT 1`,
+    [customerId, eventId],
+  );
   if (!row) throw Object.assign(new Error("voice_delivery_not_found"), { code: "not_found" });
   if (row.status === "unknown") throw Object.assign(new Error("email_delivery_unknown_reconcile_before_retry"), { code: "delivery_unknown" });
   if (row.retry_after_at && new Date(row.retry_after_at).getTime() > Date.now()) throw Object.assign(new Error("email_retry_after_provider_cooldown"), { code: "retry_after", retryAfterSeconds: Math.ceil((new Date(row.retry_after_at).getTime() - Date.now()) / 1000) });
   if (row.status === "sent" || row.status === "mocked") throw Object.assign(new Error("email_already_sent"), { code: "already_sent" });
   if (row.attempts >= 3) throw Object.assign(new Error("email_retry_limit"), { code: "retry_limit" });
-  const raw = getEventRecord(customerId, eventId);
+  const raw = await getEventRecord(customerId, eventId);
   if (raw.status === "cancelled" || new Date(row.expires_at).getTime() < Date.now()) throw Object.assign(new Error("approval_expired"), { code: "approval_expired" });
   const token = randomBytes(32).toString("base64url");
   const expiry = new Date(Date.now() + 7 * 86400_000).toISOString();
   const baseUrl = (config.voiceApprovalBaseUrl || (config.voiceMockMode ? `http://localhost:${config.port}` : "")).replace(/\/$/, "");
   const link = `${baseUrl}/approval/voice/${token}`;
   const mockLink = config.voiceMockMode ? link : null;
-  const claim = d.transaction(() => {
-    const claimed = d.prepare("UPDATE voice_outbox SET status='sending',retry_after_at=NULL,mock_approval_url=COALESCE(?,mock_approval_url),updated_at=? WHERE id=? AND status='failed'").run(mockLink, now(), row.id);
-    if (!claimed.changes) return false;
-    d.prepare("UPDATE voice_approvals SET token_hash=?,event_version=?,snapshot_hash=?,expires_at=?,status='pending',updated_at=? WHERE event_id=?").run(sha(token), raw.version, eventSnapshot(raw), expiry, now(), eventId);
+  const claimedOk = await d.withTransaction(async (tx) => {
+    const claimed = await tx.execute(
+      "UPDATE voice_outbox SET status = 'sending', retry_after_at = NULL, mock_approval_url = COALESCE($1, mock_approval_url), updated_at = $2 WHERE id = $3 AND status = 'failed'",
+      [mockLink, now(), row.id],
+    );
+    if (!claimed.rowCount) return false;
+    await tx.execute(
+      "UPDATE voice_approvals SET token_hash = $1, event_version = $2, snapshot_hash = $3, expires_at = $4, status = 'pending', updated_at = $5 WHERE event_id = $6",
+      [sha(token), raw.version, eventSnapshot(raw), expiry, now(), eventId],
+    );
     return true;
   });
-  if (!claim()) throw Object.assign(new Error("delivery_not_retryable"), { code: "delivery_not_retryable" });
+  if (!claimedOk) throw Object.assign(new Error("delivery_not_retryable"), { code: "delivery_not_retryable" });
   try {
-    const sent = await sendEmail(row.recipient, `Approve event plan: ${raw.name}`, summaryHtml(view(raw), link), `${row.id}-retry-${row.attempts + 1}`);
-    d.prepare("UPDATE voice_outbox SET status=?,attempts=attempts+1,error_code=NULL,provider_id=?,updated_at=? WHERE id=?").run(config.voiceMockMode ? "mocked" : "sent", sent.providerId, now(), row.id);
+    const sent = await sendEmail(row.recipient, `Approve event plan: ${raw.name}`, await summaryHtml(view(raw), link), `${row.id}-retry-${row.attempts + 1}`);
+    await d.execute(
+      "UPDATE voice_outbox SET status = $1, attempts = attempts + 1, error_code = NULL, provider_id = $2, updated_at = $3 WHERE id = $4",
+      [config.voiceMockMode ? "mocked" : "sent", sent.providerId, now(), row.id],
+    );
   } catch (e) {
     const code = (e as { code?: string }).code ?? "email_failed";
     const retryAfter = (e as { retryAfterSeconds?: number }).retryAfterSeconds;
     const retryAt = retryAfter ? new Date(Date.now() + retryAfter * 1000).toISOString() : null;
-    d.prepare("UPDATE voice_outbox SET status=?,attempts=attempts+1,error_code=?,retry_after_at=?,updated_at=? WHERE id=?").run(code === "email_delivery_unknown" ? "unknown" : "failed", code, retryAt, now(), row.id);
+    await d.execute(
+      "UPDATE voice_outbox SET status = $1, attempts = attempts + 1, error_code = $2, retry_after_at = $3, updated_at = $4 WHERE id = $5",
+      [code === "email_delivery_unknown" ? "unknown" : "failed", code, retryAt, now(), row.id],
+    );
     throw Object.assign(new Error(code), { code });
   }
-  appendAudit(randomUUID(), customerId, "voice_email_retried", { eventId, attempts: row.attempts + 1 });
+  await appendAudit(randomUUID(), customerId, "voice_email_retried", { eventId, attempts: row.attempts + 1 });
   return getVoiceState(customerId, eventId);
 }
 
 function publicError(code: string, status: number, detail = code) { return { type: "about:blank", title: code.replace(/_/g, " "), status, code, detail, requestId: randomUUID() }; }
 
-export function approvalPreview(token: string) {
+export async function approvalPreview(token: string) {
   const d = db();
-  const row = d.prepare("SELECT customer_id,event_id,event_version,snapshot_hash,token_hash,expires_at,consumed_at,status FROM voice_approvals WHERE token_hash=?").get(sha(token)) as { customer_id: string; event_id: string; event_version: number; snapshot_hash: string; expires_at: string; consumed_at: string | null; status: string } | undefined;
+  const row = await d.queryOne<{ customer_id: string; event_id: string; event_version: number; snapshot_hash: string; expires_at: string; consumed_at: string | null; status: string }>(
+    "SELECT customer_id, event_id, event_version, snapshot_hash, token_hash, expires_at, consumed_at, status FROM voice_approvals WHERE token_hash = $1",
+    [sha(token)],
+  );
   if (!row || row.consumed_at || row.status !== "pending" || new Date(row.expires_at).getTime() <= Date.now()) return null;
   let ev;
-  try { ev = getEventRecord(row.customer_id, row.event_id); } catch { return null; }
+  try { ev = await getEventRecord(row.customer_id, row.event_id); } catch { return null; }
   if (ev.version !== row.event_version || eventSnapshot(ev) !== row.snapshot_hash || ev.status === "cancelled") return null;
   return { event: ev, customerId: row.customer_id };
 }
 
-export function approveVoicePlan(token: string) {
+export async function approveVoicePlan(token: string): Promise<boolean> {
   const d = db();
   const tokenHash = sha(token);
-  const transaction = d.transaction(() => {
-    const row = d.prepare("SELECT customer_id,event_id,event_version,snapshot_hash,expires_at,consumed_at,status FROM voice_approvals WHERE token_hash=?").get(tokenHash) as { customer_id: string; event_id: string; event_version: number; snapshot_hash: string; expires_at: string; consumed_at: string | null; status: string } | undefined;
+  const outcome = await d.withTransaction(async (tx) => {
+    const row = await tx.queryOne<{ customer_id: string; event_id: string; event_version: number; snapshot_hash: string; expires_at: string; consumed_at: string | null; status: string }>(
+      "SELECT customer_id, event_id, event_version, snapshot_hash, expires_at, consumed_at, status FROM voice_approvals WHERE token_hash = $1",
+      [tokenHash],
+    );
     if (!row || row.consumed_at || row.status !== "pending" || new Date(row.expires_at).getTime() <= Date.now()) return { ok: false as const };
-    const eventRow = d.prepare("SELECT json FROM events WHERE id=? AND customer_id=?").get(row.event_id, row.customer_id) as { json: string } | undefined;
+    const eventRow = await tx.queryOne<{ json: string }>(
+      "SELECT json FROM events WHERE id = $1 AND customer_id = $2",
+      [row.event_id, row.customer_id],
+    );
     if (!eventRow) return { ok: false as const };
-    const ev = JSON.parse(eventRow.json) as ReturnType<typeof getEventRecord>;
+    const ev = JSON.parse(eventRow.json) as EventRecord;
     ev.version ??= 1;
     if (ev.status === "cancelled" || ev.version !== row.event_version || eventSnapshot(ev) !== row.snapshot_hash) return { ok: false as const };
-    const result = d.prepare("UPDATE voice_approvals SET status='approved',consumed_at=?,updated_at=? WHERE event_id=? AND status='pending' AND token_hash=? AND consumed_at IS NULL").run(now(), now(), row.event_id, tokenHash);
-    if (!result.changes) return { ok: false as const };
+    const result = await tx.execute(
+      "UPDATE voice_approvals SET status = 'approved', consumed_at = $1, updated_at = $2 WHERE event_id = $3 AND status = 'pending' AND token_hash = $4 AND consumed_at IS NULL",
+      [now(), now(), row.event_id, tokenHash],
+    );
+    if (!result.rowCount) return { ok: false as const };
     ev.autoOrder = true;
     ev.version += 1;
-    d.prepare("UPDATE events SET json=? WHERE id=? AND customer_id=?").run(JSON.stringify(ev), row.event_id, row.customer_id);
+    await tx.execute("UPDATE events SET json = $1 WHERE id = $2 AND customer_id = $3", [
+      JSON.stringify(ev),
+      row.event_id,
+      row.customer_id,
+    ]);
     return { ok: true as const, eventId: ev.id, customerId: row.customer_id };
   });
-  const outcome = transaction();
   if (!outcome.ok) return false;
-  appendAudit(randomUUID(), outcome.customerId, "voice_event_approved", { eventId: outcome.eventId });
+  await appendAudit(randomUUID(), outcome.customerId, "voice_event_approved", { eventId: outcome.eventId });
   return true;
 }
 
-export function isSimulatedVoiceToken(token: string): boolean {
+export async function isSimulatedVoiceToken(token: string): Promise<boolean> {
   if (!token) return false;
-  const row = db()
-    .prepare(
-      `SELECT o.status FROM voice_approvals a
-       JOIN voice_outbox o ON o.event_id = a.event_id
-       WHERE a.token_hash = ?
-       ORDER BY o.updated_at DESC LIMIT 1`,
-    )
-    .get(sha(token)) as { status: string } | undefined;
+  const row = await db().queryOne<{ status: string }>(
+    `SELECT o.status FROM voice_approvals a
+     JOIN voice_outbox o ON o.event_id = a.event_id
+     WHERE a.token_hash = $1
+     ORDER BY o.updated_at DESC LIMIT 1`,
+    [sha(token)],
+  );
   return row?.status === "mocked";
 }
 
@@ -332,7 +377,7 @@ export async function simulateVoiceCall(
   },
 ) {
   const database = db();
-  const saved = getSavedRecipes(customerId);
+  const saved = await getSavedRecipes(customerId);
   if (!saved.length) {
     throw new Error("no_saved_recipes");
   }
@@ -395,13 +440,11 @@ export async function simulateVoiceCall(
   const ev = await createEvent(
     customerId,
     { name, date, guests, recipes, autoOrder: false },
-    (created) => {
-      database
-        .prepare(
-          `INSERT INTO voice_approvals(event_id,customer_id,buyer_email,event_version,snapshot_hash,token_hash,expires_at,status,updated_at)
-           VALUES(?,?,?,?,?,?,?,'pending',?)`,
-        )
-        .run(
+    async (created) => {
+      await database.execute(
+        `INSERT INTO voice_approvals (event_id, customer_id, buyer_email, event_version, snapshot_hash, token_hash, expires_at, status, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)`,
+        [
           created.id,
           customerId,
           buyerEmail,
@@ -410,13 +453,12 @@ export async function simulateVoiceCall(
           tokenHash,
           expiresAt,
           now(),
-        );
-      database
-        .prepare(
-          `INSERT INTO voice_outbox(id,event_id,customer_id,recipient,status,attempts,provider_id,mock_approval_url,updated_at)
-           VALUES(?,?,?,?,'mocked',1,?,?,?)`,
-        )
-        .run(
+        ],
+      );
+      await database.execute(
+        `INSERT INTO voice_outbox (id, event_id, customer_id, recipient, status, attempts, provider_id, mock_approval_url, updated_at)
+         VALUES ($1, $2, $3, $4, 'mocked', 1, $5, $6, $7)`,
+        [
           outboxId,
           created.id,
           customerId,
@@ -424,18 +466,18 @@ export async function simulateVoiceCall(
           `sim-${outboxId}`,
           approvalUrl,
           now(),
-        );
+        ],
+      );
     },
   );
 
-  const persisted = getEventRecord(customerId, ev.id);
-  database
-    .prepare(
-      `UPDATE voice_approvals SET event_version=?,snapshot_hash=?,updated_at=? WHERE event_id=?`,
-    )
-    .run(persisted.version, eventSnapshot(persisted), now(), ev.id);
+  const persisted = await getEventRecord(customerId, ev.id);
+  await database.execute(
+    `UPDATE voice_approvals SET event_version = $1, snapshot_hash = $2, updated_at = $3 WHERE event_id = $4`,
+    [persisted.version, eventSnapshot(persisted), now(), ev.id],
+  );
 
-  appendAudit(randomUUID(), customerId, "voice_event_proposed", {
+  await appendAudit(randomUUID(), customerId, "voice_event_proposed", {
     eventId: ev.id,
     callId,
     simulated: true,
@@ -479,7 +521,7 @@ export async function simulateVoiceCall(
     },
   ];
 
-  const voiceState = getVoiceState(customerId, ev.id);
+  const voiceState = await getVoiceState(customerId, ev.id);
   const assistantNumber = config.voicePublicNumber || "+1 269 665 8009";
 
   return {
@@ -496,43 +538,43 @@ export async function simulateVoiceCall(
   };
 }
 
-export function approveVoiceEventByBuyer(customerId: string, eventId: string) {
+export async function approveVoiceEventByBuyer(customerId: string, eventId: string) {
   const d = db();
-  // Ensure event exists and events table is initialized
-  const current = getEventRecord(customerId, eventId);
+  const current = await getEventRecord(customerId, eventId);
   if (current.status === "cancelled") {
     throw Object.assign(new Error("event_cancelled"), { code: "event_cancelled" });
   }
-  const tx = d.transaction(() => {
-    const eventRow = d
-      .prepare("SELECT json FROM events WHERE id=? AND customer_id=?")
-      .get(eventId, customerId) as { json: string } | undefined;
+  const updatedRecord = await d.withTransaction(async (tx) => {
+    const eventRow = await tx.queryOne<{ json: string }>(
+      "SELECT json FROM events WHERE id = $1 AND customer_id = $2",
+      [eventId, customerId],
+    );
     if (!eventRow) throw new Error("event not found");
     const ev = JSON.parse(eventRow.json) as EventRecord;
     ev.autoOrder = true;
     ev.version = (ev.version ?? 1) + 1;
-    d.prepare("UPDATE events SET json=? WHERE id=? AND customer_id=?").run(
+    await tx.execute("UPDATE events SET json = $1 WHERE id = $2 AND customer_id = $3", [
       JSON.stringify(ev),
       eventId,
       customerId,
-    );
+    ]);
     const ts = now();
-    d.prepare(
+    await tx.execute(
       `UPDATE voice_approvals
-       SET status='approved', consumed_at=COALESCE(consumed_at, ?), event_version=?, snapshot_hash=?, updated_at=?
-       WHERE event_id=? AND customer_id=?`,
-    ).run(ts, ev.version, eventSnapshot(ev), ts, eventId, customerId);
+       SET status = 'approved', consumed_at = COALESCE(consumed_at, $1), event_version = $2, snapshot_hash = $3, updated_at = $4
+       WHERE event_id = $5 AND customer_id = $6`,
+      [ts, ev.version, eventSnapshot(ev), ts, eventId, customerId],
+    );
     return ev;
   });
-  const updatedRecord = tx();
-  appendAudit(randomUUID(), customerId, "voice_event_approved", {
+  await appendAudit(randomUUID(), customerId, "voice_event_approved", {
     eventId,
     approvedBy: "buyer",
   });
   const updatedView = view(updatedRecord);
   return {
     ok: true,
-    event: { ...updatedView, voice: getVoiceState(customerId, eventId) },
+    event: { ...updatedView, voice: await getVoiceState(customerId, eventId) },
   };
 }
 

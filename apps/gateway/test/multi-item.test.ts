@@ -54,10 +54,10 @@ after(() => {
   globalThis.fetch = realFetch;
 });
 
-beforeEach(() => {
-  resetMandate(CUSTOMER);
-  resetIntents(CUSTOMER, "multi-item-test");
-  resetKitchen(CUSTOMER);
+beforeEach(async () => {
+  await resetMandate(CUSTOMER);
+  await resetIntents(CUSTOMER, "multi-item-test");
+  await resetKitchen(CUSTOMER);
 });
 
 test("parseComplexNeedFromText parses multi-item prompt with implicit countable item and shared date", () => {
@@ -150,7 +150,7 @@ test("multi-item quote -> intent -> commit preserves all lines and passes non-da
   assert.equal(quote.lines.length, 2);
 
   const mandate = {
-    ...getMandate(CUSTOMER)!,
+    ...(await getMandate(CUSTOMER))!,
     autoPurchaseIf: {
       withinMaxOrderValue: true,
       deliveryOnOrBeforeNeededBy: true,
@@ -178,7 +178,7 @@ test("multi-item quote -> intent -> commit preserves all lines and passes non-da
   assert.equal(committed.status, "committed");
   assert.equal(committed.basket.length, 2);
 
-  const history = getOrderHistory(CUSTOMER);
+  const history = await getOrderHistory(CUSTOMER);
   const latest = history?.orders.find((o) => o.orderId === committed.committedOrderId);
   assert.ok(latest, "committed multi-item order recorded in kitchen order history");
   assert.equal(latest.lines.length, 2);

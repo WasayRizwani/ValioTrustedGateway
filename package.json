@@ -14,10 +14,10 @@
     "build": "npm run build -w @tta/shared && npm run typecheck -w @tta/gateway && npm run build -w @tta/desk",
     "download-data": "npm run download-data -w @tta/gateway",
     "test": "npm run test -w @tta/gateway",
-    "demo:team": "npm run demo:team -w @tta/external-agent"
+    "demo:team": "npm run demo:team -w @tta/external-agent",
+    "demo:bilateral": "npm run demo:bilateral -w @tta/external-agent"
   },
   "allowScripts": {
-    "better-sqlite3@11.10.0": true,
     "esbuild@0.28.2": true,
     "esbuild@0.25.12": true,
     "fsevents@2.3.3": true

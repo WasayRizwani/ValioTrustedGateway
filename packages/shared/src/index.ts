@@ -294,3 +294,233 @@ export const QuoteSchema = z.object({
   runId: z.string().optional(),
 });
 export type Quote = z.infer<typeof QuoteSchema>;
+
+// ── Bilateral "Zero-Dispute" Liability Receipt (.vtr.json) & 3-Way Invoice Arbitrator ──
+
+export const BuyerReceiptPayloadSchema = z.object({
+  customerId: z.string(),
+  intentId: z.string(),
+  mandateId: z.string(),
+  mandateHash: z.string(),
+  quoteId: z.string().nullable(),
+  snapshotHash: z.string(),
+  authorizedMaxTotalEur: z.number(),
+  authorityMode: z.enum([
+    "agent_autonomous",
+    "human_override_p256",
+    "human_override_webauthn",
+    "external_agent_signed",
+  ]),
+  actingAgentId: z.string().nullable(),
+  signedAt: z.string(),
+});
+export type BuyerReceiptPayload = z.infer<typeof BuyerReceiptPayloadSchema>;
+
+export const HumanOverrideBindingSchema = z.object({
+  mode: z.string(),
+  credentialId: z.string(),
+  signerLabel: z.string(),
+  signaturePrefix: z.string(),
+  verifiedAt: z.string(),
+  acknowledgedRules: z.array(z.string()).default([]),
+  publicKeySpki: z.string().optional(),
+  signedChallenge: z.string().optional(),
+  signature: z.string().optional(),
+});
+export type HumanOverrideBinding = z.infer<typeof HumanOverrideBindingSchema>;
+
+export const DetachedBuyerSignatureInputSchema = z.object({
+  algorithm: z.enum(["Ed25519", "ECDSA-P256"]),
+  keyId: z.string(),
+  publicKeyPem: z.string(),
+  signedAt: z.string(),
+  authorizedMaxTotalEur: z.number().optional(),
+  actingAgentId: z.string().nullable().optional(),
+  signature: z.string(),
+});
+export type DetachedBuyerSignatureInput = z.infer<typeof DetachedBuyerSignatureInputSchema>;
+
+export const BuyerSignatureEnvelopeSchema = z.object({
+  payload: BuyerReceiptPayloadSchema,
+  algorithm: z.enum(["Ed25519", "ECDSA-P256"]),
+  keyId: z.string(),
+  publicKeyPem: z.string(),
+  signature: z.string(),
+  humanOverride: HumanOverrideBindingSchema.optional(),
+});
+export type BuyerSignatureEnvelope = z.infer<typeof BuyerSignatureEnvelopeSchema>;
+
+export const ReceiptHonouredLineSchema = z.object({
+  productId: z.string(),
+  productName: z.string(),
+  packs: z.number(),
+  packSize: z.number(),
+  packUnit: z.string(),
+  totalQuantity: z.number(),
+  quantityUnit: z.string(),
+  unitPriceEur: z.number(),
+  comparisonPricePerUnit: z.number().nullable(),
+  comparisonUnit: z.string().nullable(),
+  lineTotalEur: z.number(),
+});
+export type ReceiptHonouredLine = z.infer<typeof ReceiptHonouredLineSchema>;
+
+export const SupplierReceiptPayloadSchema = z.object({
+  orderId: z.string(),
+  intentId: z.string(),
+  customerId: z.string(),
+  quoteId: z.string().nullable(),
+  quoteFirmUntil: z.string().nullable(),
+  honouredPrice: z.object({
+    currency: z.string(),
+    totalEur: z.number(),
+    priceBasis: z.enum(["firm_quote", "live_committed", "fallback_cascade"]),
+    lines: z.array(ReceiptHonouredLineSchema),
+  }),
+  allergenClaim: z.object({
+    excludedAllergens: z.array(z.string()),
+    lactoseFreeGuaranteed: z.boolean(),
+    lineAttestations: z.array(
+      z.object({
+        productId: z.string(),
+        productName: z.string(),
+        allergens: z.array(z.string()),
+        mayContain: z.array(z.string()),
+        lactoseFree: z.boolean(),
+        origin: z.string().nullable(),
+        certifications: z.array(z.string()),
+      }),
+    ),
+  }),
+  deliveryCommitment: z.object({
+    promisedDate: z.string(),
+    latestAcceptableDate: z.string(),
+    partialFulfilmentAllowed: z.boolean(),
+    cascadeApplied: z.boolean(),
+  }),
+  buyerSignatureHash: z.string(),
+  committedAt: z.string(),
+});
+export type SupplierReceiptPayload = z.infer<typeof SupplierReceiptPayloadSchema>;
+
+export const SupplierSignatureEnvelopeSchema = z.object({
+  payload: SupplierReceiptPayloadSchema,
+  algorithm: z.literal("Ed25519"),
+  issuer: z.string(),
+  keyId: z.string(),
+  publicKeyPem: z.string(),
+  signature: z.string(),
+});
+export type SupplierSignatureEnvelope = z.infer<typeof SupplierSignatureEnvelopeSchema>;
+
+export const TradeReceiptSchema = z.object({
+  format: z.literal("application/vnd.valio.trade-receipt+json"),
+  specVersion: z.literal("1.0"),
+  receiptId: z.string(),
+  fileName: z.string(),
+  orderId: z.string(),
+  intentId: z.string(),
+  runId: z.string(),
+  customerId: z.string(),
+  issuedAt: z.string(),
+  receiptHash: z.string(),
+  buyer: BuyerSignatureEnvelopeSchema,
+  supplier: SupplierSignatureEnvelopeSchema,
+  auditAnchor: z.object({
+    runId: z.string(),
+    headHash: z.string().nullable(),
+  }),
+});
+export type TradeReceipt = z.infer<typeof TradeReceiptSchema>;
+
+export const SimulatedInvoiceLineSchema = z.object({
+  productId: z.string(),
+  productName: z.string().optional(),
+  billedPacks: z.number().optional(),
+  deliveredPacks: z.number().optional(),
+  billedQuantity: z.number().optional(),
+  deliveredQuantity: z.number().optional(),
+  billedUnitPriceEur: z.number().optional(),
+  billedPricePerQtyUnitEur: z.number().optional(),
+  billedLineTotalEur: z.number(),
+  deliveredAllergens: z.array(z.string()).optional(),
+  deliveredLactoseFree: z.boolean().optional(),
+});
+export type SimulatedInvoiceLine = z.infer<typeof SimulatedInvoiceLineSchema>;
+
+export const SimulatedInvoiceDocumentSchema = z.object({
+  documentId: z.string().default("INV-SIM-001"),
+  documentType: z.enum(["e_invoice", "delivery_note", "combined_3way"]).default("combined_3way"),
+  deliveredAt: z.string().optional(),
+  buyerDisputeClaim: z
+    .enum([
+      "none",
+      "rogue_agent_hallucination",
+      "price_overcharge",
+      "late_delivery",
+      "allergen_breach",
+    ])
+    .default("none"),
+  buyerDisputeNote: z.string().optional(),
+  billedTotalEur: z.number(),
+  currency: z.string().default("EUR"),
+  lines: z.array(SimulatedInvoiceLineSchema),
+});
+export type SimulatedInvoiceDocument = z.infer<typeof SimulatedInvoiceDocumentSchema>;
+
+export const DisputePresetSchema = z.enum([
+  "price_hike_012",
+  "late_delivery",
+  "rogue_agent_chargeback",
+  "allergen_breach",
+  "tampered_receipt",
+  "clean_3way_match",
+]);
+export type DisputePreset = z.infer<typeof DisputePresetSchema>;
+
+export const DisputeBreachItemSchema = z.object({
+  code: z.string(),
+  party: z.enum(["supplier", "buyer", "tamper"]),
+  clause: z.string(),
+  expected: z.string(),
+  actual: z.string(),
+  creditImpactEur: z.number(),
+});
+export type DisputeBreachItem = z.infer<typeof DisputeBreachItemSchema>;
+
+export const DisputeRulingSchema = z.object({
+  rulingId: z.string(),
+  evaluatedAt: z.string(),
+  latencyMs: z.number(),
+  ruling: z.enum(["SUPPLIER_BREACH", "BUYER_LIABLE", "TAMPER_REJECTED"]),
+  subVerdict: z.enum([
+    "AUTO_CREDIT_ISSUED",
+    "CHARGEBACK_DENIED_BUYER_LIABLE",
+    "CLEAN_3WAY_SETTLEMENT",
+    "CRYPTO_SIGNATURE_INVALID",
+  ]),
+  headline: z.string(),
+  summary: z.string(),
+  cryptographicProof: z.object({
+    receiptHashValid: z.boolean(),
+    buyerSignatureValid: z.boolean(),
+    supplierSignatureValid: z.boolean(),
+    bilateralBindingValid: z.boolean(),
+    humanOverrideVerified: z.boolean(),
+    mandateHash: z.string(),
+    quoteId: z.string().nullable(),
+    snapshotHash: z.string(),
+    orderId: z.string(),
+    reason: z.string().optional(),
+  }),
+  reconciliation: z.object({
+    contractedTotalEur: z.number(),
+    billedTotalEur: z.number(),
+    autoCreditEur: z.number(),
+    netPayableEur: z.number(),
+    currency: z.string(),
+  }),
+  breaches: z.array(DisputeBreachItemSchema),
+  simulatedDocument: SimulatedInvoiceDocumentSchema,
+});
+export type DisputeRuling = z.infer<typeof DisputeRulingSchema>;

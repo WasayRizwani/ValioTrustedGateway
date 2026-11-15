@@ -1,7 +1,6 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import type Database from "better-sqlite3";
-import { getDb } from "../audit/chain.js";
+import { getDb, type DbClient } from "../audit/chain.js";
 import { config } from "../config.js";
 import {
   getAllProducts,
@@ -23,9 +22,8 @@ import {
 } from "../valio/client.js";
 import { getInventory, getKitchen, upsertInventory } from "../hotel/kitchen.js";
 
-let schemaInitializedDb: Database.Database | null = null;
-let syncedCatalogDb: Database.Database | null = null;
-let ftsAvailable = true;
+let syncedCatalogDb: DbClient | null = null;
+let syncInFlight: Promise<DbClient> | null = null;
 
 function parseCsvRows(text: string): Array<Record<string, string>> {
   const lines = text
@@ -68,114 +66,9 @@ function parseCsvRows(text: string): Array<Record<string, string>> {
   });
 }
 
-export function ensureCatalogSchema(): Database.Database {
+export async function ensureCatalogSchema(): Promise<DbClient> {
   const d = getDb();
-  if (schemaInitializedDb === d) return d;
-
-  d.exec(`
-    CREATE TABLE IF NOT EXISTS catalog_meta (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS catalog_delivery_reliability (
-      product_id TEXT PRIMARY KEY,
-      delivery_reliability REAL NOT NULL,
-      source_csv TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS catalog_carbon_footprint (
-      product_id TEXT PRIMARY KEY,
-      carbon_kg_per_kg REAL NOT NULL,
-      source_csv TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS catalog_products (
-      product_id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      name_fi TEXT,
-      brand TEXT,
-      category TEXT,
-      categories_json TEXT NOT NULL,
-      labels_json TEXT NOT NULL,
-      allergens_json TEXT NOT NULL,
-      may_contain_json TEXT NOT NULL,
-      certifications_json TEXT NOT NULL,
-      claims_json TEXT NOT NULL,
-      substitutes_json TEXT NOT NULL,
-      origin TEXT,
-      producer TEXT,
-      pack_size REAL NOT NULL,
-      pack_unit TEXT NOT NULL,
-      pieces_per_pack INTEGER,
-      sales_unit TEXT,
-      lactose_free INTEGER NOT NULL DEFAULT 0,
-      organic INTEGER NOT NULL DEFAULT 0,
-      vegan INTEGER NOT NULL DEFAULT 0,
-      delivery_reliability REAL,
-      carbon_kg_per_kg REAL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_catalog_products_lf ON catalog_products(lactose_free);
-    CREATE INDEX IF NOT EXISTS idx_catalog_products_org ON catalog_products(organic);
-    CREATE INDEX IF NOT EXISTS idx_catalog_products_vegan ON catalog_products(vegan);
-    CREATE INDEX IF NOT EXISTS idx_catalog_products_unit ON catalog_products(pack_unit);
-    CREATE INDEX IF NOT EXISTS idx_catalog_products_origin ON catalog_products(origin);
-    CREATE INDEX IF NOT EXISTS idx_catalog_products_rel ON catalog_products(delivery_reliability);
-    CREATE INDEX IF NOT EXISTS idx_catalog_products_carbon ON catalog_products(carbon_kg_per_kg);
-
-    CREATE TABLE IF NOT EXISTS catalog_availability_snapshots (
-      customer_id TEXT NOT NULL,
-      product_id TEXT NOT NULL,
-      requested_date TEXT NOT NULL,
-      available_amount REAL,
-      availability_unknown INTEGER NOT NULL DEFAULT 0,
-      available_date TEXT,
-      sales_unit TEXT,
-      sales_block INTEGER NOT NULL DEFAULT 0,
-      logistic_model TEXT,
-      closing_at TEXT,
-      unit_price REAL,
-      comparison_price REAL,
-      comparison_unit TEXT,
-      currency TEXT,
-      source TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      PRIMARY KEY (customer_id, product_id, requested_date)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_avail_snap_product
-      ON catalog_availability_snapshots(product_id, customer_id);
-
-    CREATE TABLE IF NOT EXISTS catalog_csv_imports (
-      import_id INTEGER PRIMARY KEY AUTOINCREMENT,
-      kind TEXT NOT NULL,
-      source_name TEXT NOT NULL,
-      row_count INTEGER NOT NULL,
-      imported_at TEXT NOT NULL
-    );
-  `);
-
-  try {
-    d.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS catalog_products_fts USING fts5(
-        product_id UNINDEXED,
-        name,
-        name_fi,
-        brand,
-        category,
-        labels_text,
-        tokenize = 'porter unicode61 remove_diacritics 2'
-      );
-    `);
-    ftsAvailable = true;
-  } catch {
-    ftsAvailable = false;
-  }
-
-  schemaInitializedDb = d;
+  await d.queryOne("SELECT 1");
   return d;
 }
 
@@ -205,7 +98,13 @@ function detectCsvKind(
   const lower = headers.map((h) => h.toLowerCase());
   const fn = fileName.toLowerCase();
   if (
-    lower.some((h) => h.includes("onhand") || h.includes("on_hand") || h.includes("parlevel") || h.includes("par_level")) ||
+    lower.some(
+      (h) =>
+        h.includes("onhand") ||
+        h.includes("on_hand") ||
+        h.includes("parlevel") ||
+        h.includes("par_level"),
+    ) ||
     fn.includes("kitchen") ||
     fn.includes("pantry")
   ) {
@@ -237,246 +136,327 @@ function detectCsvKind(
   return null;
 }
 
-export function ensureCatalogSynced(force = false): Database.Database {
-  const d = ensureCatalogSchema();
-  if (!force && syncedCatalogDb === d) return d;
-
-  const fingerprint = computeDataFingerprint();
-  if (!force) {
-    const existingFp = d
-      .prepare(`SELECT value FROM catalog_meta WHERE key = 'sync_fingerprint'`)
-      .get() as { value: string } | undefined;
-    const countRow = d
-      .prepare(`SELECT COUNT(*) as c FROM catalog_products`)
-      .get() as { c: number };
-    if (existingFp?.value === fingerprint && countRow.c > 0) {
-      syncedCatalogDb = d;
-      return d;
+function buildMultiRowPlaceholders(rowCount: number, colCount: number): string {
+  const groups: string[] = [];
+  let idx = 1;
+  for (let r = 0; r < rowCount; r++) {
+    const cols: string[] = [];
+    for (let c = 0; c < colCount; c++) {
+      cols.push(`$${idx++}`);
     }
+    groups.push(`(${cols.join(", ")})`);
   }
-
-  const allProducts = getAllProducts();
-  const relMap = getReliabilityMap();
-  const carbonMap = getCarbonMap();
-  const now = new Date().toISOString();
-
-  const relFileExists = existsSync(resolve(config.dataDir, "delivery-reliability.csv"));
-  const carbonFileExists = existsSync(resolve(config.dataDir, "carbon-footprint.csv"));
-
-  d.transaction(() => {
-    d.prepare(`DELETE FROM catalog_delivery_reliability`).run();
-    d.prepare(`DELETE FROM catalog_carbon_footprint`).run();
-    d.prepare(`DELETE FROM catalog_products`).run();
-    if (ftsAvailable) {
-      d.prepare(`DELETE FROM catalog_products_fts`).run();
-    }
-
-    const insRel = d.prepare(`
-      INSERT OR REPLACE INTO catalog_delivery_reliability
-        (product_id, delivery_reliability, source_csv, updated_at)
-      VALUES (?, ?, ?, ?)
-    `);
-    const relSource = relFileExists ? "delivery-reliability.csv" : "seed";
-    for (const [pid, val] of relMap.entries()) {
-      insRel.run(pid, val, relSource, now);
-    }
-
-    const insCarbon = d.prepare(`
-      INSERT OR REPLACE INTO catalog_carbon_footprint
-        (product_id, carbon_kg_per_kg, source_csv, updated_at)
-      VALUES (?, ?, ?, ?)
-    `);
-    const carbonSource = carbonFileExists ? "carbon-footprint.csv" : "seed";
-    for (const [pid, val] of carbonMap.entries()) {
-      insCarbon.run(pid, val, carbonSource, now);
-    }
-
-    const insProd = d.prepare(`
-      INSERT OR REPLACE INTO catalog_products (
-        product_id, name, name_fi, brand, category,
-        categories_json, labels_json, allergens_json, may_contain_json,
-        certifications_json, claims_json, substitutes_json,
-        origin, producer, pack_size, pack_unit, pieces_per_pack, sales_unit,
-        lactose_free, organic, vegan, delivery_reliability, carbon_kg_per_kg
-      ) VALUES (
-        ?, ?, ?, ?, ?,
-        ?, ?, ?, ?,
-        ?, ?, ?,
-        ?, ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?
-      )
-    `);
-
-    const insFts = ftsAvailable
-      ? d.prepare(`
-          INSERT INTO catalog_products_fts
-            (product_id, name, name_fi, brand, category, labels_text)
-          VALUES (?, ?, ?, ?, ?, ?)
-        `)
-      : null;
-
-    for (const p of allProducts) {
-      const labels = p.labels ?? [];
-      const lf = isLactoseFree(p) ? 1 : 0;
-      const org = labels.includes("organic") ? 1 : 0;
-      const veg = labels.includes("vegan") ? 1 : 0;
-      const rel = relMap.get(p.productId) ?? null;
-      const carb = carbonMap.get(p.productId) ?? null;
-
-      insProd.run(
-        p.productId,
-        p.name,
-        p.nameFi ?? null,
-        p.brand ?? null,
-        p.category ?? null,
-        JSON.stringify(p.categories ?? []),
-        JSON.stringify(labels),
-        JSON.stringify(p.allergens ?? []),
-        JSON.stringify(p.mayContain ?? []),
-        JSON.stringify(p.certifications ?? []),
-        JSON.stringify(p.claims ?? []),
-        JSON.stringify(p.substitutes ?? []),
-        p.origin ? p.origin.toUpperCase() : null,
-        p.producer ?? null,
-        p.packSize,
-        p.packUnit,
-        p.piecesPerPack ?? null,
-        p.salesUnit ?? null,
-        lf,
-        org,
-        veg,
-        rel,
-        carb,
-      );
-
-      if (insFts) {
-        insFts.run(
-          p.productId,
-          p.name,
-          p.nameFi ?? "",
-          p.brand ?? "",
-          [p.category, ...(p.categories ?? [])].filter(Boolean).join(" "),
-          [...labels, ...(p.certifications ?? []), ...(p.claims ?? [])].join(" "),
-        );
-      }
-    }
-
-    const insImport = d.prepare(`
-      INSERT INTO catalog_csv_imports (kind, source_name, row_count, imported_at)
-      VALUES (?, ?, ?, ?)
-    `);
-    if (relMap.size > 0) insImport.run("reliability", relSource, relMap.size, now);
-    if (carbonMap.size > 0) insImport.run("carbon", carbonSource, carbonMap.size, now);
-
-    d.prepare(`INSERT OR REPLACE INTO catalog_meta (key, value) VALUES ('sync_fingerprint', ?)`).run(
-      fingerprint,
-    );
-    d.prepare(`INSERT OR REPLACE INTO catalog_meta (key, value) VALUES ('synced_at', ?)`).run(now);
-  })();
-
-  // Auto-ingest any additional CSV files present in dataDir (e.g. availability.csv, inventory.csv)
-  if (existsSync(config.dataDir)) {
-    const extraCsvs = readdirSync(config.dataDir).filter(
-      (f) =>
-        f.toLowerCase().endsWith(".csv") &&
-        f !== "delivery-reliability.csv" &&
-        f !== "carbon-footprint.csv",
-    );
-    for (const csvFile of extraCsvs) {
-      try {
-        const text = readFileSync(resolve(config.dataDir, csvFile), "utf8");
-        importCsvToDatabase({ kind: "auto", csvText: text, sourceName: csvFile, skipSync: true });
-      } catch {
-        // ignore malformed custom files during auto-scan
-      }
-    }
-  }
-
-  syncedCatalogDb = d;
-  return d;
+  return groups.join(", ");
 }
 
-export function recordPriceSnapshots(
+export async function ensureCatalogSynced(force = false): Promise<DbClient> {
+  const d = await ensureCatalogSchema();
+  if (!force && syncedCatalogDb === d) return d;
+  if (!force && syncInFlight) return syncInFlight;
+
+  const runSync = async (): Promise<DbClient> => {
+    const fingerprint = computeDataFingerprint();
+    if (!force) {
+      const existingFp = await d.queryOne<{ value: string }>(
+        `SELECT value FROM catalog_meta WHERE key = 'sync_fingerprint'`,
+      );
+      const countRow = await d.queryOne<{ c: number }>(
+        `SELECT COUNT(*)::int AS c FROM catalog_products`,
+      );
+      if (existingFp?.value === fingerprint && Number(countRow?.c ?? 0) > 0) {
+        syncedCatalogDb = d;
+        return d;
+      }
+    }
+
+    const allProducts = getAllProducts();
+    const relMap = getReliabilityMap();
+    const carbonMap = getCarbonMap();
+    const now = new Date().toISOString();
+
+    const relFileExists = existsSync(resolve(config.dataDir, "delivery-reliability.csv"));
+    const carbonFileExists = existsSync(resolve(config.dataDir, "carbon-footprint.csv"));
+    const relSource = relFileExists ? "delivery-reliability.csv" : "seed";
+    const carbonSource = carbonFileExists ? "carbon-footprint.csv" : "seed";
+
+    await d.withTransaction(async (tx) => {
+      await tx.execute(`DELETE FROM catalog_delivery_reliability`);
+      await tx.execute(`DELETE FROM catalog_carbon_footprint`);
+      await tx.execute(`DELETE FROM catalog_products`);
+
+      const relEntries = Array.from(relMap.entries());
+      for (let i = 0; i < relEntries.length; i += 1000) {
+        const chunk = relEntries.slice(i, i + 1000);
+        const params: unknown[] = [];
+        for (const [pid, val] of chunk) {
+          params.push(pid, val, relSource, now);
+        }
+        await tx.execute(
+          `INSERT INTO catalog_delivery_reliability
+             (product_id, delivery_reliability, source_csv, updated_at)
+           VALUES ${buildMultiRowPlaceholders(chunk.length, 4)}
+           ON CONFLICT (product_id) DO UPDATE SET
+             delivery_reliability = EXCLUDED.delivery_reliability,
+             source_csv = EXCLUDED.source_csv,
+             updated_at = EXCLUDED.updated_at`,
+          params,
+        );
+      }
+
+      const carbonEntries = Array.from(carbonMap.entries());
+      for (let i = 0; i < carbonEntries.length; i += 1000) {
+        const chunk = carbonEntries.slice(i, i + 1000);
+        const params: unknown[] = [];
+        for (const [pid, val] of chunk) {
+          params.push(pid, val, carbonSource, now);
+        }
+        await tx.execute(
+          `INSERT INTO catalog_carbon_footprint
+             (product_id, carbon_kg_per_kg, source_csv, updated_at)
+           VALUES ${buildMultiRowPlaceholders(chunk.length, 4)}
+           ON CONFLICT (product_id) DO UPDATE SET
+             carbon_kg_per_kg = EXCLUDED.carbon_kg_per_kg,
+             source_csv = EXCLUDED.source_csv,
+             updated_at = EXCLUDED.updated_at`,
+          params,
+        );
+      }
+
+      // Deduplicate products by productId within batch if needed
+      const dedupProducts = new Map<string, Product>();
+      for (const p of allProducts) dedupProducts.set(p.productId, p);
+      const prodList = Array.from(dedupProducts.values());
+
+      for (let i = 0; i < prodList.length; i += 400) {
+        const chunk = prodList.slice(i, i + 400);
+        const params: unknown[] = [];
+        for (const p of chunk) {
+          const labels = p.labels ?? [];
+          const lf = isLactoseFree(p) ? 1 : 0;
+          const org = labels.includes("organic") ? 1 : 0;
+          const veg = labels.includes("vegan") ? 1 : 0;
+          const rel = relMap.get(p.productId) ?? null;
+          const carb = carbonMap.get(p.productId) ?? null;
+          params.push(
+            p.productId,
+            p.name,
+            p.nameFi ?? null,
+            p.brand ?? null,
+            p.category ?? null,
+            JSON.stringify(p.categories ?? []),
+            JSON.stringify(labels),
+            JSON.stringify(p.allergens ?? []),
+            JSON.stringify(p.mayContain ?? []),
+            JSON.stringify(p.certifications ?? []),
+            JSON.stringify(p.claims ?? []),
+            JSON.stringify(p.substitutes ?? []),
+            p.origin ? p.origin.toUpperCase() : null,
+            p.producer ?? null,
+            p.packSize,
+            p.packUnit,
+            p.piecesPerPack ?? null,
+            p.salesUnit ?? null,
+            lf,
+            org,
+            veg,
+            rel,
+            carb,
+          );
+        }
+        await tx.execute(
+          `INSERT INTO catalog_products (
+             product_id, name, name_fi, brand, category,
+             categories_json, labels_json, allergens_json, may_contain_json,
+             certifications_json, claims_json, substitutes_json,
+             origin, producer, pack_size, pack_unit, pieces_per_pack, sales_unit,
+             lactose_free, organic, vegan, delivery_reliability, carbon_kg_per_kg
+           ) VALUES ${buildMultiRowPlaceholders(chunk.length, 23)}
+           ON CONFLICT (product_id) DO UPDATE SET
+             name = EXCLUDED.name,
+             name_fi = EXCLUDED.name_fi,
+             brand = EXCLUDED.brand,
+             category = EXCLUDED.category,
+             categories_json = EXCLUDED.categories_json,
+             labels_json = EXCLUDED.labels_json,
+             allergens_json = EXCLUDED.allergens_json,
+             may_contain_json = EXCLUDED.may_contain_json,
+             certifications_json = EXCLUDED.certifications_json,
+             claims_json = EXCLUDED.claims_json,
+             substitutes_json = EXCLUDED.substitutes_json,
+             origin = EXCLUDED.origin,
+             producer = EXCLUDED.producer,
+             pack_size = EXCLUDED.pack_size,
+             pack_unit = EXCLUDED.pack_unit,
+             pieces_per_pack = EXCLUDED.pieces_per_pack,
+             sales_unit = EXCLUDED.sales_unit,
+             lactose_free = EXCLUDED.lactose_free,
+             organic = EXCLUDED.organic,
+             vegan = EXCLUDED.vegan,
+             delivery_reliability = EXCLUDED.delivery_reliability,
+             carbon_kg_per_kg = EXCLUDED.carbon_kg_per_kg`,
+          params,
+        );
+      }
+
+      if (relMap.size > 0) {
+        await tx.execute(
+          `INSERT INTO catalog_csv_imports (kind, source_name, row_count, imported_at)
+           VALUES ($1, $2, $3, $4)`,
+          ["reliability", relSource, relMap.size, now],
+        );
+      }
+      if (carbonMap.size > 0) {
+        await tx.execute(
+          `INSERT INTO catalog_csv_imports (kind, source_name, row_count, imported_at)
+           VALUES ($1, $2, $3, $4)`,
+          ["carbon", carbonSource, carbonMap.size, now],
+        );
+      }
+
+      await tx.execute(
+        `INSERT INTO catalog_meta (key, value)
+         VALUES ('sync_fingerprint', $1), ('synced_at', $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [fingerprint, now],
+      );
+    });
+
+    // Auto-ingest any additional CSV files present in dataDir (e.g. availability.csv, inventory.csv)
+    if (existsSync(config.dataDir)) {
+      const extraCsvs = readdirSync(config.dataDir).filter(
+        (f) =>
+          f.toLowerCase().endsWith(".csv") &&
+          f !== "delivery-reliability.csv" &&
+          f !== "carbon-footprint.csv",
+      );
+      for (const csvFile of extraCsvs) {
+        try {
+          const text = readFileSync(resolve(config.dataDir, csvFile), "utf8");
+          await importCsvToDatabase({ kind: "auto", csvText: text, sourceName: csvFile, skipSync: true });
+        } catch {
+          // ignore malformed custom files during auto-scan
+        }
+      }
+    }
+
+    syncedCatalogDb = d;
+    return d;
+  };
+
+  const p = runSync().finally(() => {
+    if (syncInFlight === p) syncInFlight = null;
+  });
+  if (!force) syncInFlight = p;
+  return p;
+}
+
+export async function recordPriceSnapshots(
   customerId: string,
   requestedDate: string,
   prices: PriceResult[],
-): void {
-  if (!prices.length) return;
-  const d = ensureCatalogSchema();
+): Promise<void> {
+  const dedup = new Map<string, PriceResult>();
+  for (const p of prices) {
+    if (p.error || p.unitPrice == null) continue;
+    dedup.set(p.productId, p);
+  }
+  const valid = Array.from(dedup.values());
+  if (!valid.length) return;
+
+  const d = await ensureCatalogSchema();
   const now = new Date().toISOString();
-  const stmt = d.prepare(`
-    INSERT INTO catalog_availability_snapshots (
-      customer_id, product_id, requested_date,
-      unit_price, comparison_price, comparison_unit, currency,
-      source, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'valio_live', ?)
-    ON CONFLICT(customer_id, product_id, requested_date) DO UPDATE SET
-      unit_price = excluded.unit_price,
-      comparison_price = excluded.comparison_price,
-      comparison_unit = excluded.comparison_unit,
-      currency = excluded.currency,
-      updated_at = excluded.updated_at
-  `);
-  d.transaction(() => {
-    for (const p of prices) {
-      if (p.error || p.unitPrice == null) continue;
-      stmt.run(
-        customerId,
-        p.productId,
-        requestedDate,
-        p.unitPrice,
-        p.comparisonPrice,
-        p.comparisonUnit,
-        p.currency,
-        now,
+
+  await d.withTransaction(async (tx) => {
+    for (let i = 0; i < valid.length; i += 250) {
+      const chunk = valid.slice(i, i + 250);
+      const params: unknown[] = [];
+      for (const p of chunk) {
+        params.push(
+          customerId,
+          p.productId,
+          requestedDate,
+          p.unitPrice,
+          p.comparisonPrice,
+          p.comparisonUnit,
+          p.currency,
+          "valio_live",
+          now,
+        );
+      }
+      await tx.execute(
+        `INSERT INTO catalog_availability_snapshots (
+           customer_id, product_id, requested_date,
+           unit_price, comparison_price, comparison_unit, currency,
+           source, updated_at
+         ) VALUES ${buildMultiRowPlaceholders(chunk.length, 9)}
+         ON CONFLICT (customer_id, product_id, requested_date) DO UPDATE SET
+           unit_price = EXCLUDED.unit_price,
+           comparison_price = EXCLUDED.comparison_price,
+           comparison_unit = EXCLUDED.comparison_unit,
+           currency = EXCLUDED.currency,
+           updated_at = EXCLUDED.updated_at`,
+        params,
       );
     }
-  })();
+  });
 }
 
-export function recordAvailabilitySnapshots(
+export async function recordAvailabilitySnapshots(
   customerId: string,
   requestedDate: string,
   availabilities: AvailabilityResult[],
-): void {
-  if (!availabilities.length) return;
-  const d = ensureCatalogSchema();
+): Promise<void> {
+  const dedup = new Map<string, AvailabilityResult>();
+  for (const a of availabilities) {
+    dedup.set(a.productId, a);
+  }
+  const valid = Array.from(dedup.values());
+  if (!valid.length) return;
+
+  const d = await ensureCatalogSchema();
   const now = new Date().toISOString();
-  const stmt = d.prepare(`
-    INSERT INTO catalog_availability_snapshots (
-      customer_id, product_id, requested_date,
-      available_amount, availability_unknown, available_date,
-      sales_unit, sales_block, logistic_model, closing_at,
-      source, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'valio_live', ?)
-    ON CONFLICT(customer_id, product_id, requested_date) DO UPDATE SET
-      available_amount = excluded.available_amount,
-      availability_unknown = excluded.availability_unknown,
-      available_date = excluded.available_date,
-      sales_unit = excluded.sales_unit,
-      sales_block = excluded.sales_block,
-      logistic_model = excluded.logistic_model,
-      closing_at = excluded.closing_at,
-      source = excluded.source,
-      updated_at = excluded.updated_at
-  `);
-  d.transaction(() => {
-    for (const a of availabilities) {
-      stmt.run(
-        customerId,
-        a.productId,
-        requestedDate,
-        a.availableAmount,
-        a.availabilityUnknown ? 1 : 0,
-        a.availableDate,
-        a.salesUnit,
-        a.salesBlock ? 1 : 0,
-        a.logisticModel,
-        a.closingAt,
-        now,
+
+  await d.withTransaction(async (tx) => {
+    for (let i = 0; i < valid.length; i += 250) {
+      const chunk = valid.slice(i, i + 250);
+      const params: unknown[] = [];
+      for (const a of chunk) {
+        params.push(
+          customerId,
+          a.productId,
+          requestedDate,
+          a.availableAmount,
+          a.availabilityUnknown ? 1 : 0,
+          a.availableDate,
+          a.salesUnit,
+          a.salesBlock ? 1 : 0,
+          a.logisticModel,
+          a.closingAt,
+          "valio_live",
+          now,
+        );
+      }
+      await tx.execute(
+        `INSERT INTO catalog_availability_snapshots (
+           customer_id, product_id, requested_date,
+           available_amount, availability_unknown, available_date,
+           sales_unit, sales_block, logistic_model, closing_at,
+           source, updated_at
+         ) VALUES ${buildMultiRowPlaceholders(chunk.length, 12)}
+         ON CONFLICT (customer_id, product_id, requested_date) DO UPDATE SET
+           available_amount = EXCLUDED.available_amount,
+           availability_unknown = EXCLUDED.availability_unknown,
+           available_date = EXCLUDED.available_date,
+           sales_unit = EXCLUDED.sales_unit,
+           sales_block = EXCLUDED.sales_block,
+           logistic_model = EXCLUDED.logistic_model,
+           closing_at = EXCLUDED.closing_at,
+           source = EXCLUDED.source,
+           updated_at = EXCLUDED.updated_at`,
+        params,
       );
     }
-  })();
+  });
 }
 
 export type CsvImportParams = {
@@ -487,12 +467,12 @@ export type CsvImportParams = {
   skipSync?: boolean;
 };
 
-export function importCsvToDatabase(params: CsvImportParams): {
+export async function importCsvToDatabase(params: CsvImportParams): Promise<{
   kind: string;
   sourceName: string;
   importedRows: number;
-} {
-  const d = params.skipSync ? ensureCatalogSchema() : ensureCatalogSynced();
+}> {
+  const d = params.skipSync ? await ensureCatalogSchema() : await ensureCatalogSynced();
   const rows = parseCsvRows(params.csvText);
   if (rows.length === 0) {
     throw new Error("CSV contains no data rows");
@@ -525,25 +505,7 @@ export function importCsvToDatabase(params: CsvImportParams): {
   };
 
   if (resolvedKind === "availability") {
-    const stmt = d.prepare(`
-      INSERT INTO catalog_availability_snapshots (
-        customer_id, product_id, requested_date,
-        available_amount, availability_unknown, available_date,
-        sales_unit, sales_block, unit_price, currency,
-        source, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(customer_id, product_id, requested_date) DO UPDATE SET
-        available_amount = COALESCE(excluded.available_amount, catalog_availability_snapshots.available_amount),
-        availability_unknown = excluded.availability_unknown,
-        available_date = COALESCE(excluded.available_date, catalog_availability_snapshots.available_date),
-        sales_unit = COALESCE(excluded.sales_unit, catalog_availability_snapshots.sales_unit),
-        sales_block = excluded.sales_block,
-        unit_price = COALESCE(excluded.unit_price, catalog_availability_snapshots.unit_price),
-        currency = COALESCE(excluded.currency, catalog_availability_snapshots.currency),
-        source = excluded.source,
-        updated_at = excluded.updated_at
-    `);
-    d.transaction(() => {
+    await d.withTransaction(async (tx) => {
       for (const row of rows) {
         const productId = pick(row, ["productId", "product_id", "sku", "code", "id"]) ?? Object.values(row)[0];
         if (!productId) continue;
@@ -559,56 +521,70 @@ export function importCsvToDatabase(params: CsvImportParams): {
         const rawPrice = pick(row, ["unitPrice", "unit_price", "price"]);
         const unitPrice = rawPrice !== undefined && Number.isFinite(Number(rawPrice)) ? Number(rawPrice) : null;
         const currency = pick(row, ["currency"]) ?? (unitPrice != null ? "EUR" : null);
-        stmt.run(
-          rowCust,
-          productId,
-          reqDate,
-          availAmt,
-          availAmt == null ? 1 : 0,
-          availDate ?? reqDate,
-          salesUnit,
-          salesBlock,
-          unitPrice,
-          currency,
-          `csv:${sourceName}`,
-          now,
+        await tx.execute(
+          `INSERT INTO catalog_availability_snapshots (
+             customer_id, product_id, requested_date,
+             available_amount, availability_unknown, available_date,
+             sales_unit, sales_block, unit_price, currency,
+             source, updated_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+           ON CONFLICT (customer_id, product_id, requested_date) DO UPDATE SET
+             available_amount = COALESCE(EXCLUDED.available_amount, catalog_availability_snapshots.available_amount),
+             availability_unknown = EXCLUDED.availability_unknown,
+             available_date = COALESCE(EXCLUDED.available_date, catalog_availability_snapshots.available_date),
+             sales_unit = COALESCE(EXCLUDED.sales_unit, catalog_availability_snapshots.sales_unit),
+             sales_block = EXCLUDED.sales_block,
+             unit_price = COALESCE(EXCLUDED.unit_price, catalog_availability_snapshots.unit_price),
+             currency = COALESCE(EXCLUDED.currency, catalog_availability_snapshots.currency),
+             source = EXCLUDED.source,
+             updated_at = EXCLUDED.updated_at`,
+          [
+            rowCust,
+            productId,
+            reqDate,
+            availAmt,
+            availAmt == null ? 1 : 0,
+            availDate ?? reqDate,
+            salesUnit,
+            salesBlock,
+            unitPrice,
+            currency,
+            `csv:${sourceName}`,
+            now,
+          ],
         );
         importedRows++;
       }
-    })();
+    });
   } else if (resolvedKind === "reliability") {
-    const ins = d.prepare(`
-      INSERT OR REPLACE INTO catalog_delivery_reliability
-        (product_id, delivery_reliability, source_csv, updated_at)
-      VALUES (?, ?, ?, ?)
-    `);
-    const updProd = d.prepare(`
-      UPDATE catalog_products SET delivery_reliability = ? WHERE product_id = ?
-    `);
     const relMap = getReliabilityMap();
-    d.transaction(() => {
+    await d.withTransaction(async (tx) => {
       for (const row of rows) {
         const productId = pick(row, ["productId", "product_id", "sku", "id"]) ?? Object.values(row)[0];
         const rawVal = pick(row, ["deliveryReliability", "delivery_reliability", "reliability"]) ?? Object.values(row)[1];
         const val = Number(rawVal);
         if (!productId || !Number.isFinite(val)) continue;
-        ins.run(productId, val, sourceName, now);
-        updProd.run(val, productId);
+        await tx.execute(
+          `INSERT INTO catalog_delivery_reliability
+             (product_id, delivery_reliability, source_csv, updated_at)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (product_id) DO UPDATE SET
+             delivery_reliability = EXCLUDED.delivery_reliability,
+             source_csv = EXCLUDED.source_csv,
+             updated_at = EXCLUDED.updated_at`,
+          [productId, val, sourceName, now],
+        );
+        await tx.execute(
+          `UPDATE catalog_products SET delivery_reliability = $1 WHERE product_id = $2`,
+          [val, productId],
+        );
         relMap.set(productId, val);
         importedRows++;
       }
-    })();
+    });
   } else if (resolvedKind === "carbon") {
-    const ins = d.prepare(`
-      INSERT OR REPLACE INTO catalog_carbon_footprint
-        (product_id, carbon_kg_per_kg, source_csv, updated_at)
-      VALUES (?, ?, ?, ?)
-    `);
-    const updProd = d.prepare(`
-      UPDATE catalog_products SET carbon_kg_per_kg = ? WHERE product_id = ?
-    `);
     const carbonMap = getCarbonMap();
-    d.transaction(() => {
+    await d.withTransaction(async (tx) => {
       for (const row of rows) {
         const productId = pick(row, ["productId", "product_id", "sku", "id"]) ?? Object.values(row)[0];
         const keys = Object.keys(row);
@@ -616,12 +592,24 @@ export function importCsvToDatabase(params: CsvImportParams): {
           keys.find((k) => k.toLowerCase().includes("co2") || k.toLowerCase().includes("carbon")) ?? keys[1];
         const val = Number(row[carbonKey]);
         if (!productId || !Number.isFinite(val)) continue;
-        ins.run(productId, val, sourceName, now);
-        updProd.run(val, productId);
+        await tx.execute(
+          `INSERT INTO catalog_carbon_footprint
+             (product_id, carbon_kg_per_kg, source_csv, updated_at)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (product_id) DO UPDATE SET
+             carbon_kg_per_kg = EXCLUDED.carbon_kg_per_kg,
+             source_csv = EXCLUDED.source_csv,
+             updated_at = EXCLUDED.updated_at`,
+          [productId, val, sourceName, now],
+        );
+        await tx.execute(
+          `UPDATE catalog_products SET carbon_kg_per_kg = $1 WHERE product_id = $2`,
+          [val, productId],
+        );
         carbonMap.set(productId, val);
         importedRows++;
       }
-    })();
+    });
   } else if (resolvedKind === "kitchen_inventory") {
     const items = rows
       .map((row) => {
@@ -643,34 +631,35 @@ export function importCsvToDatabase(params: CsvImportParams): {
         };
       })
       .filter((x): x is NonNullable<typeof x> => x !== null);
-    const saved = upsertInventory(customerId, items);
+    const saved = await upsertInventory(customerId, items);
     importedRows = saved.length;
   }
 
-  d.prepare(`
-    INSERT INTO catalog_csv_imports (kind, source_name, row_count, imported_at)
-    VALUES (?, ?, ?, ?)
-  `).run(resolvedKind, sourceName, importedRows, now);
+  await d.execute(
+    `INSERT INTO catalog_csv_imports (kind, source_name, row_count, imported_at)
+     VALUES ($1, $2, $3, $4)`,
+    [resolvedKind, sourceName, importedRows, now],
+  );
 
   return { kind: resolvedKind, sourceName, importedRows };
 }
 
-export function getCatalogDatabaseStats() {
-  const d = ensureCatalogSynced();
-  const count = (table: string) =>
-    (d.prepare(`SELECT COUNT(*) as c FROM ${table}`).get() as { c: number }).c;
-  const recentImports = d
-    .prepare(
-      `SELECT kind, source_name as sourceName, row_count as rowCount, imported_at as importedAt
-       FROM catalog_csv_imports ORDER BY import_id DESC LIMIT 10`,
-    )
-    .all();
+export async function getCatalogDatabaseStats() {
+  const d = await ensureCatalogSynced();
+  const count = async (table: string): Promise<number> => {
+    const row = await d.queryOne<{ c: number }>(`SELECT COUNT(*)::int AS c FROM ${table}`);
+    return Number(row?.c ?? 0);
+  };
+  const recentImports = await d.query(
+    `SELECT kind, source_name AS "sourceName", row_count AS "rowCount", imported_at AS "importedAt"
+     FROM catalog_csv_imports ORDER BY import_id DESC LIMIT 10`,
+  );
   return {
-    productsCount: count("catalog_products"),
-    reliabilityRowsCount: count("catalog_delivery_reliability"),
-    carbonRowsCount: count("catalog_carbon_footprint"),
-    availabilitySnapshotsCount: count("catalog_availability_snapshots"),
-    ftsEnabled: ftsAvailable,
+    productsCount: await count("catalog_products"),
+    reliabilityRowsCount: await count("catalog_delivery_reliability"),
+    carbonRowsCount: await count("catalog_carbon_footprint"),
+    availabilitySnapshotsCount: await count("catalog_availability_snapshots"),
+    ftsEnabled: true,
     recentCsvImports: recentImports,
   };
 }
@@ -742,43 +731,54 @@ function sanitizeFtsTokens(q: string): string[] {
     .filter((t) => t.length >= 2);
 }
 
-export function queryCatalogDatabase(filters: CatalogDbQueryFilters) {
-  const d = ensureCatalogSynced();
+export async function queryCatalogDatabase(filters: CatalogDbQueryFilters) {
+  const d = await ensureCatalogSynced();
   const limit = Math.min(Math.max(filters.limit ?? 25, 1), 100);
   const customerId = filters.customerId || "HOTEL-001";
 
-  const where: string[] = [];
   const params: unknown[] = [];
+  const addParam = (v: unknown): string => {
+    params.push(v);
+    return `$${params.length}`;
+  };
 
-  let ftsJoin = "";
-  let ftsOrderExpr = "0";
+  const custParam = addParam(customerId);
+  let snapDateClause = "";
+  if (filters.requestedDate) {
+    snapDateClause = `AND s2.requested_date = ${addParam(filters.requestedDate)}`;
+  }
+
+  const snapJoin = `
+    LEFT JOIN catalog_availability_snapshots snap
+      ON snap.customer_id = ${custParam}
+     AND snap.product_id = p.product_id
+     AND snap.requested_date = (
+       SELECT s2.requested_date
+       FROM catalog_availability_snapshots s2
+       WHERE s2.customer_id = snap.customer_id
+         AND s2.product_id = p.product_id
+         ${snapDateClause}
+       ORDER BY s2.updated_at DESC, s2.requested_date DESC
+       LIMIT 1
+     )
+  `;
+
+  const where: string[] = [];
   const qText = (filters.query ?? "").trim();
 
   if (qText) {
     const tokens = sanitizeFtsTokens(qText);
-    if (ftsAvailable && tokens.length > 0) {
-      const ftsExpr = tokens
-        .map((t) => {
-          const stem = stemToken(t);
-          return stem !== t ? `("${t}"* OR "${stem}"*)` : `"${t}"*`;
-        })
-        .join(" AND ");
-      ftsJoin = `JOIN catalog_products_fts fts ON fts.product_id = p.product_id`;
-      where.push(`catalog_products_fts MATCH ?`);
-      params.push(ftsExpr);
-      ftsOrderExpr = `bm25(catalog_products_fts)`;
-    } else if (tokens.length > 0) {
-      for (const t of tokens) {
-        const stem = stemToken(t);
-        where.push(`(LOWER(p.name) LIKE ? OR LOWER(COALESCE(p.name_fi, '')) LIKE ? OR LOWER(COALESCE(p.brand, '')) LIKE ?)`);
-        params.push(`%${stem}%`, `%${stem}%`, `%${stem}%`);
-      }
+    for (const t of tokens) {
+      const stem = stemToken(t);
+      const pat = addParam(`%${stem}%`);
+      where.push(
+        `(p.name ILIKE ${pat} OR COALESCE(p.name_fi, '') ILIKE ${pat} OR COALESCE(p.brand, '') ILIKE ${pat} OR COALESCE(p.category, '') ILIKE ${pat} OR p.categories_json ILIKE ${pat} OR p.labels_json ILIKE ${pat})`,
+      );
     }
   }
 
   if (filters.productIds && filters.productIds.length > 0) {
-    where.push(`p.product_id IN (${filters.productIds.map(() => "?").join(",")})`);
-    params.push(...filters.productIds);
+    where.push(`p.product_id IN (${filters.productIds.map((id) => addParam(id)).join(",")})`);
   }
   if (filters.lactoseFree === true) {
     where.push(`p.lactose_free = 1`);
@@ -792,61 +792,30 @@ export function queryCatalogDatabase(filters: CatalogDbQueryFilters) {
     where.push(`p.vegan = 1`);
   }
   if (filters.packUnit) {
-    where.push(`UPPER(p.pack_unit) = ?`);
-    params.push(filters.packUnit.trim().toUpperCase());
+    where.push(`UPPER(p.pack_unit) = ${addParam(filters.packUnit.trim().toUpperCase())}`);
   }
   if (filters.minPackSize !== undefined) {
-    where.push(`p.pack_size >= ?`);
-    params.push(filters.minPackSize);
+    where.push(`p.pack_size >= ${addParam(filters.minPackSize)}`);
   }
   if (filters.maxPackSize !== undefined) {
-    where.push(`p.pack_size <= ?`);
-    params.push(filters.maxPackSize);
+    where.push(`p.pack_size <= ${addParam(filters.maxPackSize)}`);
   }
   if (filters.minReliability !== undefined) {
-    where.push(`p.delivery_reliability IS NOT NULL AND p.delivery_reliability >= ?`);
-    params.push(filters.minReliability);
+    where.push(`p.delivery_reliability IS NOT NULL AND p.delivery_reliability >= ${addParam(filters.minReliability)}`);
   }
   if (filters.maxCarbonKgPerKg !== undefined) {
-    where.push(`p.carbon_kg_per_kg IS NOT NULL AND p.carbon_kg_per_kg <= ?`);
-    params.push(filters.maxCarbonKgPerKg);
+    where.push(`p.carbon_kg_per_kg IS NOT NULL AND p.carbon_kg_per_kg <= ${addParam(filters.maxCarbonKgPerKg)}`);
   }
   if (filters.origin) {
-    where.push(`UPPER(COALESCE(p.origin, '')) = ?`);
-    params.push(filters.origin.trim().toUpperCase());
+    where.push(`UPPER(COALESCE(p.origin, '')) = ${addParam(filters.origin.trim().toUpperCase())}`);
   }
   if (filters.brand) {
-    where.push(`LOWER(COALESCE(p.brand, '')) LIKE ?`);
-    params.push(`%${filters.brand.trim().toLowerCase()}%`);
+    where.push(`COALESCE(p.brand, '') ILIKE ${addParam(`%${filters.brand.trim()}%`)}`);
   }
   if (filters.category) {
-    where.push(`(LOWER(COALESCE(p.category, '')) LIKE ? OR LOWER(p.categories_json) LIKE ?)`);
-    const pat = `%${filters.category.trim().toLowerCase()}%`;
-    params.push(pat, pat);
+    const pat = addParam(`%${filters.category.trim()}%`);
+    where.push(`(COALESCE(p.category, '') ILIKE ${pat} OR p.categories_json ILIKE ${pat})`);
   }
-
-  const snapJoinParams: unknown[] = [customerId];
-  let snapDateClause = "";
-  if (filters.requestedDate) {
-    snapDateClause = `AND s2.requested_date = ?`;
-    snapJoinParams.push(filters.requestedDate);
-  }
-
-  const snapJoin = `
-    LEFT JOIN catalog_availability_snapshots snap
-      ON snap.customer_id = ?
-     AND snap.product_id = p.product_id
-     AND snap.requested_date = (
-       SELECT s2.requested_date
-       FROM catalog_availability_snapshots s2
-       WHERE s2.customer_id = snap.customer_id
-         AND s2.product_id = p.product_id
-         ${snapDateClause}
-       ORDER BY s2.updated_at DESC, s2.requested_date DESC
-       LIMIT 1
-     )
-  `;
-
   if (filters.onlyAvailable) {
     where.push(
       `snap.product_id IS NOT NULL AND snap.sales_block = 0 AND (snap.available_amount > 0 OR snap.availability_unknown = 1)`,
@@ -857,9 +826,7 @@ export function queryCatalogDatabase(filters: CatalogDbQueryFilters) {
 
   let orderSql = `ORDER BY COALESCE(p.delivery_reliability, 0) DESC, p.product_id ASC`;
   const sortBy = filters.sortBy ?? (qText ? "relevance" : "reliability_desc");
-  if (sortBy === "relevance" && qText && ftsJoin) {
-    orderSql = `ORDER BY ${ftsOrderExpr} ASC, COALESCE(p.delivery_reliability, 0) DESC`;
-  } else if (sortBy === "reliability_desc") {
+  if (sortBy === "reliability_desc") {
     orderSql = `ORDER BY COALESCE(p.delivery_reliability, -1) DESC, p.product_id ASC`;
   } else if (sortBy === "carbon_asc") {
     orderSql = `ORDER BY CASE WHEN p.carbon_kg_per_kg IS NULL THEN 1 ELSE 0 END ASC, p.carbon_kg_per_kg ASC`;
@@ -871,6 +838,8 @@ export function queryCatalogDatabase(filters: CatalogDbQueryFilters) {
 
   // Over-fetch when allergen post-filtering or relevance re-scoring is active
   const fetchCap = filters.excludeAllergens?.length || qText ? Math.min(limit * 4, 300) : limit;
+  const limitParam = addParam(fetchCap);
+
   const sql = `
     SELECT
       p.*,
@@ -882,17 +851,16 @@ export function queryCatalogDatabase(filters: CatalogDbQueryFilters) {
       snap.comparison_price,
       snap.comparison_unit,
       snap.currency,
-      snap.requested_date as snapshot_date,
-      snap.source as snapshot_source
+      snap.requested_date AS snapshot_date,
+      snap.source AS snapshot_source
     FROM catalog_products p
-    ${ftsJoin}
     ${snapJoin}
     ${whereSql}
     ${orderSql}
-    LIMIT ?
+    LIMIT ${limitParam}
   `;
 
-  let rows = d.prepare(sql).all(...snapJoinParams, ...params, fetchCap) as DbProductRow[];
+  let rows = await d.query<DbProductRow>(sql, params);
 
   if (filters.excludeAllergens && filters.excludeAllergens.length > 0) {
     rows = rows.filter((r) => {
@@ -995,7 +963,7 @@ export type InspectProductParams = {
 };
 
 export async function inspectProductInventoryAvailability(params: InspectProductParams) {
-  const d = ensureCatalogSynced();
+  const d = await ensureCatalogSynced();
   const requestedDate = params.requestedDate || defaultInspectionDate();
   const fetchLive = params.fetchLive ?? true;
 
@@ -1020,8 +988,8 @@ export async function inspectProductInventoryAvailability(params: InspectProduct
     return {
       found: false,
       error: params.productId
-        ? `Product ID "${params.productId}" was not found in the SQLite catalog.`
-        : `No product matched "${params.productQuery ?? ""}" in the SQLite catalog.`,
+        ? `Product ID "${params.productId}" was not found in the PostgreSQL catalog.`
+        : `No product matched "${params.productQuery ?? ""}" in the PostgreSQL catalog.`,
     };
   }
 
@@ -1093,75 +1061,74 @@ export async function inspectProductInventoryAvailability(params: InspectProduct
     }
   }
 
-  // Query SQLite CSV tables for this product
-  const prodRow = d
-    .prepare(`SELECT * FROM catalog_products WHERE product_id = ?`)
-    .get(pid) as DbProductRow | undefined;
-  const relRow = d
-    .prepare(
-      `SELECT delivery_reliability as value, source_csv as sourceCsv, updated_at as updatedAt
-       FROM catalog_delivery_reliability WHERE product_id = ?`,
-    )
-    .get(pid) as { value: number; sourceCsv: string; updatedAt: string } | undefined;
-  const carbonRow = d
-    .prepare(
-      `SELECT carbon_kg_per_kg as value, source_csv as sourceCsv, updated_at as updatedAt
-       FROM catalog_carbon_footprint WHERE product_id = ?`,
-    )
-    .get(pid) as { value: number; sourceCsv: string; updatedAt: string } | undefined;
+  // Query PostgreSQL CSV tables for this product
+  const prodRow = await d.queryOne<DbProductRow>(
+    `SELECT * FROM catalog_products WHERE product_id = $1`,
+    [pid],
+  );
+  const relRow = await d.queryOne<{ value: number; sourceCsv: string; updatedAt: string }>(
+    `SELECT delivery_reliability AS value, source_csv AS "sourceCsv", updated_at AS "updatedAt"
+     FROM catalog_delivery_reliability WHERE product_id = $1`,
+    [pid],
+  );
+  const carbonRow = await d.queryOne<{ value: number; sourceCsv: string; updatedAt: string }>(
+    `SELECT carbon_kg_per_kg AS value, source_csv AS "sourceCsv", updated_at AS "updatedAt"
+     FROM catalog_carbon_footprint WHERE product_id = $1`,
+    [pid],
+  );
 
-  // Query all stored availability & price snapshots in SQLite for this product
-  const snapshots = d
-    .prepare(
-      `SELECT
-         requested_date as requestedDate,
-         available_amount as availableAmount,
-         availability_unknown as availabilityUnknown,
-         available_date as availableDate,
-         sales_unit as salesUnit,
-         sales_block as salesBlock,
-         logistic_model as logisticModel,
-         closing_at as closingAt,
-         unit_price as unitPrice,
-         comparison_price as comparisonPrice,
-         comparison_unit as comparisonUnit,
-         currency,
-         source,
-         updated_at as updatedAt
-       FROM catalog_availability_snapshots
-       WHERE customer_id = ? AND product_id = ?
-       ORDER BY requested_date DESC, updated_at DESC`,
-    )
-    .all(params.customerId, pid)
-    .map((s) => {
-      const rec = s as Record<string, unknown>;
-      return {
-        ...rec,
-        availabilityUnknown: Boolean(rec.availabilityUnknown),
-        salesBlock: Boolean(rec.salesBlock),
-      };
-    });
+  // Query all stored availability & price snapshots in PostgreSQL for this product
+  const rawSnapshots = await d.query<Record<string, unknown>>(
+    `SELECT
+       requested_date AS "requestedDate",
+       available_amount AS "availableAmount",
+       availability_unknown AS "availabilityUnknown",
+       available_date AS "availableDate",
+       sales_unit AS "salesUnit",
+       sales_block AS "salesBlock",
+       logistic_model AS "logisticModel",
+       closing_at AS "closingAt",
+       unit_price AS "unitPrice",
+       comparison_price AS "comparisonPrice",
+       comparison_unit AS "comparisonUnit",
+       currency,
+       source,
+       updated_at AS "updatedAt"
+     FROM catalog_availability_snapshots
+     WHERE customer_id = $1 AND product_id = $2
+     ORDER BY requested_date DESC, updated_at DESC`,
+    [params.customerId, pid],
+  );
+  const snapshots = rawSnapshots.map((rec) => ({
+    ...rec,
+    availabilityUnknown: Boolean(rec.availabilityUnknown),
+    salesBlock: Boolean(rec.salesBlock),
+  }));
 
-  // Resolve Valio-declared substitutes from SQLite
+  // Resolve Valio-declared substitutes from PostgreSQL
   const subIds = getValioSubstitutes(pid);
-  const substitutes = subIds
-    .map((subId) => {
-      const subRow = d
-        .prepare(
-          `SELECT p.product_id, p.name, p.pack_size, p.pack_unit, p.lactose_free, p.organic,
-                  p.delivery_reliability, p.carbon_kg_per_kg,
-                  s.available_amount, s.available_date, s.sales_block, s.unit_price, s.requested_date
-           FROM catalog_products p
-           LEFT JOIN catalog_availability_snapshots s
-             ON s.customer_id = ? AND s.product_id = p.product_id
-            AND s.requested_date = (
-              SELECT s2.requested_date FROM catalog_availability_snapshots s2
-              WHERE s2.customer_id = ? AND s2.product_id = p.product_id
-              ORDER BY s2.updated_at DESC LIMIT 1
-            )
-           WHERE p.product_id = ?`,
-        )
-        .get(params.customerId, params.customerId, subId) as Record<string, unknown> | undefined;
+  const subRows = await Promise.all(
+    subIds.map((subId) =>
+      d.queryOne<Record<string, unknown>>(
+        `SELECT p.product_id, p.name, p.pack_size, p.pack_unit, p.lactose_free, p.organic,
+                p.delivery_reliability, p.carbon_kg_per_kg,
+                s.available_amount, s.available_date, s.sales_block, s.unit_price, s.requested_date
+         FROM catalog_products p
+         LEFT JOIN catalog_availability_snapshots s
+           ON s.customer_id = $1 AND s.product_id = p.product_id
+          AND s.requested_date = (
+            SELECT s2.requested_date FROM catalog_availability_snapshots s2
+            WHERE s2.customer_id = $1 AND s2.product_id = p.product_id
+            ORDER BY s2.updated_at DESC LIMIT 1
+          )
+         WHERE p.product_id = $2`,
+        [params.customerId, subId],
+      ),
+    ),
+  );
+
+  const substitutes = subRows
+    .map((subRow) => {
       if (!subRow) return null;
       return {
         productId: String(subRow.product_id),
@@ -1210,8 +1177,8 @@ export async function inspectProductInventoryAvailability(params: InspectProduct
 
   // Strict least-privilege gate: ONLY attach buyer kitchen stock when includeKitchenStock === true
   if (params.includeKitchenStock) {
-    const inv = getInventory(params.customerId);
-    const kitchen = getKitchen(params.customerId);
+    const inv = await getInventory(params.customerId);
+    const kitchen = await getKitchen(params.customerId);
     if (inv && kitchen) {
       const prodLower = `${targetProduct.name} ${targetProduct.nameFi ?? ""}`.toLowerCase();
       const matchingIngredients = inv.inventory.filter((item) => {

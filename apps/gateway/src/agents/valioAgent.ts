@@ -33,55 +33,47 @@ export type Suggestion = {
   intentId?: string;
 };
 
-let ready = false;
 function db() {
-  const d = getDb();
-  if (!ready) {
-    d.exec(`
-      CREATE TABLE IF NOT EXISTS valio_suggestions (
-        id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, dedupe_key TEXT NOT NULL,
-        status TEXT NOT NULL, created_at TEXT NOT NULL, json TEXT NOT NULL
-      );
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_sugg_open ON valio_suggestions(customer_id, dedupe_key) WHERE status = 'new';
-    `);
-    ready = true;
-  }
-  return d;
+  return getDb();
 }
 
 const iso = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 
-export function listSuggestions(customerId: string): Suggestion[] {
-  const rows = db()
-    .prepare(`SELECT json, status, id FROM valio_suggestions WHERE customer_id = ? ORDER BY created_at DESC LIMIT 50`)
-    .all(customerId) as Array<{ json: string; status: string; id: string }>;
+export async function listSuggestions(customerId: string): Promise<Suggestion[]> {
+  const rows = await db().query<{ json: string; status: string; id: string }>(
+    `SELECT json, status, id FROM valio_suggestions WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 50`,
+    [customerId],
+  );
   return rows.map((r) => ({ ...(JSON.parse(r.json) as Suggestion), status: r.status as Suggestion["status"], id: r.id }));
 }
 
-function getSuggestion(customerId: string, id: string): Suggestion | null {
-  const row = db()
-    .prepare(`SELECT json, status, id FROM valio_suggestions WHERE customer_id = ? AND id = ?`)
-    .get(customerId, id) as { json: string; status: string; id: string } | undefined;
+async function getSuggestion(customerId: string, id: string): Promise<Suggestion | null> {
+  const row = await db().queryOne<{ json: string; status: string; id: string }>(
+    `SELECT json, status, id FROM valio_suggestions WHERE customer_id = $1 AND id = $2`,
+    [customerId, id],
+  );
   return row ? { ...(JSON.parse(row.json) as Suggestion), status: row.status as Suggestion["status"], id: row.id } : null;
 }
 
-function save(s: Suggestion): boolean {
-  const res = db()
-    .prepare(`INSERT OR IGNORE INTO valio_suggestions (id, customer_id, dedupe_key, status, created_at, json) VALUES (?,?,?,?,?,?)`)
-    .run(s.id, s.customerId, `${s.kind}:${s.originalProductId}:${s.suggestedProductId}`, s.status, s.createdAt, JSON.stringify(s));
-  return res.changes > 0;
+async function save(s: Suggestion): Promise<boolean> {
+  const res = await db().execute(
+    `INSERT INTO valio_suggestions (id, customer_id, dedupe_key, status, created_at, json) VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT DO NOTHING`,
+    [s.id, s.customerId, `${s.kind}:${s.originalProductId}:${s.suggestedProductId}`, s.status, s.createdAt, JSON.stringify(s)],
+  );
+  return res.rowCount > 0;
 }
 
-function setStatus(id: string, patch: Partial<Suggestion>) {
-  const row = db().prepare(`SELECT json FROM valio_suggestions WHERE id = ?`).get(id) as { json: string } | undefined;
+async function setStatus(id: string, patch: Partial<Suggestion>) {
+  const row = await db().queryOne<{ json: string }>(`SELECT json FROM valio_suggestions WHERE id = $1`, [id]);
   if (!row) throw new Error("suggestion not found");
   const next = { ...(JSON.parse(row.json) as Suggestion), ...patch };
-  db().prepare(`UPDATE valio_suggestions SET status = ?, json = ? WHERE id = ?`).run(next.status, JSON.stringify(next), id);
+  await db().execute(`UPDATE valio_suggestions SET status = $1, json = $2 WHERE id = $3`, [next.status, JSON.stringify(next), id]);
   return next;
 }
 
-export function resetSuggestions(customerId: string) {
-  db().prepare(`DELETE FROM valio_suggestions WHERE customer_id = ?`).run(customerId);
+export async function resetSuggestions(customerId: string) {
+  await db().execute(`DELETE FROM valio_suggestions WHERE customer_id = $1`, [customerId]);
 }
 
 /** One pass of the Valio account agent for a customer. */
@@ -96,15 +88,16 @@ async function runImpl(customerId: string) {
   const since = Date.now() - 60 * 86_400_000;
 
   // Valio's own records: what this customer has actually bought recently (latest order per product).
-  const latest = new Map<string, ReturnType<typeof listOrders>[number]>();
-  for (const o of listOrders(customerId)) {
+  const orders = await listOrders(customerId);
+  const latest = new Map<string, (typeof orders)[number]>();
+  for (const o of orders) {
     if (o.status !== "committed" || new Date(o.updatedAt).getTime() < since) continue;
     const pid = o.basket[0]?.productId;
     if (pid && !latest.has(pid)) latest.set(pid, o);
   }
   const watched = [...latest.entries()].slice(0, 6);
   const upcoming = iso(new Date(Date.now() + 3 * 86_400_000));
-  appendAudit(runId, customerId, "valio_agent_started", { watching: watched.length, upcoming });
+  await appendAudit(runId, customerId, "valio_agent_started", { watching: watched.length, upcoming });
 
   for (const [productId, order] of watched) {
     const need: Need = { ...order.need, neededBy: upcoming };
@@ -138,9 +131,9 @@ async function runImpl(customerId: string) {
           source: alt.substitutionSource === "valio_catalog" ? "valio_catalog" : "price_comparison",
           need,
         };
-        if (save(s)) {
+        if (await save(s)) {
           created.push(s);
-          appendAudit(runId, customerId, "suggestion_created", { kind: s.kind, title: s.title, suggested: alt.productName });
+          await appendAudit(runId, customerId, "suggestion_created", { kind: s.kind, title: s.title, suggested: alt.productName });
         }
         continue;
       }
@@ -165,22 +158,22 @@ async function runImpl(customerId: string) {
           source: "price_comparison",
           need,
         };
-        if (save(s)) {
+        if (await save(s)) {
           created.push(s);
-          appendAudit(runId, customerId, "suggestion_created", { kind: s.kind, title: s.title, suggested: best.productName });
+          await appendAudit(runId, customerId, "suggestion_created", { kind: s.kind, title: s.title, suggested: best.productName });
         }
       }
     } catch (e) {
       notes.push(`${name}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  appendAudit(runId, customerId, "valio_agent_finished", { checked: watched.length, created: created.length });
+  await appendAudit(runId, customerId, "valio_agent_finished", { checked: watched.length, created: created.length });
   return { checked: watched.length, created, notes };
 }
 
 /** The buyer side acts on a suggestion — through the Procurement agent and the normal mandate. */
 export async function acceptSuggestion(customerId: string, id: string, mandate: Mandate) {
-  const s = getSuggestion(customerId, id);
+  const s = await getSuggestion(customerId, id);
   if (!s) throw new Error("suggestion not found");
   if (s.status !== "new") throw new Error(`suggestion already ${s.status}`);
   const res = await createOrderIntent({
@@ -191,14 +184,14 @@ export async function acceptSuggestion(customerId: string, id: string, mandate: 
     // A stock-out replacement is a substitution; a cheaper equivalent is the same need, better sourced.
     markSubstitution: s.kind === "stockout_alert",
   });
-  appendAudit(res.intent.runId, customerId, "suggestion_accepted", { title: s.title, intentId: res.intent.id, status: res.intent.status });
-  setStatus(id, { status: "accepted", intentId: res.intent.id });
+  await appendAudit(res.intent.runId, customerId, "suggestion_accepted", { title: s.title, intentId: res.intent.id, status: res.intent.status });
+  await setStatus(id, { status: "accepted", intentId: res.intent.id });
   return res.intent;
 }
 
-export function dismissSuggestion(customerId: string, id: string) {
-  const s = getSuggestion(customerId, id);
+export async function dismissSuggestion(customerId: string, id: string) {
+  const s = await getSuggestion(customerId, id);
   if (!s) throw new Error("suggestion not found");
-  appendAudit(randomUUID(), customerId, "suggestion_dismissed", { title: s.title });
+  await appendAudit(randomUUID(), customerId, "suggestion_dismissed", { title: s.title });
   return setStatus(id, { status: "dismissed" });
 }

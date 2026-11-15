@@ -3,20 +3,23 @@ import { AgentArenaView } from "./AgentArenaView";
 import {
   api,
   getApiKey,
+  isLabModeEnabled,
   setApiKey,
   type Intent,
   type Mandate,
   type RestockAutomationBundle,
 } from "./api";
 import { ApprovalView } from "./ApprovalView";
+import { ConnectAgentModal } from "./ConnectAgentModal";
 import { EventsAndKitchenView } from "./EventsAndKitchenView";
+import { HomeView, type DemoAccountKey } from "./HomeView";
 import { NewOrderView } from "./NewOrderView";
 import { OrdersHistoryView } from "./OrdersHistoryView";
 import { PromptEvalView } from "./PromptEvalView";
 import { RulesView } from "./RulesView";
 import { TechProofModal } from "./TechProofModal";
 
-export type TabId = "order" | "kitchen" | "approval" | "rules" | "history" | "arena" | "eval";
+export type TabId = "home" | "order" | "kitchen" | "approval" | "rules" | "history" | "arena" | "eval";
 type KitchenSection = "events" | "pantry" | "recipes" | "recurring";
 type ToastTone = "success" | "warn" | "info";
 
@@ -28,11 +31,12 @@ type EventBadgeSummary = {
 };
 
 function getInitialTab(): TabId {
-  if (typeof window === "undefined") return "order";
+  if (typeof window === "undefined") return "home";
   const params = new URLSearchParams(window.location.search);
   if (params.get("eval") === "1") return "eval";
   const q = params.get("tab");
   if (
+    q === "home" ||
     q === "order" ||
     q === "kitchen" ||
     q === "approval" ||
@@ -43,7 +47,7 @@ function getInitialTab(): TabId {
   ) {
     return q;
   }
-  return "order";
+  return "home";
 }
 
 function getInitialKitchenSection(): KitchenSection {
@@ -68,11 +72,13 @@ export function App() {
   const [selectedPendingId, setSelectedPendingId] = useState<string | null>(null);
   const [toast, setToast] = useState<{ text: string; tone: ToastTone } | null>(null);
   const [authIssue, setAuthIssue] = useState<string | null>(null);
-  const [sseConnected, setSseConnected] = useState<boolean>(false);
   const [resetNonce, setResetNonce] = useState<number>(0);
   const [techModal, setTechModal] = useState<{ open: boolean; runId?: string }>({
     open: false,
   });
+
+  const [connectModalOpen, setConnectModalOpen] = useState(false);
+  const [launchingDemo, setLaunchingDemo] = useState(false);
 
   const lastMandateJsonRef = useRef<string>("");
 
@@ -149,6 +155,53 @@ export function App() {
     return () => clearInterval(timer);
   }, [refreshState]);
 
+  const launchDemo = useCallback(
+    async (
+      accountKey: DemoAccountKey,
+      targetTab: TabId = "order",
+      kitchenSubView?: KitchenSection,
+    ) => {
+      setLaunchingDemo(true);
+      try {
+        setApiKey(accountKey);
+        const res = await api<{
+          ok: boolean;
+          seeded?: {
+            committedOrders: number;
+            pendingApprovals: number;
+            events: number;
+            standingOrders: number;
+          };
+        }>("/v1/demo/seed", {
+          method: "POST",
+          body: "{}",
+        });
+        lastMandateJsonRef.current = "";
+        setSelectedPendingId(null);
+        setResetNonce((n) => n + 1);
+        if (kitchenSubView) {
+          setKitchenSection(kitchenSubView);
+        }
+        await refreshState();
+        setTab(targetTab);
+        const label = accountKey.includes("school") ? "School Kitchen" : "Hotel Kitchen";
+        const s = res.seeded;
+        showToast(
+          s
+            ? `Live ${label} demo ready! Loaded ${s.pendingApprovals} pending approval(s), ${s.events} event(s), ${s.standingOrders} recurring schedule(s), and ${s.committedOrders} past order(s).`
+            : `Live ${label} demo data loaded!`,
+          "success",
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        showToast(`Could not load demo data: ${msg}`, "warn");
+      } finally {
+        setLaunchingDemo(false);
+      }
+    },
+    [refreshState, showToast],
+  );
+
   // Real-time SSE stream (/v1/stream) for zero-lag multi-agent, voice & approval updates
   useEffect(() => {
     if (typeof EventSource === "undefined") return;
@@ -158,21 +211,14 @@ export function App() {
     try {
       const key = getApiKey();
       es = new EventSource(`/v1/stream?apiKey=${encodeURIComponent(key)}`);
-      es.addEventListener("connected", () => {
-        setSseConnected(true);
-      });
       es.addEventListener("audit", () => {
-        setSseConnected(true);
         if (debounceTimer) window.clearTimeout(debounceTimer);
         debounceTimer = window.setTimeout(() => {
           void refreshState();
         }, 180);
       });
-      es.onerror = () => {
-        setSseConnected(false);
-      };
     } catch {
-      setSseConnected(false);
+      // Ignore EventSource connection errors; polling fallback remains active
     }
 
     return () => {
@@ -190,11 +236,11 @@ export function App() {
   const viewKey = `${customerId}-${resetNonce}`;
 
   return (
-    <div>
+    <div className="app-shell">
       {/* Calm Chef Navigation + Instant Judge Security Lab Access */}
       <header className="top-shell">
         <div className="top-shell-inner">
-          <button type="button" className="brand-lockup" onClick={() => setTab("order")}>
+          <button type="button" className="brand-lockup" onClick={() => setTab("home")}>
             <div className="brand-mark">VA</div>
             <div>
               <div className="brand-title">Valio Aimo®</div>
@@ -202,7 +248,28 @@ export function App() {
             </div>
           </button>
 
-          <nav className="nav-tabs" aria-label="Main navigation">
+          {tab === "home" ? (
+            <div className="top-shell-actions">
+              <button
+                type="button"
+                className="btn primary"
+                style={{ minHeight: 42, padding: "8px 18px", fontSize: 14, fontWeight: 700 }}
+                disabled={launchingDemo}
+                onClick={() => void launchDemo("hotel_buyer_key_001", "order")}
+              >
+                {launchingDemo ? "Preparing Live Demo…" : "Test the App →"}
+              </button>
+            </div>
+          ) : (
+            <>
+              <nav className="nav-tabs" aria-label="Main navigation">
+            <button
+              type="button"
+              className="nav-tab"
+              onClick={() => setTab("home")}
+            >
+              Home
+            </button>
             <button
               type="button"
               className={`nav-tab ${tab === "order" ? "active" : ""}`}
@@ -263,33 +330,28 @@ export function App() {
           >
             <button
               type="button"
-              className={`judge-lab-btn ${tab === "eval" ? "active" : ""}`}
-              onClick={() => setTab("eval")}
-              title="28-case LLM Purchasing Agent Prompt Evaluation & Accuracy Marking Bench"
+              className="connect-agent-btn"
+              onClick={() => setConnectModalOpen(true)}
             >
-              <span>🧪 Prompt Eval</span>
+              <span>✨</span>
+              <span>Connect Your AI Agent</span>
             </button>
-
-            <button
-              type="button"
-              className={`judge-lab-btn ${tab === "arena" ? "active" : ""}`}
-              onClick={() => setTab("arena")}
-              title="Live Multi-Agent Topology, Red-Team Security Attacks, MCP & Cryptographic Proof"
-            >
-              <span className={`pulse-dot ${sseConnected ? "" : "amber"}`} />
-              <span>⚡ Live Agent Lab</span>
-            </button>
-
             <button
               type="button"
               className="kitchen-pill-btn"
               onClick={() => setTechModal({ open: true })}
-              title="Switch kitchen account or open demo tools"
+              title={
+                isLabModeEnabled()
+                  ? "Switch kitchen account or open demo tools"
+                  : "Switch kitchen account"
+              }
             >
               <span>{kitchenName}</span>
               <span style={{ opacity: 0.6 }}>▾</span>
             </button>
           </div>
+            </>
+          )}
         </div>
       </header>
 
@@ -334,6 +396,15 @@ export function App() {
 
       {/* Active Tab Content */}
       <main>
+        {tab === "home" && (
+          <HomeView
+            launching={launchingDemo}
+            onLaunchDemo={launchDemo}
+            onEnterWithoutSeed={(nextTab) => setTab(nextTab)}
+            onOpenConnectAgent={() => setConnectModalOpen(true)}
+          />
+        )}
+
         {tab === "order" && (
           <NewOrderView
             key={`order-${viewKey}`}
@@ -456,6 +527,52 @@ export function App() {
           />
         )}
       </main>
+
+      <footer className="global-footer">
+        <div className="global-footer-inner">
+          <div className="global-footer-brand">
+            <div className="brand-mark" style={{ width: 30, height: 30, fontSize: 12, borderRadius: 8 }}>
+              VA
+            </div>
+            <div>
+              <div className="global-footer-title">Valio Aimo® Kitchen Ordering &amp; Voice Assistant</div>
+              <div className="global-footer-sub">
+                Autonomous wholesale ordering with spend guardrails &amp; verified digital receipts.
+              </div>
+            </div>
+          </div>
+
+          <nav className="global-footer-links" aria-label="Footer navigation">
+            <button type="button" className="link-quiet" onClick={() => setTab("home")}>
+              Home
+            </button>
+            <button
+              type="button"
+              className="link-quiet"
+              disabled={launchingDemo}
+              onClick={() => void launchDemo("hotel_buyer_key_001", "order")}
+            >
+              Test Hotel Demo
+            </button>
+            <button
+              type="button"
+              className="link-quiet"
+              disabled={launchingDemo}
+              onClick={() => void launchDemo("school_buyer_key_001", "order")}
+            >
+              Test School Demo
+            </button>
+            <button type="button" className="link-quiet" onClick={() => setTab("order")}>
+              Open Workspace
+            </button>
+          </nav>
+        </div>
+      </footer>
+
+      <ConnectAgentModal
+        open={connectModalOpen}
+        onClose={() => setConnectModalOpen(false)}
+      />
 
       <TechProofModal
         open={techModal.open}

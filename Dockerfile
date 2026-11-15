@@ -9,9 +9,8 @@ COPY apps/desk/package.json ./apps/desk/
 COPY apps/external-agent/package.json ./apps/external-agent/
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends python3 make g++ ca-certificates \
+  && apt-get install -y --no-install-recommends ca-certificates \
   && npm ci \
-  && apt-get purge -y --auto-remove python3 make g++ \
   && rm -rf /var/lib/apt/lists/* /root/.npm
 
 COPY packages ./packages

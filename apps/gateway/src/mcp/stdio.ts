@@ -3,7 +3,7 @@ import { config } from "../config.js";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { generateKeyPairSync } from "node:crypto";
-import { getDb } from "../audit/chain.js";
+import { initDb } from "../audit/chain.js";
 import { loadCatalog } from "../catalog/index.js";
 
 function ensureKeys() {
@@ -18,6 +18,6 @@ function ensureKeys() {
 }
 
 ensureKeys();
-getDb();
+await initDb();
 loadCatalog();
 await startMcpServer();

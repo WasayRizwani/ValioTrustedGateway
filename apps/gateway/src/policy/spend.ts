@@ -11,24 +11,23 @@ export type SpendSummary = {
 };
 
 /** Committed plus approved / auto_eligible-not-yet-committed (and unexpired) intents. */
-export function computeSpend(customerId: string, now: Date = new Date()): SpendSummary {
+export async function computeSpend(customerId: string, now: Date = new Date()): Promise<SpendSummary> {
   const dayStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
   const weekStart = dayStart - ((now.getUTCDay() + 6) % 7) * 86_400_000;
   const monthStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
-  const rows = getDb()
-    .prepare(
-      `SELECT total_price, created_at FROM order_intents
-       WHERE customer_id = ? AND created_at >= ?
-         AND (status = 'committed' OR (status IN ('approved','auto_eligible') AND expires_at > ?))`,
-    )
-    .all(
+  const rows = await getDb().query<{
+    total_price: number;
+    created_at: string;
+  }>(
+    `SELECT total_price, created_at FROM order_intents
+     WHERE customer_id = $1 AND created_at >= $2
+       AND (status = 'committed' OR (status IN ('approved','auto_eligible') AND expires_at > $3))`,
+    [
       customerId,
       new Date(Math.min(monthStart, weekStart, now.getTime() - 86_400_000)).toISOString(),
       now.toISOString(),
-    ) as Array<{
-    total_price: number;
-    created_at: string;
-  }>;
+    ],
+  );
   const out: SpendSummary = { day: 0, week: 0, month: 0, ordersToday: 0, recent24h: [] };
   for (const r of rows) {
     const t = new Date(r.created_at).getTime();

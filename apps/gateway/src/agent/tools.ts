@@ -1,18 +1,31 @@
 import { smartRestock } from "../hotel/optimizer.js";
 import { randomUUID } from "node:crypto";
-import { NeedSchema, type ComplexNeedResult, type Need, type Offer } from "@tta/shared";
+import {
+  NeedSchema,
+  SignedClaimSchema,
+  PreferencesSchema,
+  DetachedBuyerSignatureInputSchema,
+  DisputePresetSchema,
+  SimulatedInvoiceDocumentSchema,
+  type ComplexNeedResult,
+  type Need,
+  type Offer,
+  type TradeReceipt,
+} from "@tta/shared";
+import { z } from "zod";
 import { getMandate } from "../auth/customers.js";
 import { searchProducts, searchFromNeed } from "../catalog/index.js";
 import { buildOffers, buildOffersBatch, explainOffers } from "../catalog/offers.js";
 import { getPrices, getAvailability } from "../valio/client.js";
 import { verifyClaim } from "../claims/sign.js";
-import { SignedClaimSchema, PreferencesSchema } from "@tta/shared";
+import { verifyTradeReceipt, arbitrateTradeDispute } from "../claims/receipt.js";
 import {
   createOrderIntent,
   listPending,
   getIntent,
   commitOrder,
   listOrders,
+  ensureReceiptForCommittedOrder,
 } from "../orders/store.js";
 import { createMultiItemQuote, createQuote, getQuote } from "../orders/quotes.js";
 import { getAuditTrail, verifyAuditChain } from "../audit/chain.js";
@@ -483,12 +496,27 @@ export const agentToolDefs: AgentToolDef[] = [
     function: {
       name: "commit_order",
       description:
-        "Commit an auto_eligible or approved intent after revalidation. Will fail if pending_approval without human approval.",
+        "Commit an auto_eligible or approved intent after revalidation and return the dual-signed Bilateral Liability Receipt (.vtr.json). Will fail if pending_approval without human approval.",
       parameters: {
         type: "object",
         properties: {
           intentId: { type: "string" },
           idempotencyKey: { type: "string" },
+          buyerSignature: {
+            type: "object",
+            description:
+              "Optional detached buyer signature (Ed25519 or ECDSA-P256) over canonical BuyerReceiptPayload",
+            properties: {
+              algorithm: { type: "string", enum: ["Ed25519", "ECDSA-P256"] },
+              keyId: { type: "string" },
+              publicKeyPem: { type: "string" },
+              signedAt: { type: "string" },
+              authorizedMaxTotalEur: { type: "number" },
+              actingAgentId: { type: "string" },
+              signature: { type: "string" },
+            },
+            required: ["algorithm", "keyId", "publicKeyPem", "signedAt", "signature"],
+          },
         },
         required: ["intentId"],
       },
@@ -573,6 +601,122 @@ export const agentToolDefs: AgentToolDef[] = [
           productIds: { type: "array", items: { type: "string" } },
         },
         required: ["requestedDate", "productIds"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_trade_receipt",
+      description:
+        "Fetch (or issue if missing) the dual-signed Bilateral Liability Receipt (.vtr.json) for a committed order by Order ID (ORD-...), Intent ID, or Receipt ID (VTR-...). Read-only.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: {
+            type: "string",
+            description: "Order ID (ORD-...), Intent ID, or Receipt ID (VTR-...)",
+          },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "verify_trade_receipt",
+      description:
+        "Offline cryptographic verification of a portable .vtr.json Bilateral Liability Receipt (SHA-256 receiptHash, buyer Ed25519/ECDSA-P256 signature, supplier Ed25519 signature, bilateral binding, and human override proof). Read-only.",
+      parameters: {
+        type: "object",
+        properties: {
+          receipt: {
+            type: "object",
+            description: "Portable .vtr.json TradeReceipt object",
+          },
+        },
+        required: ["receipt"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "arbitrate_dispute",
+      description:
+        "Deterministic (<10 ms) 3-Way Invoice & Bilateral Liability Dispute Arbitrator. Resolves a .vtr.json TradeReceipt (by Order/Intent/Receipt ID or inline receipt) against a preset scenario or simulated invoice/delivery document and returns a DisputeRuling (SUPPLIER_BREACH, BUYER_LIABLE, or TAMPER_REJECTED). Read-only.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: {
+            type: "string",
+            description:
+              "Order ID (ORD-...), Intent ID, or Receipt ID (VTR-...) used to resolve the receipt when inline receipt is omitted",
+          },
+          receipt: {
+            type: "object",
+            description: "Optional inline portable .vtr.json TradeReceipt object",
+          },
+          preset: {
+            type: "string",
+            enum: [
+              "price_hike_012",
+              "late_delivery",
+              "rogue_agent_chargeback",
+              "allergen_breach",
+              "tampered_receipt",
+              "clean_3way_match",
+            ],
+            description: "Optional deterministic dispute simulation preset",
+          },
+          document: {
+            type: "object",
+            description: "Optional simulated e-invoice / delivery note document for 3-way matching",
+            properties: {
+              documentId: { type: "string" },
+              documentType: {
+                type: "string",
+                enum: ["e_invoice", "delivery_note", "combined_3way"],
+              },
+              deliveredAt: { type: "string" },
+              buyerDisputeClaim: {
+                type: "string",
+                enum: [
+                  "none",
+                  "rogue_agent_hallucination",
+                  "price_overcharge",
+                  "late_delivery",
+                  "allergen_breach",
+                ],
+              },
+              buyerDisputeNote: { type: "string" },
+              billedTotalEur: { type: "number" },
+              currency: { type: "string" },
+              lines: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    productId: { type: "string" },
+                    productName: { type: "string" },
+                    billedPacks: { type: "number" },
+                    deliveredPacks: { type: "number" },
+                    billedQuantity: { type: "number" },
+                    deliveredQuantity: { type: "number" },
+                    billedUnitPriceEur: { type: "number" },
+                    billedPricePerQtyUnitEur: { type: "number" },
+                    billedLineTotalEur: { type: "number" },
+                    deliveredAllergens: { type: "array", items: { type: "string" } },
+                    deliveredLactoseFree: { type: "boolean" },
+                  },
+                  required: ["productId", "billedLineTotalEur"],
+                },
+              },
+            },
+            required: ["billedTotalEur", "lines"],
+          },
+        },
       },
     },
   },
@@ -679,20 +823,20 @@ export async function executeAgentTool(
           return formatComplexParseResult(parsedComplex);
         }
         case "get_mandate":
-          return getMandate(customerId);
+          return await getMandate(customerId);
         case "get_inventory":
-          return getInventory(customerId) ?? { error: "no_kitchen_profile" };
+          return (await getInventory(customerId)) ?? { error: "no_kitchen_profile" };
         case "get_recipes":
-          return getRecipes(customerId) ?? { error: "no_kitchen_profile" };
+          return (await getRecipes(customerId)) ?? { error: "no_kitchen_profile" };
         case "get_order_history":
-          return getOrderHistory(customerId) ?? { error: "no_kitchen_profile" };
+          return (await getOrderHistory(customerId)) ?? { error: "no_kitchen_profile" };
         case "smart_restock":
           return (await smartRestock(customerId, { daysCover: Number(args.daysCover ?? 7) })) ?? { error: "no_kitchen_profile" };
         case "recommend_restock":
           return (
-            recommendRestock(customerId, {
+            (await recommendRestock(customerId, {
               daysCover: Number(args.daysCover ?? 7),
-            }) ?? { error: "no_kitchen_profile" }
+            })) ?? { error: "no_kitchen_profile" }
           );
         case "search_products": {
           if (args.need) {
@@ -716,7 +860,7 @@ export async function executeAgentTool(
           };
         }
         case "rank_offers": {
-          const mandate = getMandate(customerId);
+          const mandate = await getMandate(customerId);
           const preferences = args.preferences ? PreferencesSchema.parse(args.preferences) : undefined;
           if (Array.isArray(args.needs) && args.needs.length > 0) {
             const boundNeeds: Need[] = [];
@@ -764,13 +908,13 @@ export async function executeAgentTool(
           };
         }
         case "list_events":
-          return { events: listEvents(customerId) };
+          return { events: await listEvents(customerId) };
         case "create_event":
-          return createEvent(customerId, args as never);
+          return await createEvent(customerId, args as never);
         case "order_event":
-          return orderEvent(customerId, String(args.eventId));
+          return await orderEvent(customerId, String(args.eventId));
         case "plan_menu_sourcing": {
-          const mandate = getMandate(customerId);
+          const mandate = await getMandate(customerId);
           if (!mandate) throw new Error("no mandate");
           return planSourcing(customerId, mandate, {
             neededBy: String(args.neededBy),
@@ -779,7 +923,7 @@ export async function executeAgentTool(
           });
         }
         case "handle_stockout": {
-          const mandate = getMandate(customerId);
+          const mandate = await getMandate(customerId);
           if (!mandate) throw new Error("no mandate");
           return handleStockout(customerId, mandate, {
             ingredientId: String(args.ingredientId),
@@ -789,7 +933,7 @@ export async function executeAgentTool(
           });
         }
         case "create_order_intent": {
-          const mandate = getMandate(customerId);
+          const mandate = await getMandate(customerId);
           if (!mandate) throw new Error("no mandate");
           if (Array.isArray(args.items) && args.items.length > 0) {
             const boundItems: Array<{ need: Need; offerProductId?: string }> = [];
@@ -809,7 +953,7 @@ export async function executeAgentTool(
             });
           }
           const quoteId = args.quoteId as string | undefined;
-          const existingQuote = quoteId ? getQuote(quoteId, customerId) : undefined;
+          const existingQuote = quoteId ? await getQuote(quoteId, customerId) : undefined;
           if (quoteId && existingQuote?.isMultiItemBasket && existingQuote.lines.length > 1) {
             return createOrderIntent({
               customerId,
@@ -852,23 +996,121 @@ export async function executeAgentTool(
           });
         }
         case "get_quote":
-          return getQuote(String(args.quoteId), customerId) ?? { error: "not_found" };
-        case "commit_order":
-          return commitOrder({
+          return (await getQuote(String(args.quoteId), customerId)) ?? { error: "not_found" };
+        case "commit_order": {
+          const buyerSignature = DetachedBuyerSignatureInputSchema.optional().parse(
+            args.buyerSignature,
+          );
+          const committed = await commitOrder({
             intentId: String(args.intentId),
             customerId,
             idempotencyKey: String(args.idempotencyKey ?? randomUUID()),
+            buyerSignature,
           });
+          const receipt = await ensureReceiptForCommittedOrder(committed.id, customerId);
+          return {
+            ...committed,
+            orderId: committed.committedOrderId,
+            confirmation: {
+              orderId: committed.committedOrderId,
+              status: committed.status,
+              lines: committed.basket,
+              totalPrice: committed.totalPrice,
+              confirmedAt: committed.updatedAt,
+              runId: committed.runId,
+            },
+            intent: committed,
+            receipt,
+          };
+        }
+        case "get_trade_receipt": {
+          const { id } = z
+            .object({
+              id: z
+                .string()
+                .min(1)
+                .describe("Order ID (ORD-...), Intent ID, or Receipt ID (VTR-...)"),
+            })
+            .parse({
+              id: args.id ?? args.orderId ?? args.intentId ?? args.receiptId,
+            });
+          return (
+            (await ensureReceiptForCommittedOrder(id, customerId)) ?? {
+              error: "not_found",
+            }
+          );
+        }
+        case "verify_trade_receipt": {
+          const { receipt } = z
+            .object({
+              receipt: z.record(z.unknown()).describe("Portable .vtr.json TradeReceipt object"),
+            })
+            .parse(args);
+          const target =
+            "receipt" in receipt &&
+            !("receiptId" in receipt) &&
+            receipt.receipt &&
+            typeof receipt.receipt === "object"
+              ? (receipt.receipt as TradeReceipt)
+              : (receipt as unknown as TradeReceipt);
+          return verifyTradeReceipt(target);
+        }
+        case "arbitrate_dispute": {
+          const parsed = z
+            .object({
+              id: z.string().optional(),
+              receipt: z.record(z.unknown()).optional(),
+              preset: DisputePresetSchema.optional(),
+              document: SimulatedInvoiceDocumentSchema.optional(),
+            })
+            .parse({
+              ...args,
+              id: args.id ?? args.orderId ?? args.receiptId ?? args.intentId,
+            });
+          let receipt: TradeReceipt | null = null;
+          if (parsed.receipt) {
+            const raw = parsed.receipt;
+            receipt =
+              "receipt" in raw &&
+              !("receiptId" in raw) &&
+              raw.receipt &&
+              typeof raw.receipt === "object"
+                ? (raw.receipt as TradeReceipt)
+                : (raw as unknown as TradeReceipt);
+          } else if (parsed.id) {
+            receipt = await ensureReceiptForCommittedOrder(parsed.id, customerId);
+            if (!receipt) {
+              throw new Error(
+                `receipt_not_found: No committed order or bilateral receipt found for ${parsed.id}`,
+              );
+            }
+          } else {
+            throw new Error(
+              "receipt_required: Provide either `id` (Order ID, Intent ID, or Receipt ID) or `receipt` (.vtr.json)",
+            );
+          }
+          const fallbackDoc =
+            !parsed.preset &&
+            !parsed.document &&
+            !(receipt as unknown as { supplier?: { payload?: unknown } })?.supplier?.payload
+              ? SimulatedInvoiceDocumentSchema.parse({ billedTotalEur: 0, lines: [] })
+              : undefined;
+          return arbitrateTradeDispute({
+            receipt,
+            preset: parsed.preset,
+            document: parsed.document ?? fallbackDoc,
+          });
+        }
         case "list_pending_approvals":
-          return { intents: listPending(customerId) };
+          return { intents: await listPending(customerId) };
         case "list_orders":
-          return { orders: listOrders(customerId) };
+          return { orders: await listOrders(customerId) };
         case "get_order_intent":
-          return getIntent(String(args.intentId), customerId);
+          return await getIntent(String(args.intentId), customerId);
         case "get_audit_trail":
           return {
-            events: getAuditTrail(String(args.runId), customerId),
-            verification: verifyAuditChain(String(args.runId), customerId),
+            events: await getAuditTrail(String(args.runId), customerId),
+            verification: await verifyAuditChain(String(args.runId), customerId),
           };
         case "verify_claim":
           return verifyClaim(SignedClaimSchema.parse(args.claim), { customerId });
@@ -939,6 +1181,7 @@ Capability patterns (compose as needed from the user's ask — not a checklist t
 - Suggestions / new products: search/rank against kitchen context + mandate; propose with rationale; do not commit unless the user confirms.
 - Policy / allergen constraints: get_mandate; treat allergenRestrictions and lactoseFreePreferred as hard constraints; escalate when policy blocks auto-commit.
 - Recurring-order anomalies: recommend_restock + get_order_history; surface standingOrderDrift / qty or cost creep; do not auto-order drifted lines unless the user overrides.
+- Bilateral receipts & 3-way dispute arbitration: get_trade_receipt (fetch .vtr.json receipt by order/intent/receipt id), verify_trade_receipt (offline cryptographic verification), arbitrate_dispute (deterministic <10 ms 3-way invoice/delivery dispute ruling via preset or simulated invoice document).
 
 Hard rules:
 - ${UNTRUSTED_DATA_RULE}

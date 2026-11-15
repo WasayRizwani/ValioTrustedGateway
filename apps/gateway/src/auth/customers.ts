@@ -131,52 +131,40 @@ export function assertBuyer(auth: AuthContext, action: string): void {
   if (auth.role !== "buyer") throw new ForbiddenError(action);
 }
 
-function mandateTable() {
-  const db = getDb();
-  db.exec(
-    `CREATE TABLE IF NOT EXISTS mandates (
-       customer_id TEXT PRIMARY KEY,
-       json TEXT NOT NULL,
-       updated_at TEXT NOT NULL
-     )`,
-  );
-  return db;
-}
-
 /** Mandates are persisted so edits survive a gateway restart. */
-export function getMandate(customerId: string): Mandate | null {
-  const db = mandateTable();
-  const row = db
-    .prepare(`SELECT json FROM mandates WHERE customer_id = ?`)
-    .get(customerId) as { json: string } | undefined;
+export async function getMandate(customerId: string): Promise<Mandate | null> {
+  const db = getDb();
+  const row = await db.queryOne<{ json: string }>(
+    `SELECT json FROM mandates WHERE customer_id = $1`,
+    [customerId],
+  );
   if (row) return MandateSchema.parse(JSON.parse(row.json));
   const seed = defaultMandates.get(customerId);
   if (!seed) return null;
-  saveMandate(seed);
+  await saveMandate(seed);
   return seed;
 }
 
-function saveMandate(m: Mandate) {
-  mandateTable()
-    .prepare(
-      `INSERT INTO mandates (customer_id, json, updated_at) VALUES (?, ?, ?)
-       ON CONFLICT(customer_id) DO UPDATE SET json=excluded.json, updated_at=excluded.updated_at`,
-    )
-    .run(m.customerId, JSON.stringify(m), new Date().toISOString());
+async function saveMandate(m: Mandate): Promise<void> {
+  await getDb().execute(
+    `INSERT INTO mandates (customer_id, json, updated_at) VALUES ($1, $2, $3)
+     ON CONFLICT (customer_id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at`,
+    [m.customerId, JSON.stringify(m), new Date().toISOString()],
+  );
 }
 
-export function setMandate(mandate: Mandate): Mandate {
+export async function setMandate(mandate: Mandate): Promise<Mandate> {
   if (!defaultMandates.has(mandate.customerId)) {
     throw new Error("Unknown customer");
   }
-  saveMandate(mandate);
+  await saveMandate(mandate);
   return mandate;
 }
 
-export function resetMandate(customerId: string): Mandate | null {
+export async function resetMandate(customerId: string): Promise<Mandate | null> {
   const seed = defaultMandates.get(customerId);
   if (!seed) return null;
-  saveMandate(seed);
+  await saveMandate(seed);
   return seed;
 }
 

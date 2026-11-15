@@ -112,11 +112,11 @@ export const SENSITIVE_TOOLS = new Set([
 ]);
 
 /** Audit a refusal (at most once per key+bucket per 10 s so a flood cannot bloat the chain). */
-export function auditRefusal(apiKey: string, customerId: string, d: Extract<LimitDecision, { ok: false }>, what: string, agent?: string) {
+export async function auditRefusal(apiKey: string, customerId: string, d: Extract<LimitDecision, { ok: false }>, what: string, agent?: string): Promise<void> {
   const b = buckets.get(`${apiKey}|${d.bucket}`);
   if (b && now() - b.audited < 10_000) return;
   if (b) b.audited = now();
-  appendAudit(randomUUID(), customerId, "rate_limited", {
+  await appendAudit(randomUUID(), customerId, "rate_limited", {
     action: what,
     bucket: d.bucket,
     limitPerMin: d.limit,
@@ -157,7 +157,7 @@ export function rateLimitMiddleware(): MiddlewareHandler {
     const effectiveRole = deskRead ? "buyer" : (auth as { role?: string }).role;
     const d = checkLimit(auth.apiKey, sensitive, effectiveRole);
     if (!d.ok) {
-      auditRefusal(auth.apiKey, auth.customerId, d, `${c.req.method} ${c.req.path}`, auth.agentId);
+      await auditRefusal(auth.apiKey, auth.customerId, d, `${c.req.method} ${c.req.path}`, auth.agentId);
       c.header("Retry-After", String(d.retryAfterSec));
       return c.json(rateLimitBody(d), 429);
     }

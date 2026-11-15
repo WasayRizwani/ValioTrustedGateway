@@ -12,7 +12,7 @@ We do **not** compete on how smart our LLM is. We compete on **how safely someon
 
 1. **Deterministic Gateway Authority, Untrusted AI:** LLMs (internal chat coordinator or external third-party agents) only orchestrate tool calls. Scope checks, allergen/dietary floors, spend caps, mandate overrides, and commit-time revalidation execute deterministically inside gateway code.
 2. **Protocol Parity (REST + MCP):** External agents connect via OpenAPI 3.1 REST or Model Context Protocol (`stdio` MCP). Both transports pass through identical authentication, per-key token-bucket rate limiting, capability checks, and audit logging.
-3. **Verifiable Facts & Non-Repudiation:** Outbound price, stock, allergen, and origin claims are wrapped in canonical **Ed25519 v2 envelopes** (verifiable offline via `/.well-known/jwks.json`). Human mandate overrides bind a **WebAuthn / ECDSA P-256 cryptographic signature** to the basket's `snapshotHash` and failing rules, and every state transition or `403` refusal is recorded in an append-only **SHA-256 hash-chained SQLite audit log**.
+3. **Verifiable Facts & Non-Repudiation:** Outbound price, stock, allergen, and origin claims are wrapped in canonical **Ed25519 v2 envelopes** (verifiable offline via `/.well-known/jwks.json`). Human mandate overrides bind a **WebAuthn / ECDSA P-256 cryptographic signature** to the basket's `snapshotHash` and failing rules, and every state transition or `403` refusal is recorded in an append-only **SHA-256 hash-chained PostgreSQL audit log**.
 4. **Upstream ERP Protection:** Catalog search runs locally against 17,546 indexed SKUs; live Valio `/api/price` and `/api/availability` calls are restricted to shortlisted SKUs (`MAX_SHORTLIST_SIZE = 25`) and paced through a serialized `<10 req/s` upstream queue.
 
 ### 1. Entry Points & Gateway Overview
@@ -35,7 +35,7 @@ flowchart LR
   end
 
   subgraph Data["Storage & Supplier"]
-    DB[("SQLite (Kitchen, Quotes, Orders, Audit)")]
+    DB[("PostgreSQL (Kitchen, Quotes, Orders, Audit)")]
     Valio["Valio Price & Stock API (<10 req/s)"]
   end
 
@@ -116,7 +116,7 @@ The repository is organized as an npm workspaces monorepo (`apps/*`, `packages/*
 1. **Identity, Tenant Isolation & Multi-Agent Capability Scopes (`auth/`, `agents/`, `middleware/ratelimit.ts`)**
    - Every API key resolves server-side to an immutable `customerId` (`HOTEL-001` or `SCHOOL-001`) and role (`buyer`, general `agent`, or one of four specialist `AgentId`s: `sourcing`, `planner`, `procurement`, `valio-account`). Cross-tenant parameter spoofing is impossible.
    - `agents/registry.ts` maps 14 granular capabilities (`catalog:read`, `quotes:create`, `orders:propose`, `orders:commit`, `kitchen:read`, `plan:run`, `suggest:write`, etc.) to exact HTTP method/path patterns and MCP tool visibility. Any out-of-scope call returns `403 forbidden` and appends a `forbidden_action` event to the audit chain.
-   - `AsyncLocalStorage` (`agents/context.ts`) propagates the acting agent identity down into internal calls so every SQLite audit entry automatically records which specialist agent performed the step.
+   - `AsyncLocalStorage` (`agents/context.ts`) propagates the acting agent identity down into internal calls so every PostgreSQL audit entry automatically records which specialist agent performed the step.
    - Per-key token buckets enforce burst/cooldown limits (`middleware/ratelimit.ts`) alongside shortlist-size caps (`MAX_SHORTLIST_SIZE = 25`).
 
 2. **Prompt-Injection Defense & Deterministic NL Constraint Floor (`agent/`, `need/parse.ts`)**
@@ -140,23 +140,24 @@ The repository is organized as an npm workspaces monorepo (`apps/*`, `packages/*
    - **Firm-Price Quotes (`orders/quotes.ts`):** `createQuote` and `createMultiItemQuote` freeze live shortlisted offers into a single-use `Quote` (`QUO-*`) with `validUntil` (default 30 min), `availabilityHeld: false`, and quote-bound Ed25519 claims (`subject.quoteId`).
    - **Snapshot-Bound Order Intents (`orders/store.ts`):** Supports both single-SKU and **consolidated multi-item baskets** (`isMultiItemBasket`, `itemNeeds`). Computes a deterministic SHA-256 `snapshotHash` over the basket lines, prices, and policy verdict. Identical open intents are deduplicated; newer drafts supersede stale unapproved ones without double-counting spend.
    - **Accountable Human Overrides & Hardware Signatures:** Approving a `pending_approval` intent (`POST /v1/orders/:id/approve`) requires the human `buyer` key, matching `snapshotHash`, `authorizeMandateOverride: true`, and explicit `acknowledgedRules` covering every failing rule. Buyers can additionally sign a deterministic challenge (`POST /v1/orders/:id/approve-challenge` over `intentId:snapshotHash:failingRules`) via **WebAuthn Passkey** or **WebCrypto ECDSA P-256** (`auth/humanProof.ts`), recording `humanSignatureProof` in intent metadata and the audit trail, and optionally attach an `authorizedFallback` backup SKU.
-   - **Revalidated Commit & Stock-Out Cascade (`commitOrder`):** Re-verifies mandate validity/expiry, re-queries live Valio price and availability, honours firm quote pricing inside `validUntil` (`quote_price_honoured`) or enforces `priceDriftTolerancePct` outside it, and transitions back to `pending_approval` if any unacknowledged rule newly fails. If the primary SKU suffers a warehouse stock-out right before commit and a buyer-approved `authorizedFallback` exists within its `maxTotalPrice` ceiling, the gateway automatically cascades to the backup SKU (`cascadeExecuted`). Synchronous state locking (`revalidating`), in-flight promise joining, and a unique SQLite index on `idempotency_key` guarantee **exactly-once** commit execution.
+   - **Revalidated Commit & Stock-Out Cascade (`commitOrder`):** Re-verifies mandate validity/expiry, re-queries live Valio price and availability, honours firm quote pricing inside `validUntil` (`quote_price_honoured`) or enforces `priceDriftTolerancePct` outside it, and transitions back to `pending_approval` if any unacknowledged rule newly fails. If the primary SKU suffers a warehouse stock-out right before commit and a buyer-approved `authorizedFallback` exists within its `maxTotalPrice` ceiling, the gateway automatically cascades to the backup SKU (`cascadeExecuted`). State locking (`revalidating`), in-flight promise joining, and a unique PostgreSQL index on `idempotency_key` guarantee **exactly-once** commit execution.
 
 6. **Cryptographic Claim Envelopes & Tamper-Evident Audit Chain (`claims/sign.ts`, `audit/chain.ts`)**
    - **Ed25519 Envelope v2:** Canonical JSON signatures cover `{ version: 2, claimId, issuer, keyId, asOf, subject, claim }` (including product origin, producer, allergens, `mayContain`, and certifications). Public keys are served at `/.well-known/jwks.json`; legacy v1 envelopes with unsigned metadata are rejected.
-   - **SHA-256 Audit Chain & SSE Bus:** Every event is written in an atomic SQLite transaction linking `prev_hash → hash` (`GENESIS` root per `(run_id, customer_id)`) and emitted onto `auditBus` for live `/v1/stream` SSE updates in the Desk. `POST /v1/audit/:runId/simulate-tamper` runs an in-memory tamper X-ray proving broken hash detection without mutating SQLite.
+   - **SHA-256 Audit Chain & SSE Bus:** Every event is written in an atomic PostgreSQL transaction (`pg_advisory_xact_lock`) linking `prev_hash → hash` (`GENESIS` root per `(run_id, customer_id)`) and emitted onto `auditBus` for live `/v1/stream` SSE updates in the Desk. `POST /v1/audit/:runId/simulate-tamper` runs an in-memory tamper X-ray proving broken hash detection without mutating PostgreSQL.
 
-7. **Operational Kitchen Domain, Schedulers & Voice Proposals (`hotel/`)**
-   - Buyer-owned kitchen state (`inventory` with `shelfLifeDays`/`expiresOn`, `recipes`, `order_history`, `standing_orders`, `events`) lives in SQLite and syncs automatically when orders commit or deliveries/cooking runs are logged.
+7. **Operational Kitchen Domain, Schedulers, Daily Digest & Voice Proposals (`hotel/`)**
+   - Buyer-owned kitchen state (`inventory` with `shelfLifeDays`/`expiresOn`, `recipes`, `order_history`, `standing_orders`, `events`) lives in PostgreSQL and syncs automatically when orders commit or deliveries/cooking runs are logged.
    - Three background schedulers (`startRestockScheduler`, `startStandingScheduler`, `startEventScheduler`) monitor low stock, recurring schedules, and upcoming event `orderBy` deadlines.
+   - **Daily Restock Digest Email (1/day):** To keep buyers informed without alert fatigue, the gateway sends **one daily digest email** (`dailyDigestEnabled` / `dailyDigestTime`) summarizing every automated restock placed or planned that day, recent inventory history, and incoming deliveries arriving at the kitchen or workplace.
    - **Voice Event Proposals (`hotel/voice.ts`):** Handles Vapi phone calls (`/vapi/tools`) and simulated presets (`/v1/voice/simulate`) to draft banquet events with `autoOrder: false`, issuing a hashed single-use POST approval link (`/approval/voice/:token`) so a phone call can **never** spend money without explicit buyer confirmation.
 
 ### Data & Storage Architecture
 
 | Store / Artifact | Location | Purpose |
 |------------------|----------|---------|
-| **Transactional & Audit DB** | `data/gateway.db` (SQLite) | Append-only `audit_events` (`prev_hash → hash`), `quotes`, `order_intents` (with partial unique index `idx_idempotency`), persisted customer mandates, kitchen inventory/recipes, standing orders, events, and Valio agent suggestions. |
-| **Catalog & ESG Datasets** | `data/products.json`, `data/*.csv` | 17,546 Valio product records, allergens/certifications, substitute graphs, 4,429 delivery reliability rows, and 11,033 product carbon intensity records loaded in memory/SQLite FTS on boot. |
+| **Transactional & Audit DB** | PostgreSQL (`DATABASE_URL` / Aiven Managed PG; local PGlite fallback) | Append-only `audit_events` (`prev_hash → hash`), `quotes`, `order_intents` (with partial unique index `idx_idempotency`), `.vtr.json` `trade_receipts`, persisted customer mandates, kitchen inventory/recipes, standing orders, events, and Valio agent suggestions. |
+| **Catalog & ESG Datasets** | `data/products.json`, `data/*.csv` | 17,546 Valio product records, allergens/certifications, substitute graphs, 4,429 delivery reliability rows, and 11,033 product carbon intensity records loaded in memory and synced to PostgreSQL catalog tables on boot. |
 | **Signing Key Material** | `keys/claim-ed25519-*.pem` | Ed25519 PKCS#8 private key and SPKI public key auto-generated on first boot (`ensureKeys()`) and published via `GET /.well-known/jwks.json`. |
 | **Upstream Live Truth** | Valio Mock / Challenge API | Authoritative live customer unit prices and warehouse schedule lines, queried strictly on-demand for shortlisted SKUs and re-queried prior to commit. |
 
@@ -256,19 +257,19 @@ Full evaluation, prototype boundaries, and phased architecture roadmap: **[`docs
 ### Working end-to-end today
 
 1. **Deterministic authority & least-privilege multi-agent isolation** — Four scoped agent identities (`sourcing`, `planner`, `procurement`, `valio-account`) enforced in gateway middleware across both **REST and MCP**. Agents get `403 forbidden` on approvals, mandate edits, simulators, and admin routes (every refusal audited). Valio's account agent flags stock-outs without seeing private kitchen inventory or recipes (`npm run demo:team`).
-2. **Two-phase transaction safety (`Quote → Intent → Revalidated Commit`) + Multi-Item Baskets** — Single-use fixed-price `Quote` (single-SKU and consolidated multi-item baskets, `validUntil` window, `availabilityHeld: false`), `snapshotHash`-bound `OrderIntent`, live Valio `/api/price` + `/api/availability` revalidation at commit, pre-authorized **cold-chain stock-out fallback cascade** (`authorizedFallback`), and synchronous check-and-set + SQLite `idempotency_key` deduplication (`npm run demo:a`, `npm run demo:b`).
+2. **Two-phase transaction safety (`Quote → Intent → Revalidated Commit`) + Multi-Item Baskets** — Single-use fixed-price `Quote` (single-SKU and consolidated multi-item baskets, `validUntil` window, `availabilityHeld: false`), `snapshotHash`-bound `OrderIntent`, live Valio `/api/price` + `/api/availability` revalidation at commit, pre-authorized **cold-chain stock-out fallback cascade** (`authorizedFallback`), and check-and-set + PostgreSQL `idempotency_key` deduplication (`npm run demo:a`, `npm run demo:b`).
 3. **17-rule deterministic policy engine & Mandate Time-Machine** — Per-order and cumulative daily/weekly/monthly spend caps, order velocity & **anti-order-splitting detection** (3+ orders in 24h >80% of cap), dairy-scoped `lactose-free` checks (`"low lactose"` rejected; non-dairy unaffected), `CONTAINS` + `MAY_CONTAIN` allergen exclusions, rule-by-rule `acknowledgedRules` overrides, and counterfactual backtesting via `POST /v1/mandate/simulate`.
-4. **Cryptographic claim envelopes, hardware human signatures & tamper-evident audit chain** — Canonical Ed25519 v2 envelopes verifiable via `/.well-known/jwks.json`, **WebAuthn Passkey & WebCrypto ECDSA P-256** human approval signatures (`auth/humanProof.ts`), SHA-256 hash-chained SQLite audit trails (`POST /v1/audit/:runId/verify`), and interactive **Security Arena + non-mutating Tamper X-Ray** (`POST /v1/arena/run`, `POST /v1/audit/:runId/simulate-tamper`).
+4. **Cryptographic claim envelopes, hardware human signatures & tamper-evident audit chain** — Canonical Ed25519 v2 envelopes verifiable via `/.well-known/jwks.json`, **WebAuthn Passkey & WebCrypto ECDSA P-256** human approval signatures (`auth/humanProof.ts`), SHA-256 hash-chained PostgreSQL audit trails (`POST /v1/audit/:runId/verify`), and interactive **Security Arena + non-mutating Tamper X-Ray** (`POST /v1/arena/run`, `POST /v1/audit/:runId/simulate-tamper`).
 5. **17,546-SKU catalog ranking, SSE live feed & upstream Valio protection** — Pack-size math, bidirectional Valio substitutes, Pareto-optimal scoring across price, delivery cut-off (`closingTime`), reliability (4,429 SKUs), and carbon (11,033 SKUs), real-time `/v1/stream` SSE push to the Desk, `MAX_SHORTLIST_SIZE = 25`, per-key token buckets, and a serialized `<10 req/s` upstream queue.
-6. **Defense-in-depth AI & kitchen operations** — Nonce-fenced prompt-injection sanitization (`<<<UNTRUSTED_TOOL_DATA>>>`), deterministic single/multi-item NL constraint floor, backward lead-time event planning, shelf-life-aware `smart_restock`, and a non-ordering phone proposal flow (Vapi + single-use POST approval links).
+6. **Defense-in-depth AI & kitchen operations** — Nonce-fenced prompt-injection sanitization (`<<<UNTRUSTED_TOOL_DATA>>>`), deterministic single/multi-item NL constraint floor, backward lead-time event planning, shelf-life-aware `smart_restock`, **once-daily restock digest emails** summarizing automated restocks and incoming deliveries, and a non-ordering phone proposal flow (Vapi + single-use POST approval links).
 
 ### Honest current gaps & highest-leverage production steps
 
 | Current prototype boundary | Enterprise Valio Aimo production step |
 |----------------------------|---------------------------------------|
 | **No upstream stock hold during approval** (`availabilityHeld: false`; mitigated via pre-approved `authorizedFallback` SKU cascade) | **Time-boxed ERP soft-holds** — reserve stock during `pending_approval` TTL bounded per customer quota |
-| **Gateway-local signing key & per-run SQLite chains** (`data/gateway.db`) | **Upstream Valio HSM/KMS signing + global WORM Merkle log** — supplier-signed VCs with automated key rotation and SIEM anchoring |
-| **Static API keys, single-node memory locks & `stdio` MCP** | **OAuth 2.1 tiered org approvals, Streamable HTTP MCP & Postgres/Redis HA** — multi-tier sign-off (Kitchen Lead / Director / Finance) and distributed rate/commit locks |
+| **Gateway-local signing key & per-run PostgreSQL audit chains** (`DATABASE_URL`) | **Upstream Valio HSM/KMS signing + global WORM Merkle log** — supplier-signed VCs with automated key rotation and SIEM anchoring |
+| **Static API keys, single-node memory rate buckets & `stdio` MCP** | **OAuth 2.1 tiered org approvals, Streamable HTTP MCP & Redis HA** — multi-tier sign-off (Kitchen Lead / Director / Finance) and distributed rate buckets |
 | **Mock `ORD-*` commit & browser-only SSE** | **ERP/EDI order submission, live ASN webhooks, Slack/Teams cut-off alerts & 3-way e-invoice match** |
 
 ## Important challenge constraints
@@ -279,7 +280,7 @@ Full evaluation, prototype boundaries, and phased architecture roadmap: **[`docs
 
 ## Hotel data sync, recipes & recipe-driven sourcing
 
-The hotel's kitchen data (inventory, recipes, order history) is the **buyer's** data, not Valio's. It is persisted in SQLite (`data/gateway.db`), seeded with demo data on first run, and kept in sync three ways:
+The hotel's kitchen data (inventory, recipes, order history) is the **buyer's** data, not Valio's. It is persisted in PostgreSQL (`DATABASE_URL`, with zero-config local PGlite fallback), seeded with demo data on first run, and kept in sync three ways:
 
 | How | Endpoint |
 |-----|----------|
@@ -336,3 +337,4 @@ API (buyer-only writes; the Planner may read): `GET/POST /v1/events`, `PUT/DELET
 - `GET /v1/kitchen/restock/smart` (MCP/chat tool `smart_restock`) prices the exact shortfall against other pack sizes. Valio prices are flat per pack, so the lever is pack size: it compares cost per unit **actually used** (surplus only counts up to what recipes use within ~60% of shelf life). A modest step up (≤2× the exact cost) is ordered automatically when `smartQuantities` is on; a bulk buy is offered, never assumed.
 - Stock carries `shelfLifeDays`, `expiresOn` and `lastUsedAt`. Deliveries set expiry, recipe usage stamps last use. "Use these first" lists stock that will not be used before it expires, or has not been touched for 14+ days, with the recipes that would use it.
 - `POST /v1/kitchen/restock/run` accepts `choice: "exact" | "smart"`. The mandate still gates every order.
+- **Daily Restock Digest Email (1/day):** `GET/PUT /v1/kitchen/restock/automation` keeps the buyer aware without notification spam by scheduling **one daily email** (`dailyDigestEnabled`, `dailyDigestTime`) summarizing every restock placed or planned that day, recent inventory history, and incoming deliveries on the way to the kitchen or workplace.

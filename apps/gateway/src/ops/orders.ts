@@ -10,6 +10,8 @@ export type Stage = "approval" | "awaiting_delivery" | "delivered" | "closed";
 export type OrderRow = {
   intentId: string;
   orderId: string | null;
+  receiptId: string | null;
+  quoteId: string | null;
   runId: string;
   stage: Stage;
   statusLabel: string;
@@ -46,18 +48,18 @@ function sourceOf(types: Set<string>, idemKey: string | null, hasIngredient: boo
   return "Agent / API request";
 }
 
-export function getOrderHistory(customerId: string): { orders: OrderRow[]; counts: Record<Stage, number>; lastReset: LastReset | null } {
-  const intents = listOrders(customerId);
-  const k = getKitchen(customerId);
+export async function getOrderHistory(customerId: string): Promise<{ orders: OrderRow[]; counts: Record<Stage, number>; lastReset: LastReset | null }> {
+  const intents = await listOrders(customerId);
+  const k = await getKitchen(customerId);
   const delivered = new Map((k?.orderHistory ?? []).map((o) => [o.orderId, o]));
   const runIds = [...new Set(intents.map((i) => i.runId))];
   const typesByRun = new Map<string, Set<string>>();
   if (runIds.length) {
-    const rows = getDb()
-      .prepare(
-        `SELECT run_id, type FROM audit_events WHERE customer_id = ? AND type IN ('standing_order_triggered','menu_plan_started','human_approved') AND run_id IN (${runIds.map(() => "?").join(",")})`,
-      )
-      .all(customerId, ...runIds) as Array<{ run_id: string; type: string }>;
+    const placeholders = runIds.map((_, idx) => `$${idx + 2}`).join(",");
+    const rows = await getDb().query<{ run_id: string; type: string }>(
+      `SELECT run_id, type FROM audit_events WHERE customer_id = $1 AND type IN ('standing_order_triggered','menu_plan_started','human_approved') AND run_id IN (${placeholders})`,
+      [customerId, ...runIds],
+    );
     for (const r of rows) {
       if (!typesByRun.has(r.run_id)) typesByRun.set(r.run_id, new Set());
       typesByRun.get(r.run_id)!.add(r.type);
@@ -117,6 +119,11 @@ export function getOrderHistory(customerId: string): { orders: OrderRow[]; count
       return {
         intentId: i.id,
         orderId: i.committedOrderId,
+        receiptId:
+          i.status === "committed"
+            ? (i.meta?.receiptId ?? (i.committedOrderId ? "VTR-" + i.committedOrderId.replace(/^ORD-/, "") : null))
+            : null,
+        quoteId: i.meta?.quoteId ?? null,
         runId: i.runId,
         stage,
         statusLabel: label,
@@ -168,5 +175,5 @@ export function getOrderHistory(customerId: string): { orders: OrderRow[]; count
 
   const counts: Record<Stage, number> = { approval: 0, awaiting_delivery: 0, delivered: 0, closed: 0 };
   for (const o of orders) counts[o.stage]++;
-  return { orders, counts, lastReset: getLastReset(customerId) };
+  return { orders, counts, lastReset: await getLastReset(customerId) };
 }

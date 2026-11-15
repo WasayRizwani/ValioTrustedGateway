@@ -6,12 +6,24 @@ import {
   MandateSchema,
   SignedClaimSchema,
   PreferencesSchema,
+  DetachedBuyerSignatureInputSchema,
+  DisputePresetSchema,
+  SimulatedInvoiceDocumentSchema,
   type BasketLine,
+  type DisputePreset,
   type Mandate,
   type Need,
   type PolicyVerdict,
+  type SimulatedInvoiceDocument,
+  type TradeReceipt,
 } from "@tta/shared";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import {
+  createPublicKey,
+  generateKeyPairSync,
+  randomUUID,
+  sign,
+  timingSafeEqual,
+} from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
 import {
@@ -33,6 +45,14 @@ import {
   signClaim,
 } from "../claims/sign.js";
 import {
+  arbitrateTradeDispute,
+  buildBuyerReceiptPayload,
+  createDetachedBuyerSignature,
+  getBuyerAgentKeyPair,
+  listTradeReceipts,
+  verifyTradeReceipt,
+} from "../claims/receipt.js";
+import {
   createOrderIntent,
   getIntent,
   listPending,
@@ -40,6 +60,7 @@ import {
   approveOrder,
   rejectOrder,
   commitOrder,
+  ensureReceiptForCommittedOrder,
   resetIntents,
 } from "../orders/store.js";
 import { createMultiItemQuote, createQuote, getQuote } from "../orders/quotes.js";
@@ -47,6 +68,7 @@ import {
   appendAudit,
   auditBus,
   getAuditTrail,
+  getDb,
   simulateAuditTamper,
   verifyAuditChain,
 } from "../audit/chain.js";
@@ -90,6 +112,7 @@ import { agentAllows, AGENTS, CAPABILITY_ROUTES, TOOL_CAPABILITY, mcpToolsFor, t
 import { withAgent } from "../agents/context.js";
 import { getSystemStatus, runSelfTest, getActivity, getOverview, getAuditRuns, getAgentRoster } from "../ops/overview.js";
 import {
+  getDailyRestockDigestStatus,
   getInventorySyncStatus,
   getLastRestockRun,
   getRestockAutomationPolicy,
@@ -101,6 +124,7 @@ import {
 } from "../hotel/restock-automation.js";
 import { smartRestock } from "../hotel/optimizer.js";
 import { explainOrder } from "../ops/explain.js";
+import { seedDemoShowcase } from "../demo/seed.js";
 import { rateLimitMiddleware, shortlistError } from "../middleware/ratelimit.js";
 import {
   allowVoiceAttempt,
@@ -166,17 +190,31 @@ export function createApi() {
 
   app.get("/health", (c) => c.json({ ok: true, service: "valio-aimo-agent-gateway" }));
 
-  app.get("/.well-known/jwks.json", (c) =>
-    c.json({
+  app.get("/.well-known/jwks.json", (c) => {
+    const buyerKey = getBuyerAgentKeyPair();
+    const buyerJwk = createPublicKey(buyerKey.publicKeyPem).export({ format: "jwk" }) as {
+      kty: string;
+      crv: string;
+      x: string;
+    };
+    return c.json({
       keys: [
         {
           ...getPublicJwk(),
           pem: getPublicKeyPem(),
           issuer: "valio-aimo-gateway",
         },
+        {
+          ...buyerJwk,
+          kid: buyerKey.keyId,
+          alg: "EdDSA",
+          use: "sig",
+          pem: buyerKey.publicKeyPem,
+          issuer: "buyer-procurement-agent",
+        },
       ],
-    }),
-  );
+    });
+  });
 
   app.get("/openapi.json", (c) => {
     const host = c.req.header("x-forwarded-host") ?? c.req.header("host");
@@ -201,7 +239,7 @@ export function createApi() {
     const call = message?.call ?? body?.call ?? {};
     const callId = String(call?.id ?? message?.call?.id ?? body?.callId ?? "");
     const phone = String(call?.customer?.number ?? call?.from ?? call?.phoneNumber ?? message?.call?.customer?.number ?? "");
-    if (!allowVoiceAttempt(phone)) return c.json(publicError("caller_rate_limited", 429), 429, { "Retry-After": "300" });
+    if (!(await allowVoiceAttempt(phone))) return c.json(publicError("caller_rate_limited", 429), 429, { "Retry-After": "300" });
     const caller = resolveCaller(phone);
     const calls = message?.toolCallList ?? message?.toolWithToolCallList ?? [];
     if (!Array.isArray(calls) || calls.length === 0) return c.json(publicError("invalid_tool_payload", 400), 400);
@@ -216,14 +254,14 @@ export function createApi() {
         if (!id || !callId || !args || typeof args !== "object") throw Object.assign(new Error("invalid_tool_payload"), { code: "invalid_tool_payload" });
         if (name === "list_saved_recipes") {
           if (!caller) throw Object.assign(new Error("caller_not_allowed"), { code: "caller_not_allowed" });
-          results.push({ toolCallId: id, result: { recipes: getSavedRecipes(caller.customerId) } });
+          results.push({ toolCallId: id, result: { recipes: await getSavedRecipes(caller.customerId) } });
           continue;
         }
         if (name !== "create_event_proposal") throw Object.assign(new Error("unknown_tool"), { code: "unknown_tool" });
         if (!caller) throw Object.assign(new Error("caller_not_allowed"), { code: "caller_not_allowed" });
         if (args.confirmed !== true) throw Object.assign(new Error("spoken_confirmation_required"), { code: "spoken_confirmation_required" });
         const recipeIds: string[] = Array.isArray(args.recipeIds) ? Array.from(new Set<string>(args.recipeIds.map((r: unknown) => String(r)))) : [];
-        const available = new Map(getSavedRecipes(caller.customerId).map((r) => [r.id, r.name]));
+        const available = new Map((await getSavedRecipes(caller.customerId)).map((r) => [r.id, r.name]));
         if (!recipeIds.length || recipeIds.length > 20 || recipeIds.some((id) => !available.has(id))) throw Object.assign(new Error("unknown_or_missing_recipe"), { code: "unknown_or_missing_recipe" });
         const event = {
           name: String(args.name ?? "").trim(), date: String(args.date ?? ""), guests: Number(args.guests), autoOrder: false,
@@ -248,18 +286,18 @@ export function createApi() {
   const voicePageShell = (title: string, body: string) =>
     `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} — Valio Aimo</title><style>:root{color-scheme:light}*{box-sizing:border-box}body{font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#0c1a24;margin:0;background:#e8edf2;padding:1.25rem 1rem}header{max-width:680px;margin:0 auto .85rem;display:flex;align-items:center;gap:.65rem}.logo{width:32px;height:32px;border-radius:4px;background:#0057a8;color:#fff;display:grid;place-items:center;font-weight:700;font-size:.78rem;letter-spacing:.06em}main{max-width:680px;margin:0 auto;padding:1.35rem 1.4rem;background:#fff;border:1px solid #d0d8e0;border-radius:8px;box-shadow:0 1px 2px rgba(12,26,36,.06),0 8px 24px rgba(12,26,36,.04)}h1{font-size:1.3rem;margin:0 0 .35rem;letter-spacing:-.02em}h2{font-size:.82rem;text-transform:uppercase;letter-spacing:.05em;color:#5a6b7a;margin:1.15rem 0 .4rem}.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.55rem;margin:.85rem 0}.card{border:1px solid #d0d8e0;border-radius:6px;padding:.6rem .75rem;background:#f4f6f8}.card b{display:block;font-size:.7rem;text-transform:uppercase;letter-spacing:.04em;color:#5a6b7a;font-weight:600}.card span{font-weight:600;font-size:.98rem}ul{margin:.35rem 0;padding-left:1.2rem}li{margin:.4rem 0}.risks{background:#f9e8e6;border:1px solid #e8b4af;color:#a11c14;border-radius:6px;padding:.75rem .9rem;margin-top:.85rem}.notice{padding:.85rem 1rem;background:#e6f0f8;border:1px solid #b8cce0;color:#003d7a;border-radius:6px;font-size:.88rem;margin:1rem 0}.ok-banner{padding:.85rem 1rem;background:#e4f3ec;border:1px solid #b5d9c6;color:#0d6b45;border-radius:6px}button{padding:.7rem 1.25rem;background:#0057a8;color:#fff;border:1px solid #0057a8;border-radius:6px;font:600 .95rem inherit;cursor:pointer;width:100%}button:hover{background:#00448a}button:focus-visible{outline:3px solid #9ec5e8;outline-offset:2px}</style><header><div class="logo">VA</div><div><strong>Valio Aimo</strong> · <span style="color:#5a6b7a;font-size:.82rem">Approval Desk</span></div></header><main>${body}</main></html>`;
 
-  const canAccessVoiceApproval = (c: any) =>
+  const canAccessVoiceApproval = async (c: any) =>
     !config.voiceMockMode ||
     /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(c.req.header("host") ?? "") ||
-    isSimulatedVoiceToken(c.req.param("token"));
+    (await isSimulatedVoiceToken(c.req.param("token")));
 
-  app.get("/approval/voice/:token", (c) => {
-    if (!canAccessVoiceApproval(c)) return c.html(voicePageShell("Unavailable", "<h1>Local demo only</h1>"), 404);
-    const preview = approvalPreview(c.req.param("token"));
+  app.get("/approval/voice/:token", async (c) => {
+    if (!(await canAccessVoiceApproval(c))) return c.html(voicePageShell("Unavailable", "<h1>Local demo only</h1>"), 404);
+    const preview = await approvalPreview(c.req.param("token"));
     if (!preview) return c.html(voicePageShell("Link unavailable", "<h1>This approval link is no longer available</h1><p>It may have expired, been used, or the event plan changed. Contact your buyer or open the current event in the dashboard.</p>"), 410);
     const ev = preview.event;
     const items = ev.plan?.lines.filter((line) => line.shortfall > 0) ?? [];
-    const dishes = eventDishNames(ev).map((dish) => `<li>${escapeHtml(dish.name)} · ${dish.servings} portion${dish.servings === 1 ? "" : "s"}</li>`).join("");
+    const dishes = (await eventDishNames(ev)).map((dish) => `<li>${escapeHtml(dish.name)} · ${dish.servings} portion${dish.servings === 1 ? "" : "s"}</li>`).join("");
     const unpriced = items.filter((line) => !line.chosen).length;
     const hasPriced = items.some((line) => line.chosen);
     const spend = unpriced ? hasPriced ? `At least €${(ev.plan?.estTotal ?? 0).toFixed(2)} for priced items · ${unpriced} item${unpriced === 1 ? "" : "s"} not priced` : `${unpriced} item${unpriced === 1 ? "" : "s"} not priced · total estimate unavailable` : `€${(ev.plan?.estTotal ?? 0).toFixed(2)}`;
@@ -277,9 +315,9 @@ export function createApi() {
       "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
     });
   });
-  app.post("/approval/voice/:token", (c) => {
-    if (!canAccessVoiceApproval(c)) return c.html(voicePageShell("Unavailable", "<h1>Local demo only</h1>"), 404);
-    return approveVoicePlan(c.req.param("token"))
+  app.post("/approval/voice/:token", async (c) => {
+    if (!(await canAccessVoiceApproval(c))) return c.html(voicePageShell("Unavailable", "<h1>Local demo only</h1>"), 404);
+    return (await approveVoicePlan(c.req.param("token")))
     ? c.html(voicePageShell("Plan approved", `<div class="ok-banner"><h1 style="color:#0d6b45">Plan approved</h1><p style="margin:0">The event is scheduled for a fresh price and availability check. This did not place an order.</p></div>`), 200, { "Cache-Control": "no-store" })
     : c.html(voicePageShell("Link unavailable", "<h1>This approval link is no longer available</h1><p>It may have expired, been used, or the event plan changed. Open the current event in the dashboard.</p>"), 410, { "Cache-Control": "no-store" });
   });
@@ -300,7 +338,7 @@ export function createApi() {
       const verdict = agentAllows(auth.agentId as AgentId, c.req.method, c.req.path);
       if (!verdict.allowed) {
         const def = AGENTS[auth.agentId as AgentId];
-        appendAudit(randomUUID(), auth.customerId, "forbidden_action", {
+        await appendAudit(randomUUID(), auth.customerId, "forbidden_action", {
           action: `${c.req.method} ${c.req.path}`,
           role: def.short + " agent",
           agent: auth.agentId,
@@ -319,7 +357,7 @@ export function createApi() {
     // Authority boundary: agent credentials can never approve, override or change standing authority.
     const rule = BUYER_ONLY.find(([m, re]) => m.includes(c.req.method) && re.test(c.req.path));
     if (rule && auth.role !== "buyer") {
-      appendAudit(randomUUID(), auth.customerId, "forbidden_action", {
+      await appendAudit(randomUUID(), auth.customerId, "forbidden_action", {
         action: rule[2],
         method: c.req.method,
         path: c.req.path,
@@ -393,21 +431,21 @@ export function createApi() {
     });
   });
 
-  app.get("/v1/me", (c) => {
+  app.get("/v1/me", async (c) => {
     const auth = c.get("auth");
     return c.json({
       customerId: auth.customerId,
       role: auth.role,
       agent: auth.agentId ? AGENTS[auth.agentId as AgentId] : null,
       canApprove: auth.role === "buyer",
-      hotelName: getInventory(auth.customerId)?.hotelName ?? null,
-      mandate: getMandate(auth.customerId),
+      hotelName: (await getInventory(auth.customerId))?.hotelName ?? null,
+      mandate: await getMandate(auth.customerId),
     });
   });
 
-  app.get("/v1/mandate", (c) => {
+  app.get("/v1/mandate", async (c) => {
     const auth = c.get("auth");
-    return c.json(getMandate(auth.customerId));
+    return c.json(await getMandate(auth.customerId));
   });
 
   app.put("/v1/mandate", async (c) => {
@@ -416,7 +454,7 @@ export function createApi() {
     if (body.customerId !== auth.customerId) {
       return c.json({ error: "customer_mismatch" }, 403);
     }
-    return c.json(setMandate(body));
+    return c.json(await setMandate(body));
   });
 
   app.post("/v1/mandate/simulate", async (c) => {
@@ -425,8 +463,8 @@ export function createApi() {
     if (draft.customerId !== auth.customerId) {
       return c.json({ error: "customer_mismatch" }, 403);
     }
-    const baseline = getMandate(auth.customerId);
-    return c.json(simulateMandateBaskets(auth.customerId, baseline, draft));
+    const baseline = await getMandate(auth.customerId);
+    return c.json(await simulateMandateBaskets(auth.customerId, baseline, draft));
   });
 
   app.post("/v1/need/parse", async (c) => {
@@ -443,7 +481,7 @@ export function createApi() {
             needs: complex.needs,
             isMultiItem: complex.isMultiItem,
           };
-    appendAudit(randomUUID(), auth.customerId, "need_parsed", { text, parsed });
+    await appendAudit(randomUUID(), auth.customerId, "need_parsed", { text, parsed });
     return c.json(parsed);
   });
 
@@ -505,7 +543,7 @@ export function createApi() {
   app.post("/v1/offers/rank", async (c) => {
     const auth = c.get("auth");
     const body = await c.req.json();
-    const mandate = getMandate(auth.customerId);
+    const mandate = await getMandate(auth.customerId);
     const preferences = body.preferences ? PreferencesSchema.parse(body.preferences) : undefined;
 
     if (Array.isArray(body.needs) && body.needs.length > 0) {
@@ -555,7 +593,7 @@ export function createApi() {
   app.post("/v1/orders/intent", async (c) => {
     const auth = c.get("auth");
     const body = await c.req.json();
-    const mandate = getMandate(auth.customerId);
+    const mandate = await getMandate(auth.customerId);
     if (!mandate) return c.json({ error: "no_mandate" }, 400);
     // With a quoteId the need comes from the quote; with items[] a consolidated multi-item basket is built.
     try {
@@ -579,7 +617,7 @@ export function createApi() {
 
       let rawNeed = body.need;
       if (body.quoteId && !body.need) {
-        const q = getQuote(String(body.quoteId), auth.customerId);
+        const q = await getQuote(String(body.quoteId), auth.customerId);
         if (!q) return c.json({ error: "quote_not_found: Quote does not exist" }, 400);
         rawNeed = q.need;
       }
@@ -641,40 +679,40 @@ export function createApi() {
     }
   });
 
-  app.get("/v1/quotes/:id", (c) => {
+  app.get("/v1/quotes/:id", async (c) => {
     const auth = c.get("auth");
-    const quote = getQuote(c.req.param("id"), auth.customerId);
+    const quote = await getQuote(c.req.param("id"), auth.customerId);
     if (!quote) return c.json({ error: "not_found" }, 404);
     return c.json(quote);
   });
 
-  app.get("/v1/orders/pending", (c) => {
+  app.get("/v1/orders/pending", async (c) => {
     const auth = c.get("auth");
-    return c.json({ intents: listPending(auth.customerId) });
+    return c.json({ intents: await listPending(auth.customerId) });
   });
 
-  app.get("/v1/orders", (c) => {
+  app.get("/v1/orders", async (c) => {
     const auth = c.get("auth");
-    return c.json({ orders: listOrders(auth.customerId) });
+    return c.json({ orders: await listOrders(auth.customerId) });
   });
 
-  app.get("/v1/orders/:id/explain", (c) => {
+  app.get("/v1/orders/:id/explain", async (c) => {
     const auth = c.get("auth");
-    const explanation = explainOrder(c.req.param("id"), auth.customerId);
+    const explanation = await explainOrder(c.req.param("id"), auth.customerId);
     if (!explanation) return c.json({ error: "not_found" }, 404);
     return c.json(explanation);
   });
 
-  app.get("/v1/orders/:id", (c) => {
+  app.get("/v1/orders/:id", async (c) => {
     const auth = c.get("auth");
-    const intent = getIntent(c.req.param("id"), auth.customerId);
+    const intent = await getIntent(c.req.param("id"), auth.customerId);
     if (!intent) return c.json({ error: "not_found" }, 404);
     return c.json(intent);
   });
 
-  app.post("/v1/orders/:id/approve-challenge", (c) => {
+  app.post("/v1/orders/:id/approve-challenge", async (c) => {
     const auth = c.get("auth");
-    const intent = getIntent(c.req.param("id"), auth.customerId);
+    const intent = await getIntent(c.req.param("id"), auth.customerId);
     if (!intent) return c.json({ error: "not_found" }, 404);
     const challenge = computeApprovalChallenge(intent);
     return c.json({
@@ -689,7 +727,7 @@ export function createApi() {
     const auth = c.get("auth");
     const body = await c.req.json();
     try {
-      const intent = approveOrder(
+      const intent = await approveOrder(
         c.req.param("id"),
         auth.customerId,
         String(body.snapshotHash),
@@ -715,7 +753,7 @@ export function createApi() {
     const auth = c.get("auth");
     const body = await c.req.json();
     try {
-      const intent = rejectOrder(
+      const intent = await rejectOrder(
         c.req.param("id"),
         auth.customerId,
         String(body.snapshotHash),
@@ -734,11 +772,18 @@ export function createApi() {
     const auth = c.get("auth");
     const body = await c.req.json();
     try {
+      const rawBuyerSig = body.buyerSignature ?? body.detachedBuyerSignature;
+      const buyerSignature =
+        rawBuyerSig !== undefined
+          ? DetachedBuyerSignatureInputSchema.parse(rawBuyerSig)
+          : undefined;
       const intent = await commitOrder({
         intentId: c.req.param("id"),
         customerId: auth.customerId,
         idempotencyKey: String(body.idempotencyKey ?? randomUUID()),
+        buyerSignature,
       });
+      const receipt = await ensureReceiptForCommittedOrder(intent.id, auth.customerId);
       return c.json({
         confirmation: {
           orderId: intent.committedOrderId,
@@ -747,8 +792,10 @@ export function createApi() {
           totalPrice: intent.totalPrice,
           confirmedAt: intent.updatedAt,
           runId: intent.runId,
+          receiptId: receipt?.receiptId ?? null,
         },
         intent,
+        receipt,
       });
     } catch (e) {
       return c.json(
@@ -758,36 +805,142 @@ export function createApi() {
     }
   });
 
-  app.get("/v1/audit/:runId", (c) => {
+  const getReceiptHandler = async (c: any) => {
+    const auth = c.get("auth") as AuthContext;
+    const receipt = await ensureReceiptForCommittedOrder(c.req.param("id"), auth.customerId);
+    if (!receipt) {
+      return c.json(
+        { error: "receipt_not_found", message: "No committed order receipt found for this ID." },
+        404,
+      );
+    }
+    if (c.req.query("download") === "1" || c.req.query("download") === "true") {
+      c.header("content-disposition", `attachment; filename="${receipt.fileName}"`);
+      c.header("content-type", "application/vnd.valio.trade-receipt+json; charset=utf-8");
+      return c.body(JSON.stringify(receipt, null, 2));
+    }
+    return c.json(receipt);
+  };
+
+  const arbitrateHandler = async (c: any) => {
+    const auth = c.get("auth") as AuthContext;
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    try {
+      let receipt: TradeReceipt | null = null;
+      if (body.receipt && typeof body.receipt === "object") {
+        // Do NOT TradeReceiptSchema.parse before arbitrateTradeDispute so tampered receipts return 200 TAMPER_REJECTED
+        receipt = body.receipt as TradeReceipt;
+      } else {
+        const paramId = c.req.param("id");
+        const targetId =
+          paramId ?? body.orderId ?? body.intentId ?? body.receiptId;
+        if (!targetId || typeof targetId !== "string" || !targetId.trim()) {
+          return c.json(
+            {
+              error: "receipt_required",
+              message: "Provide receipt, orderId, intentId, or receiptId.",
+            },
+            400,
+          );
+        }
+        receipt = await ensureReceiptForCommittedOrder(targetId.trim(), auth.customerId);
+        if (!receipt) {
+          return c.json(
+            { error: "receipt_not_found", message: "No committed order receipt found for this ID." },
+            404,
+          );
+        }
+      }
+
+      const preset: DisputePreset | undefined =
+        body.preset !== undefined && body.preset !== null && body.preset !== ""
+          ? DisputePresetSchema.parse(body.preset)
+          : undefined;
+
+      const document: SimulatedInvoiceDocument | undefined =
+        body.document && typeof body.document === "object"
+          ? (body.document as SimulatedInvoiceDocument)
+          : !preset
+            ? buildCustomDisputeDocument(receipt, body)
+            : undefined;
+
+      const ruling = arbitrateTradeDispute({
+        receipt,
+        preset,
+        document,
+      });
+
+      if (
+        receipt.customerId === auth.customerId &&
+        preset !== "tampered_receipt" &&
+        ruling.ruling !== "TAMPER_REJECTED"
+      ) {
+        await appendAudit(receipt.runId || randomUUID(), auth.customerId, "dispute_arbitrated", {
+          rulingId: ruling.rulingId,
+          orderId: ruling.cryptographicProof.orderId,
+          receiptId: receipt.receiptId,
+          preset: preset ?? "custom",
+          ruling: ruling.ruling,
+          subVerdict: ruling.subVerdict,
+          autoCreditEur: ruling.reconciliation.autoCreditEur,
+          netPayableEur: ruling.reconciliation.netPayableEur,
+          latencyMs: ruling.latencyMs,
+        });
+      }
+
+      return c.json(ruling);
+    } catch (e) {
+      return c.json(
+        { error: e instanceof Error ? e.message : "arbitrate_failed" },
+        400,
+      );
+    }
+  };
+
+  app.get("/v1/orders/:id/receipt", getReceiptHandler);
+  app.post("/v1/orders/:id/arbitrate", arbitrateHandler);
+  app.get("/v1/receipts", async (c) => {
+    const auth = c.get("auth");
+    const receipts = await listTradeReceipts(auth.customerId);
+    return c.json({ receipts });
+  });
+  app.post("/v1/receipts/verify", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    return c.json(verifyTradeReceipt((body.receipt ?? body) as TradeReceipt));
+  });
+  app.post("/v1/receipts/arbitrate", arbitrateHandler);
+  app.get("/v1/receipts/:id", getReceiptHandler);
+
+  app.get("/v1/audit/:runId", async (c) => {
     const auth = c.get("auth");
     const runId = c.req.param("runId");
     return c.json({
-      events: getAuditTrail(runId, auth.customerId),
-      verification: verifyAuditChain(runId, auth.customerId),
+      events: await getAuditTrail(runId, auth.customerId),
+      verification: await verifyAuditChain(runId, auth.customerId),
     });
   });
 
-  app.post("/v1/audit/:runId/verify", (c) => {
+  app.post("/v1/audit/:runId/verify", async (c) => {
     const auth = c.get("auth");
-    return c.json(verifyAuditChain(c.req.param("runId"), auth.customerId));
+    return c.json(await verifyAuditChain(c.req.param("runId"), auth.customerId));
   });
 
-  app.post("/v1/audit/:runId/simulate-tamper", (c) => {
+  app.post("/v1/audit/:runId/simulate-tamper", async (c) => {
     const auth = c.get("auth");
     let targetRunId = c.req.param("runId");
     if (
       targetRunId === "latest" ||
-      getAuditTrail(targetRunId, auth.customerId).length === 0
+      (await getAuditTrail(targetRunId, auth.customerId)).length === 0
     ) {
-      const latestRun = getAuditRuns(auth.customerId).find((r) => r.events > 0);
+      const latestRun = (await getAuditRuns(auth.customerId)).find((r) => r.events > 0);
       if (latestRun) {
         targetRunId = latestRun.runId;
       }
     }
-    if (getAuditTrail(targetRunId, auth.customerId).length === 0) {
+    if ((await getAuditTrail(targetRunId, auth.customerId)).length === 0) {
       return c.json({ error: "audit_run_not_found" }, 404);
     }
-    return c.json(simulateAuditTamper(targetRunId, auth.customerId));
+    return c.json(await simulateAuditTamper(targetRunId, auth.customerId));
   });
 
   app.post("/v1/exceptions/followup", async (c) => {
@@ -799,37 +952,37 @@ export function createApi() {
       problem: body.problem,
       details: body.details,
     });
-    appendAudit(body.runId ?? randomUUID(), auth.customerId, "exception_followup_drafted", draft);
+    await appendAudit(body.runId ?? randomUUID(), auth.customerId, "exception_followup_drafted", draft);
     return c.json(draft);
   });
 
   app.get("/v1/valio/ping", async (c) => c.json(await pingValio()));
 
-  app.get("/v1/kitchen/inventory", (c) => {
+  app.get("/v1/kitchen/inventory", async (c) => {
     const auth = c.get("auth");
-    const data = getInventory(auth.customerId);
+    const data = await getInventory(auth.customerId);
     if (!data) return c.json({ error: "no_kitchen_profile" }, 404);
     return c.json(data);
   });
 
-  app.get("/v1/kitchen/recipes", (c) => {
+  app.get("/v1/kitchen/recipes", async (c) => {
     const auth = c.get("auth");
-    const data = getRecipes(auth.customerId);
+    const data = await getRecipes(auth.customerId);
     if (!data) return c.json({ error: "no_kitchen_profile" }, 404);
     return c.json(data);
   });
 
-  app.get("/v1/kitchen/order-history", (c) => {
+  app.get("/v1/kitchen/order-history", async (c) => {
     const auth = c.get("auth");
-    const data = getOrderHistory(auth.customerId);
+    const data = await getOrderHistory(auth.customerId);
     if (!data) return c.json({ error: "no_kitchen_profile" }, 404);
     return c.json(data);
   });
 
-  app.get("/v1/kitchen/restock", (c) => {
+  app.get("/v1/kitchen/restock", async (c) => {
     const auth = c.get("auth");
     const days = Number(c.req.query("daysCover") ?? 7);
-    const data = recommendRestock(auth.customerId, { daysCover: days });
+    const data = await recommendRestock(auth.customerId, { daysCover: days });
     if (!data) return c.json({ error: "no_kitchen_profile" }, 404);
     return c.json(data);
   });
@@ -842,20 +995,21 @@ export function createApi() {
     return c.json(r);
   });
 
-  app.get("/v1/kitchen/restock/automation", (c) => {
+  app.get("/v1/kitchen/restock/automation", async (c) => {
     const auth = c.get("auth");
     return c.json({
-      policy: getRestockAutomationPolicy(auth.customerId),
-      lastRun: getLastRestockRun(auth.customerId),
-      syncStatus: getInventorySyncStatus(auth.customerId),
-      stockHealth: getStockHealthSnapshot(auth.customerId),
+      policy: await getRestockAutomationPolicy(auth.customerId),
+      lastRun: await getLastRestockRun(auth.customerId),
+      syncStatus: await getInventorySyncStatus(auth.customerId),
+      stockHealth: await getStockHealthSnapshot(auth.customerId),
+      dailyDigest: await getDailyRestockDigestStatus(auth.customerId),
     });
   });
 
   app.put("/v1/kitchen/restock/automation", async (c) => {
     const auth = c.get("auth");
     const body = (await c.req.json()) as Record<string, unknown>;
-    const policy = setRestockAutomationPolicy(auth.customerId, {
+    const policy = await setRestockAutomationPolicy(auth.customerId, {
       enabled: body.enabled as boolean | undefined,
       autoSyncInventory: body.autoSyncInventory as boolean | undefined,
       syncIntervalMinutes: body.syncIntervalMinutes as number | undefined,
@@ -867,12 +1021,15 @@ export function createApi() {
         | undefined,
       smartQuantities: body.smartQuantities as boolean | undefined,
       intervalMinutes: body.intervalMinutes as number | undefined,
+      dailyDigestEnabled: body.dailyDigestEnabled as boolean | undefined,
+      dailyDigestTime: body.dailyDigestTime as string | undefined,
     });
     return c.json({
       policy,
-      lastRun: getLastRestockRun(auth.customerId),
-      syncStatus: getInventorySyncStatus(auth.customerId),
-      stockHealth: getStockHealthSnapshot(auth.customerId),
+      lastRun: await getLastRestockRun(auth.customerId),
+      syncStatus: await getInventorySyncStatus(auth.customerId),
+      stockHealth: await getStockHealthSnapshot(auth.customerId),
+      dailyDigest: await getDailyRestockDigestStatus(auth.customerId),
     });
   });
 
@@ -899,9 +1056,10 @@ export function createApi() {
       });
       return c.json({
         result,
-        policy: getRestockAutomationPolicy(auth.customerId),
-        syncStatus: getInventorySyncStatus(auth.customerId),
-        stockHealth: getStockHealthSnapshot(auth.customerId),
+        policy: await getRestockAutomationPolicy(auth.customerId),
+        syncStatus: await getInventorySyncStatus(auth.customerId),
+        stockHealth: await getStockHealthSnapshot(auth.customerId),
+        dailyDigest: await getDailyRestockDigestStatus(auth.customerId),
       });
     } catch (e) {
       return c.json(
@@ -944,8 +1102,8 @@ export function createApi() {
     const body = await c.req.json();
     try {
       const items = Array.isArray(body) ? body : (body.items ?? [body]);
-      const saved = upsertInventory(auth.customerId, items);
-      appendAudit(randomUUID(), auth.customerId, "kitchen_inventory_updated", {
+      const saved = await upsertInventory(auth.customerId, items);
+      await appendAudit(randomUUID(), auth.customerId, "kitchen_inventory_updated", {
         ingredients: saved.map((i) => i.ingredientId),
       });
       return c.json({ saved });
@@ -954,10 +1112,10 @@ export function createApi() {
     }
   });
 
-  app.delete("/v1/kitchen/inventory/:id", (c) => {
+  app.delete("/v1/kitchen/inventory/:id", async (c) => {
     const auth = c.get("auth");
     try {
-      return c.json({ deleted: deleteIngredient(auth.customerId, c.req.param("id")) });
+      return c.json({ deleted: await deleteIngredient(auth.customerId, c.req.param("id")) });
     } catch (e) {
       return kitchenErr(c, e);
     }
@@ -966,7 +1124,7 @@ export function createApi() {
   app.post("/v1/kitchen/inventory/adjust", async (c) => {
     const auth = c.get("auth");
     try {
-      return c.json({ item: adjustStock(auth.customerId, await c.req.json()) });
+      return c.json({ item: await adjustStock(auth.customerId, await c.req.json()) });
     } catch (e) {
       return kitchenErr(c, e);
     }
@@ -975,8 +1133,8 @@ export function createApi() {
   app.post("/v1/kitchen/recipes", async (c) => {
     const auth = c.get("auth");
     try {
-      const recipe = upsertRecipe(auth.customerId, await c.req.json());
-      appendAudit(randomUUID(), auth.customerId, "kitchen_recipe_saved", {
+      const recipe = await upsertRecipe(auth.customerId, await c.req.json());
+      await appendAudit(randomUUID(), auth.customerId, "kitchen_recipe_saved", {
         recipeId: recipe.recipeId,
       });
       return c.json({ recipe });
@@ -985,16 +1143,16 @@ export function createApi() {
     }
   });
 
-  app.delete("/v1/kitchen/recipes/:id", (c) => {
+  app.delete("/v1/kitchen/recipes/:id", async (c) => {
     const auth = c.get("auth");
-    return c.json({ deleted: deleteRecipe(auth.customerId, c.req.param("id")) });
+    return c.json({ deleted: await deleteRecipe(auth.customerId, c.req.param("id")) });
   });
 
   app.post("/v1/kitchen/recipes/:id/cook", async (c) => {
     const auth = c.get("auth");
     const body = (await c.req.json().catch(() => ({}))) as { batches?: number };
     try {
-      return c.json(recordUsage(auth.customerId, c.req.param("id"), Number(body.batches ?? 1)));
+      return c.json(await recordUsage(auth.customerId, c.req.param("id"), Number(body.batches ?? 1)));
     } catch (e) {
       return kitchenErr(c, e);
     }
@@ -1003,8 +1161,8 @@ export function createApi() {
   app.post("/v1/kitchen/import", async (c) => {
     const auth = c.get("auth");
     try {
-      const result = importKitchen(auth.customerId, await c.req.json());
-      appendAudit(randomUUID(), auth.customerId, "kitchen_imported", result);
+      const result = await importKitchen(auth.customerId, await c.req.json());
+      await appendAudit(randomUUID(), auth.customerId, "kitchen_imported", result);
       return c.json(result);
     } catch (e) {
       return kitchenErr(c, e);
@@ -1018,11 +1176,11 @@ export function createApi() {
       received?: Record<string, number>;
     };
     try {
-      const res = receiveDelivery(auth.customerId, body.orderId, body.received);
+      const res = await receiveDelivery(auth.customerId, body.orderId, body.received);
       const matchedRunId =
-        listOrders(auth.customerId).find((o) => o.committedOrderId === body.orderId)?.runId ??
+        (await listOrders(auth.customerId)).find((o) => o.committedOrderId === body.orderId)?.runId ??
         randomUUID();
-      appendAudit(matchedRunId, auth.customerId, "delivery_received", res);
+      await appendAudit(matchedRunId, auth.customerId, "delivery_received", res);
       return c.json(res);
     } catch (e) {
       return kitchenErr(c, e);
@@ -1032,12 +1190,12 @@ export function createApi() {
   // ── Recipe-driven sourcing (menu plan, last-minute event, supplier stock-out) ──
   app.post("/v1/kitchen/plan", async (c) => {
     const auth = c.get("auth");
-    const mandate = getMandate(auth.customerId);
+    const mandate = await getMandate(auth.customerId);
     if (!mandate) return c.json({ error: "no_mandate" }, 400);
     const body = await c.req.json();
     if (body.createIntents && auth.agentId && !AGENTS[auth.agentId as AgentId].capabilities.includes("orders:propose")) {
       const def = AGENTS[auth.agentId as AgentId];
-      appendAudit(randomUUID(), auth.customerId, "forbidden_action", {
+      await appendAudit(randomUUID(), auth.customerId, "forbidden_action", {
         action: `POST ${c.req.path} (createIntents)`,
         role: def.short + " agent",
         agent: auth.agentId,
@@ -1063,12 +1221,12 @@ export function createApi() {
 
   app.post("/v1/kitchen/stockout", async (c) => {
     const auth = c.get("auth");
-    const mandate = getMandate(auth.customerId);
+    const mandate = await getMandate(auth.customerId);
     if (!mandate) return c.json({ error: "no_mandate" }, 400);
     const body = await c.req.json();
     if (body.createIntents && auth.agentId && !AGENTS[auth.agentId as AgentId].capabilities.includes("orders:propose")) {
       const def = AGENTS[auth.agentId as AgentId];
-      appendAudit(randomUUID(), auth.customerId, "forbidden_action", {
+      await appendAudit(randomUUID(), auth.customerId, "forbidden_action", {
         action: `POST ${c.req.path} (createIntents)`,
         role: def.short + " agent",
         agent: auth.agentId,
@@ -1094,26 +1252,26 @@ export function createApi() {
   });
 
   // ── Recurring (standing) orders ──
-  app.get("/v1/standing-orders", (c) => {
+  app.get("/v1/standing-orders", async (c) => {
     const id = c.get("auth").customerId;
-    return c.json({ standingOrders: listStanding(id), suggestions: suggestFromHistory(id) });
+    return c.json({ standingOrders: await listStanding(id), suggestions: await suggestFromHistory(id) });
   });
   app.post("/v1/standing-orders", async (c) => {
     try {
-      return c.json({ standingOrder: createStanding(c.get("auth").customerId, await c.req.json()) });
+      return c.json({ standingOrder: await createStanding(c.get("auth").customerId, await c.req.json()) });
     } catch (e) {
       return kitchenErr(c, e);
     }
   });
   app.put("/v1/standing-orders/:id", async (c) => {
     try {
-      return c.json({ standingOrder: updateStanding(c.get("auth").customerId, c.req.param("id"), await c.req.json()) });
+      return c.json({ standingOrder: await updateStanding(c.get("auth").customerId, c.req.param("id"), await c.req.json()) });
     } catch (e) {
       return kitchenErr(c, e);
     }
   });
-  app.delete("/v1/standing-orders/:id", (c) =>
-    c.json({ deleted: deleteStanding(c.get("auth").customerId, c.req.param("id")) }),
+  app.delete("/v1/standing-orders/:id", async (c) =>
+    c.json({ deleted: await deleteStanding(c.get("auth").customerId, c.req.param("id")) }),
   );
   app.post("/v1/standing-orders/run", async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as { standingId?: string; force?: boolean };
@@ -1123,9 +1281,9 @@ export function createApi() {
   // ── Operator views: health, self-test, activity, overview ──
   app.get("/v1/system/status", async (c) => c.json(await getSystemStatus()));
   app.post("/v1/system/selftest", async (c) => c.json(await runSelfTest(c.get("auth").customerId)));
-  app.get("/v1/activity", (c) =>
+  app.get("/v1/activity", async (c) =>
     c.json({
-      events: getActivity(c.get("auth").customerId, Number(c.req.query("limit") ?? 30), c.req.query("runId") || undefined),
+      events: await getActivity(c.get("auth").customerId, Number(c.req.query("limit") ?? 30), c.req.query("runId") || undefined),
     }),
   );
   // "Connect an agent": everything an external developer needs — endpoints, identities, scopes, how to verify.
@@ -1171,10 +1329,10 @@ export function createApi() {
       ],
     });
   });
-  app.get("/v1/agents", (c) => c.json({ agents: getAgentRoster(c.get("auth").customerId) }));
-  app.get("/v1/audit-runs", (c) => c.json({ runs: getAuditRuns(c.get("auth").customerId) }));
-  app.get("/v1/orders-overview", (c) => c.json(getOrdersOverview(c.get("auth").customerId)));
-  app.get("/v1/overview", (c) => c.json(getOverview(c.get("auth").customerId)));
+  app.get("/v1/agents", async (c) => c.json({ agents: await getAgentRoster(c.get("auth").customerId) }));
+  app.get("/v1/audit-runs", async (c) => c.json({ runs: await getAuditRuns(c.get("auth").customerId) }));
+  app.get("/v1/orders-overview", async (c) => c.json(await getOrdersOverview(c.get("auth").customerId)));
+  app.get("/v1/overview", async (c) => c.json(await getOverview(c.get("auth").customerId)));
 
   // ── Events & peak demand ──
   app.get("/v1/voice/readiness", (c) => c.json(voiceReadiness()));
@@ -1200,9 +1358,9 @@ export function createApi() {
       return kitchenErr(c, e);
     }
   });
-  app.post("/v1/events/:id/voice-approve", (c) => {
+  app.post("/v1/events/:id/voice-approve", async (c) => {
     try {
-      return c.json(approveVoiceEventByBuyer(c.get("auth").customerId, c.req.param("id")));
+      return c.json(await approveVoiceEventByBuyer(c.get("auth").customerId, c.req.param("id")));
     } catch (e) {
       return kitchenErr(c, e);
     }
@@ -1216,10 +1374,17 @@ export function createApi() {
       return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
     }
   });
-  app.get("/v1/events", (c) => {
+  app.get("/v1/events", async (c) => {
     const customerId = c.get("auth").customerId;
     const includeVoiceState = c.get("auth").role === "buyer";
-    return c.json({ events: listEvents(customerId, c.req.query("all") === "1").map((event) => ({ ...event, voice: includeVoiceState ? getVoiceState(customerId, event.id) : null })) });
+    const evs = await listEvents(customerId, c.req.query("all") === "1");
+    const withVoice = await Promise.all(
+      evs.map(async (event) => ({
+        ...event,
+        voice: includeVoiceState ? await getVoiceState(customerId, event.id) : null,
+      })),
+    );
+    return c.json({ events: withVoice });
   });
   app.post("/v1/events/:id/voice-email/retry", async (c) => {
     try { return c.json({ voice: await retryVoiceEmail(c.get("auth").customerId, c.req.param("id")) }); }
@@ -1258,20 +1423,20 @@ export function createApi() {
       return kitchenErr(c, e);
     }
   });
-  app.delete("/v1/events/:id", (c) => {
+  app.delete("/v1/events/:id", async (c) => {
     try {
-      return c.json(cancelEvent(c.get("auth").customerId, c.req.param("id")));
+      return c.json(await cancelEvent(c.get("auth").customerId, c.req.param("id")));
     } catch (e) {
       return kitchenErr(c, e);
     }
   });
 
   // ── Valio's account agent + suggestions ──
-  app.get("/v1/suggestions", (c) => c.json({ suggestions: listSuggestions(c.get("auth").customerId) }));
+  app.get("/v1/suggestions", async (c) => c.json({ suggestions: await listSuggestions(c.get("auth").customerId) }));
   app.post("/v1/valio-agent/run", async (c) => c.json(await runValioAgent(c.get("auth").customerId)));
   app.post("/v1/suggestions/:id/accept", async (c) => {
     const auth = c.get("auth");
-    const mandate = getMandate(auth.customerId);
+    const mandate = await getMandate(auth.customerId);
     if (!mandate) return c.json({ error: "no_mandate" }, 400);
     try {
       return c.json({ intent: await acceptSuggestion(auth.customerId, c.req.param("id"), mandate) });
@@ -1279,9 +1444,9 @@ export function createApi() {
       return kitchenErr(c, e);
     }
   });
-  app.post("/v1/suggestions/:id/dismiss", (c) => {
+  app.post("/v1/suggestions/:id/dismiss", async (c) => {
     try {
-      return c.json({ suggestion: dismissSuggestion(c.get("auth").customerId, c.req.param("id")) });
+      return c.json({ suggestion: await dismissSuggestion(c.get("auth").customerId, c.req.param("id")) });
     } catch (e) {
       return kitchenErr(c, e);
     }
@@ -1297,49 +1462,69 @@ export function createApi() {
   // ── Demo hygiene ──
   // Destructive, so it must be explicit: callers have to send `X-Demo-Reset: confirm`. A bare POST is refused,
   // which stops scripts/tests/other clients from silently wiping a running demo. The caller is recorded in the audit.
-  app.post("/v1/admin/demo-reset", (c) => {
+  app.post("/v1/admin/demo-reset", async (c) => {
     const auth = c.get("auth");
     if (c.req.header("x-demo-reset") !== "confirm")
       return c.json({ error: "confirmation_required", hint: "Send header X-Demo-Reset: confirm (the Desk's 'Reset demo data' button does)." }, 400);
     const source = c.req.header("x-reset-source") ?? c.req.header("user-agent")?.slice(0, 80) ?? "unknown";
-    const removedIntents = resetIntents(auth.customerId, source);
-    resetKitchen(auth.customerId);
-    resetRestockAutomation(auth.customerId);
-    resetStanding(auth.customerId);
-    resetSuggestions(auth.customerId);
-    resetEvents(auth.customerId);
+    const removedIntents = await resetIntents(auth.customerId, source);
+    await resetKitchen(auth.customerId);
+    await resetRestockAutomation(auth.customerId);
+    await resetStanding(auth.customerId);
+    await resetSuggestions(auth.customerId);
+    await resetEvents(auth.customerId);
     simulatedStockouts.clear();
-    resetMandate(auth.customerId);
+    await resetMandate(auth.customerId);
     return c.json({ ok: true, removedIntents });
+  });
+
+  // Seeds rich showcase data in the database for live demo visitors.
+  app.post("/v1/demo/seed", async (c) => {
+    const auth = c.get("auth");
+    if (auth.role !== "buyer") {
+      return c.json({ error: "buyer_role_required" }, 403);
+    }
+    const source = c.req.header("x-reset-source") ?? "home-test-app";
+    const summary = await seedDemoShowcase(auth.customerId, source, () => simulatedStockouts.clear());
+    return c.json({ ok: true, seeded: summary });
   });
 
   app.get("/v1/agent/status", (c) => c.json(getLlmStatus()));
 
-  // ── LLM Prompt Evaluation Bench persistence (buyer-only, saves to data/llm-eval-results.json) ──
-  const evalResultsPath = resolve(config.dataDir, "llm-eval-results.json");
-  app.get("/v1/eval/results", (c) => {
-    if (!existsSync(evalResultsPath)) {
+  // ── LLM Prompt Evaluation Bench persistence (buyer-only, stored in PostgreSQL so tsx watch never restarts) ──
+  app.get("/v1/eval/results", async (c) => {
+    const cid = c.get("auth").customerId;
+    const row = await getDb().queryOne<{ payload_json: string }>(
+      "SELECT payload_json FROM eval_bench_state WHERE customer_id = $1",
+      [cid],
+    );
+    if (!row) {
       return c.json({ updatedAt: null, records: {}, customCases: [] });
     }
     try {
-      const parsed = JSON.parse(readFileSync(evalResultsPath, "utf8"));
-      return c.json(parsed);
+      return c.json(JSON.parse(row.payload_json));
     } catch {
       return c.json({ updatedAt: null, records: {}, customCases: [] });
     }
   });
   app.post("/v1/eval/results", async (c) => {
+    const cid = c.get("auth").customerId;
     const body = await c.req.json();
+    const updatedAt = new Date().toISOString();
     const payload = {
-      updatedAt: new Date().toISOString(),
-      customerId: c.get("auth").customerId,
+      updatedAt,
+      customerId: cid,
       llm: getLlmStatus(),
       records: body?.records && typeof body.records === "object" ? body.records : {},
       customCases: Array.isArray(body?.customCases) ? body.customCases : [],
     };
-    mkdirSync(config.dataDir, { recursive: true });
-    writeFileSync(evalResultsPath, JSON.stringify(payload, null, 2) + "\n", "utf8");
-    return c.json({ ok: true, updatedAt: payload.updatedAt, path: "data/llm-eval-results.json" });
+    await getDb().execute(
+      `INSERT INTO eval_bench_state (customer_id, payload_json, updated_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (customer_id) DO UPDATE SET payload_json = EXCLUDED.payload_json, updated_at = EXCLUDED.updated_at`,
+      [cid, JSON.stringify(payload), updatedAt],
+    );
+    return c.json({ ok: true, updatedAt });
   });
 
   app.post("/v1/agent/chat", async (c) => {
@@ -1362,7 +1547,7 @@ export function createApi() {
         history,
         callerRole: auth.role,
       });
-      appendAudit(randomUUID(), auth.customerId, "agent_chat_turn", {
+      await appendAudit(randomUUID(), auth.customerId, "agent_chat_turn", {
         provider: result.provider,
         model: result.model,
         tools: result.toolTrace.map((t) => ({
@@ -1401,7 +1586,7 @@ export function createApi() {
         history,
         callerRole: auth.role,
       });
-      appendAudit(randomUUID(), auth.customerId, "assistant_query", {
+      await appendAudit(randomUUID(), auth.customerId, "assistant_query", {
         mode: result.mode,
         sourceKind: result.sourceKind ?? null,
         itemCount: result.bundleItems?.length ?? 0,
@@ -1538,7 +1723,7 @@ function classifySimOutcome(verdict: PolicyVerdict): "auto_commit" | "pending_ap
   return "pending_approval";
 }
 
-function simulateMandateBaskets(
+async function simulateMandateBaskets(
   customerId: string,
   baseline: Mandate | null | undefined,
   draft: Mandate,
@@ -1641,7 +1826,7 @@ function simulateMandateBaskets(
   ];
 
   // Include recent real customer intents as well
-  const recentIntents = listOrders(customerId).slice(0, 10);
+  const recentIntents = (await listOrders(customerId)).slice(0, 10);
   recentIntents.forEach((intent, idx) => {
     if (intent.basket.length > 0) {
       fixtures.push({
@@ -1735,7 +1920,7 @@ async function runArenaScenario(
   customerId: string,
   scenario: string,
 ): Promise<Record<string, unknown>> {
-  const mandate = getMandate(customerId);
+  const mandate = await getMandate(customerId);
   if (!mandate) throw new Error("no_mandate");
 
   const validScenarios = [
@@ -1774,7 +1959,7 @@ async function runArenaScenario(
   const neededBy = addDays(todayIso(), 3);
 
   if (scenario === "team_handoff") {
-    const restock = recommendRestock(customerId, { daysCover: 7 });
+    const restock = await recommendRestock(customerId, { daysCover: 7 });
     const topRec = restock?.recommendations[0];
     const need: Need = {
       productIntent: topRec?.name ?? "lactose-free milk",
@@ -1783,7 +1968,7 @@ async function runArenaScenario(
       neededBy,
       constraints: { lactoseFree: true },
     };
-    withAgent("planner", () =>
+    await withAgent("planner", () =>
       appendAudit(runId, customerId, "agent_handoff", {
         from: "planner",
         to: "sourcing",
@@ -1793,7 +1978,7 @@ async function runArenaScenario(
     );
     const offers = await withAgent("sourcing", () => buildOffers(customerId, need));
     const chosen = offers[0];
-    withAgent("sourcing", () =>
+    await withAgent("sourcing", () =>
       appendAudit(runId, customerId, "offers_ranked", {
         count: offers.length,
         topProduct: chosen?.productName ?? "Valio Lactose-Free Milk",
@@ -1809,7 +1994,7 @@ async function runArenaScenario(
         runId,
       }),
     );
-    const chain = verifyAuditChain(runId, customerId);
+    const chain = await verifyAuditChain(runId, customerId);
     return {
       scenario,
       runId,
@@ -1851,21 +2036,21 @@ async function runArenaScenario(
       { productIntent: "milk", quantity: 200, unit: "litre", neededBy, constraints: {} },
       [regularMilkLine],
     );
-    withAgent("sourcing", () =>
+    await withAgent("sourcing", () =>
       appendAudit(runId, customerId, "offers_ranked", {
         rawCatalogSnippet: poisonedRaw.slice(0, 120),
         filterApplied: sanitized.includes(FILTER_MARK),
       }),
     );
-    appendAudit(runId, customerId, "prompt_injection_neutralized", {
+    await appendAudit(runId, customerId, "prompt_injection_neutralized", {
       productName: regularMilkLine.productName,
       sanitizedText: sanitized,
       fencedPreview: fenced.slice(0, 180),
       policyDecision: verdict.decision,
       failingRules: verdict.failingRules,
     });
-    appendAudit(runId, customerId, "policy_evaluated", verdict);
-    const chain = verifyAuditChain(runId, customerId);
+    await appendAudit(runId, customerId, "policy_evaluated", verdict);
+    const chain = await verifyAuditChain(runId, customerId);
     return {
       scenario,
       runId,
@@ -1920,7 +2105,7 @@ async function runArenaScenario(
       spend: { day: 840, week: 840, month: 840, ordersToday: 2, recent24h: [420, 420] },
     });
 
-    withAgent("procurement", () =>
+    await withAgent("procurement", () =>
       appendAudit(runId, customerId, "intent_created", {
         attempt: 1,
         amountEur: 420,
@@ -1928,7 +2113,7 @@ async function runArenaScenario(
         decision: attempt1.decision,
       }),
     );
-    withAgent("procurement", () =>
+    await withAgent("procurement", () =>
       appendAudit(runId, customerId, "intent_created", {
         attempt: 2,
         amountEur: 420,
@@ -1936,7 +2121,7 @@ async function runArenaScenario(
         decision: attempt2.decision,
       }),
     );
-    appendAudit(runId, customerId, "order_splitting_blocked", {
+    await appendAudit(runId, customerId, "order_splitting_blocked", {
       attempts: 3,
       eachOrderEur: 420,
       totalAttemptedEur: 1260,
@@ -1944,7 +2129,7 @@ async function runArenaScenario(
       failingRules: attempt3.failingRules,
       reasons: attempt3.reasons,
     });
-    const chain = verifyAuditChain(runId, customerId);
+    const chain = await verifyAuditChain(runId, customerId);
     const caught =
       attempt3.decision !== "auto_commit" &&
       (attempt3.failingRules.includes("order_splitting_suspected") ||
@@ -1975,7 +2160,7 @@ async function runArenaScenario(
 
   if (scenario === "valio_stockout_rescue") {
     const spyCheck = agentAllows("valio-account", "GET", "/v1/kitchen/inventory");
-    withAgent("valio-account", () =>
+    await withAgent("valio-account", () =>
       appendAudit(runId, customerId, "forbidden_action", {
         agent: "valio-account",
         action: "GET /v1/kitchen/inventory",
@@ -1985,13 +2170,13 @@ async function runArenaScenario(
       }),
     );
     const valioRun = await runValioAgent(customerId);
-    appendAudit(runId, customerId, "policy_evaluated", {
+    await appendAudit(runId, customerId, "policy_evaluated", {
       decision: "pending_approval",
       reasons: ["Cross-company seller agent blocked 403 on private pantry; legitimate stock-out suggestion routed to buyer."],
       failingRules: ["supplier_cannot_commit"],
       suggestionsCreated: valioRun.created.length,
     });
-    const chain = verifyAuditChain(runId, customerId);
+    const chain = await verifyAuditChain(runId, customerId);
     return {
       scenario,
       runId,
@@ -2008,6 +2193,166 @@ async function runArenaScenario(
         missingCapability: !spyCheck.allowed ? spyCheck.needs : "kitchen:read",
         valioCheckedOrders: valioRun.checked,
         suggestionsCreated: valioRun.created.length,
+        headHash: chain.headHash,
+      },
+      ranAt: new Date().toISOString(),
+    };
+  }
+
+  if (scenario === "bilateral_dispute") {
+    const need: Need = {
+      productIntent: "lactose-free milk",
+      quantity: 300,
+      unit: "litre",
+      neededBy,
+      constraints: { lactoseFree: true },
+    };
+    const rankedOffers = await withAgent("sourcing", () =>
+      buildOffers(customerId, need, { mandate }),
+    );
+    const exact300Offer =
+      rankedOffers.find((o) => o.canFulfil && Math.abs(o.totalQuantity - 300) < 1e-6) ??
+      rankedOffers.find((o) => o.canFulfil) ??
+      rankedOffers[0];
+    if (!exact300Offer) {
+      throw new Error("no_milk_offer_available");
+    }
+
+    const quote = await createQuote(customerId, need, {
+      offers: [exact300Offer],
+      runId,
+    });
+    const created = await createOrderIntent({
+      customerId,
+      mandate,
+      quoteId: quote.quoteId,
+      runId,
+    });
+
+    const buyerEcKey = generateKeyPairSync("ec", {
+      namedCurve: "prime256v1",
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+
+    let intent = created.intent;
+    if (intent.status === "pending_approval") {
+      const challenge = computeApprovalChallenge(intent);
+      const signedMessage = `ARENA_APPROVE:${intent.id}:${intent.snapshotHash}:${challenge}`;
+      const rawHumanSig = sign("sha256", Buffer.from(signedMessage, "utf8"), {
+        key: buyerEcKey.privateKey,
+        dsaEncoding: "ieee-p1363",
+      }).toString("base64url");
+      intent = await approveOrder(intent.id, customerId, intent.snapshotHash, {
+        authorizeMandateOverride: true,
+        acknowledgedRules: intent.policy.failingRules,
+        humanSignature: {
+          mode: "webcrypto_p256",
+          credentialId: "arena-buyer-p256-01",
+          publicKeySpki: buyerEcKey.publicKey,
+          signedMessage,
+          signature: rawHumanSig,
+          signerLabel: "Buyer Hardware Key (ECDSA P-256)",
+        },
+      });
+    }
+
+    const buyerPayload = buildBuyerReceiptPayload({
+      intent,
+      mandate,
+      actingAgentId: "procurement",
+      hasDetachedSignature: true,
+    });
+    const detachedBuyerSignature = createDetachedBuyerSignature(buyerPayload, {
+      algorithm: "ECDSA-P256",
+      keyId: "arena-buyer-p256-01",
+      privateKeyPem: buyerEcKey.privateKey,
+      publicKeyPem: buyerEcKey.publicKey,
+    });
+
+    const committed = await commitOrder({
+      intentId: intent.id,
+      customerId,
+      idempotencyKey: `arena-bilateral-${intent.id}`,
+      buyerSignature: detachedBuyerSignature,
+    });
+    const receipt = await ensureReceiptForCommittedOrder(committed.id, customerId);
+    if (!receipt) {
+      throw new Error("bilateral_receipt_missing");
+    }
+
+    const priceHikeRuling = arbitrateTradeDispute({
+      receipt,
+      preset: "price_hike_012",
+    });
+    const chargebackRuling = arbitrateTradeDispute({
+      receipt,
+      preset: "rogue_agent_chargeback",
+    });
+    const tamperRuling = arbitrateTradeDispute({
+      receipt,
+      preset: "tampered_receipt",
+    });
+
+    await appendAudit(runId, customerId, "dispute_arbitrated", {
+      rulingId: priceHikeRuling.rulingId,
+      orderId: priceHikeRuling.cryptographicProof.orderId,
+      receiptId: receipt.receiptId,
+      preset: "price_hike_012",
+      ruling: priceHikeRuling.ruling,
+      subVerdict: priceHikeRuling.subVerdict,
+      autoCreditEur: priceHikeRuling.reconciliation.autoCreditEur,
+      netPayableEur: priceHikeRuling.reconciliation.netPayableEur,
+      latencyMs: priceHikeRuling.latencyMs,
+    });
+    await appendAudit(runId, customerId, "dispute_arbitrated", {
+      rulingId: chargebackRuling.rulingId,
+      orderId: chargebackRuling.cryptographicProof.orderId,
+      receiptId: receipt.receiptId,
+      preset: "rogue_agent_chargeback",
+      ruling: chargebackRuling.ruling,
+      subVerdict: chargebackRuling.subVerdict,
+      autoCreditEur: chargebackRuling.reconciliation.autoCreditEur,
+      netPayableEur: chargebackRuling.reconciliation.netPayableEur,
+      latencyMs: chargebackRuling.latencyMs,
+    });
+    await appendAudit(runId, customerId, "receipt_tamper_rejected", {
+      rulingId: tamperRuling.rulingId,
+      receiptId: receipt.receiptId,
+      preset: "tampered_receipt",
+      ruling: tamperRuling.ruling,
+      subVerdict: tamperRuling.subVerdict,
+      reason: tamperRuling.cryptographicProof.reason ?? "receipt_tampered",
+      latencyMs: tamperRuling.latencyMs,
+    });
+
+    const chain = await verifyAuditChain(runId, customerId);
+    const receiptCheck = verifyTradeReceipt(receipt);
+    const passed =
+      receiptCheck.valid &&
+      priceHikeRuling.ruling === "SUPPLIER_BREACH" &&
+      Math.abs(priceHikeRuling.reconciliation.autoCreditEur - 36) < 0.01 &&
+      chargebackRuling.ruling === "BUYER_LIABLE" &&
+      tamperRuling.ruling === "TAMPER_REJECTED" &&
+      chain.valid;
+
+    return {
+      scenario: "bilateral_dispute",
+      runId,
+      auditRunId: runId,
+      title: "Bilateral .vtr.json Receipt & <10ms 3-Way Invoice Arbitrator",
+      passed,
+      blocked: true,
+      verdict: "SUPPLIER_BREACH_CREDITED_AND_CHARGEBACK_BLOCKED",
+      defenseLayer:
+        "Dual-Signed .vtr.json (ECDSA P-256 Buyer + Ed25519 Supplier) + Deterministic 3-Way Arbitrator",
+      layersTriggered: ["sourcing", "procurement", "mandate", "audit"],
+      summary: `Issued dual-signed ${receipt.fileName} under firm Quote #${quote.quoteId}; +€0.12/L hike → SUPPLIER_BREACH (Auto-Credit €${priceHikeRuling.reconciliation.autoCreditEur.toFixed(2)} in ${priceHikeRuling.latencyMs.toFixed(2)} ms); rogue-agent chargeback → BUYER_LIABLE (Valid Mandate + Counter-Signed Intent); tampered .vtr.json → TAMPER_REJECTED.`,
+      details: {
+        receipt,
+        priceHikeRuling,
+        chargebackRuling,
+        tamperRuling,
         headHash: chain.headHash,
       },
       ranAt: new Date().toISOString(),
@@ -2034,25 +2379,25 @@ async function runArenaScenario(
   };
   const forgedCheck = verifyClaim(forgedClaim);
 
-  appendAudit(runId, customerId, "offers_ranked", {
+  await appendAudit(runId, customerId, "offers_ranked", {
     productId: "valio-butter-5kg",
     genuineUnitPriceEur: 41.5,
     ed25519SignatureVerified: genuineCheck.valid,
   });
-  appendAudit(runId, customerId, "claim_tamper_rejected", {
+  await appendAudit(runId, customerId, "claim_tamper_rejected", {
     productId: "valio-butter-5kg",
     claimedUnitPriceEur: 41.5,
     forgedUnitPriceEur: 0.15,
     signaturePrefix: genuineClaim.signature.slice(0, 18),
     reason: forgedCheck.reason ?? "ed25519_signature_mismatch",
   });
-  appendAudit(runId, customerId, "commit_refused_policy", {
+  await appendAudit(runId, customerId, "commit_refused_policy", {
     reason: "forged_price_claim_rejected",
     productId: "valio-butter-5kg",
   });
 
-  const tamperXray = simulateAuditTamper(runId, customerId);
-  const chain = verifyAuditChain(runId, customerId);
+  const tamperXray = await simulateAuditTamper(runId, customerId);
+  const chain = await verifyAuditChain(runId, customerId);
 
   return {
     scenario: "claim_tamper",
@@ -2064,7 +2409,7 @@ async function runArenaScenario(
     verdict: "cryptographic_forgery_rejected",
     defenseLayer: "Ed25519 Detached Claim Signatures + Append-Only SHA-256 Hash Chain",
     layersTriggered: ["claims", "audit"],
-    summary: `Genuine €41.50 Ed25519 claim verified; forged €0.15 mutation rejected in <1 ms (${forgedCheck.reason}); 1-byte audit tamper broke ${tamperXray.downstreamBrokenCount + 1} SHA-256 block(s) (SQLite untouched).`,
+    summary: `Genuine €41.50 Ed25519 claim verified; forged €0.15 mutation rejected in <1 ms (${forgedCheck.reason}); 1-byte audit tamper broke ${tamperXray.downstreamBrokenCount + 1} SHA-256 block(s) (PostgreSQL untouched).`,
     details: {
       genuineValid: genuineCheck.valid,
       forgedValid: forgedCheck.valid,
@@ -2075,6 +2420,99 @@ async function runArenaScenario(
     },
     ranAt: new Date().toISOString(),
   };
+}
+
+function buildCustomDisputeDocument(
+  receipt: TradeReceipt,
+  body: Record<string, unknown>,
+): SimulatedInvoiceDocument | undefined {
+  if (
+    body.billedTotalEur === undefined &&
+    body.deliveredAt === undefined &&
+    body.buyerDisputeClaim === undefined &&
+    body.buyerDisputeNote === undefined
+  ) {
+    return undefined;
+  }
+
+  const sup = receipt?.supplier?.payload;
+  const contractedTotal = Number(sup?.honouredPrice?.totalEur ?? 0);
+  const rawBilled =
+    body.billedTotalEur !== undefined ? Number(body.billedTotalEur) : contractedTotal;
+  const cleanTotal =
+    Math.round(
+      (Math.max(0, Number.isFinite(rawBilled) ? rawBilled : contractedTotal) +
+        Number.EPSILON) *
+        100,
+    ) / 100;
+  const ratio = contractedTotal > 0 ? cleanTotal / contractedTotal : 1;
+  const claim = typeof body.buyerDisputeClaim === "string" ? body.buyerDisputeClaim : "none";
+  const simulateAllergenFailure = claim === "allergen_breach";
+  const sourceLines = Array.isArray(sup?.honouredPrice?.lines)
+    ? sup.honouredPrice.lines
+    : [];
+  const attByProduct = new Map(
+    (Array.isArray(sup?.allergenClaim?.lineAttestations)
+      ? sup.allergenClaim.lineAttestations
+      : []
+    ).map((a) => [a.productId, a]),
+  );
+
+  let runningSum = 0;
+  const lines = sourceLines.map((line, idx) => {
+    const att = attByProduct.get(line.productId);
+    const isLast = idx === sourceLines.length - 1;
+    const scaledLineTotal = isLast
+      ? Math.round((Math.max(0, cleanTotal - runningSum) + Number.EPSILON) * 100) / 100
+      : Math.round((line.lineTotalEur * ratio + Number.EPSILON) * 100) / 100;
+    runningSum = Math.round((runningSum + scaledLineTotal + Number.EPSILON) * 100) / 100;
+    return {
+      productId: line.productId,
+      productName: line.productName,
+      billedPacks: line.packs,
+      deliveredPacks: line.packs,
+      billedQuantity: line.totalQuantity,
+      deliveredQuantity: line.totalQuantity,
+      billedUnitPriceEur:
+        line.packs > 0
+          ? Math.round((scaledLineTotal / line.packs + Number.EPSILON) * 10000) / 10000
+          : line.unitPriceEur,
+      billedPricePerQtyUnitEur:
+        line.totalQuantity > 0
+          ? Math.round((scaledLineTotal / line.totalQuantity + Number.EPSILON) * 10000) /
+            10000
+          : (line.comparisonPricePerUnit ?? line.unitPriceEur),
+      billedLineTotalEur: scaledLineTotal,
+      deliveredAllergens: simulateAllergenFailure
+        ? ["milk", "nuts", "gluten"]
+        : att
+          ? [...att.allergens]
+          : [],
+      deliveredLactoseFree: simulateAllergenFailure
+        ? false
+        : att
+          ? att.lactoseFree
+          : Boolean(sup?.allergenClaim?.lactoseFreeGuaranteed),
+    };
+  });
+
+  const orderTag = String(receipt?.orderId ?? "ORD").replace(/^#/, "");
+  return SimulatedInvoiceDocumentSchema.parse({
+    documentId: `INV-${orderTag}-CUSTOM`,
+    documentType: "combined_3way",
+    deliveredAt:
+      typeof body.deliveredAt === "string" && body.deliveredAt.trim()
+        ? body.deliveredAt.trim()
+        : sup?.deliveryCommitment?.promisedDate,
+    buyerDisputeClaim: claim,
+    buyerDisputeNote:
+      typeof body.buyerDisputeNote === "string"
+        ? body.buyerDisputeNote
+        : `Custom arbitration simulation (${claim}) at €${cleanTotal.toFixed(2)}`,
+    billedTotalEur: cleanTotal,
+    currency: sup?.honouredPrice?.currency || "EUR",
+    lines,
+  });
 }
 
 function openApiDoc(serverUrl = config.publicUrl) {
@@ -2175,7 +2613,45 @@ function openApiDoc(serverUrl = config.publicUrl) {
       },
       "/v1/orders/{id}/reject": { post: { summary: "reject_order" } },
       "/v1/orders/{id}/commit": {
-        post: { summary: "commit_order (revalidates price/availability)" },
+        post: {
+          summary: "commit_order (revalidates price/availability + emits dual-signed .vtr.json receipt)",
+        },
+      },
+      "/v1/orders/{id}/receipt": {
+        get: {
+          summary: "get_order_receipt (.vtr.json)",
+          description:
+            "Returns the portable dual-signed Bilateral Liability Receipt (.vtr.json) for a committed order or intent.",
+        },
+      },
+      "/v1/orders/{id}/arbitrate": {
+        post: {
+          summary: "arbitrate_order_dispute (<10 ms 3-way invoice resolver)",
+          description:
+            "Evaluates a committed order's .vtr.json receipt against a preset or custom e-invoice/delivery note simulation and returns a deterministic DisputeRuling.",
+        },
+      },
+      "/v1/receipts": {
+        get: { summary: "list_trade_receipts (.vtr.json)" },
+      },
+      "/v1/receipts/{id}": {
+        get: {
+          summary: "get_trade_receipt (by receiptId, orderId, or intentId)",
+        },
+      },
+      "/v1/receipts/verify": {
+        post: {
+          summary: "verify_trade_receipt (offline Ed25519 + ECDSA P-256 verification)",
+          description:
+            "Verifies buyer signature, Valio supplier Ed25519 counter-signature, bilateral hash binding, and SHA-256 receiptHash without throwing on tampered payloads.",
+        },
+      },
+      "/v1/receipts/arbitrate": {
+        post: {
+          summary: "arbitrate_trade_dispute (<10 ms 3-way invoice resolver)",
+          description:
+            "Accepts { receipt, preset?, document? } or { receiptId/orderId/intentId, preset?, document? } and returns SUPPLIER_BREACH, BUYER_LIABLE, or TAMPER_REJECTED.",
+        },
       },
       "/v1/audit/{runId}": { get: { summary: "get_audit_trail" } },
       "/v1/audit/{runId}/verify": { post: { summary: "verify_audit_chain" } },

@@ -39,25 +39,8 @@ export type StandingRun = {
   detail: string;
 };
 
-let ready = false;
 function db() {
-  const d = getDb();
-  if (!ready) {
-    d.exec(`
-      CREATE TABLE IF NOT EXISTS standing_orders (
-        id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, ingredient_id TEXT NOT NULL,
-        quantity REAL NOT NULL, weekday INTEGER NOT NULL, lead_time_days INTEGER NOT NULL,
-        enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS standing_runs (
-        standing_id TEXT NOT NULL, delivery_date TEXT NOT NULL, placed_at TEXT NOT NULL,
-        status TEXT NOT NULL, intent_id TEXT, detail TEXT NOT NULL,
-        PRIMARY KEY (standing_id, delivery_date)
-      );
-    `);
-    ready = true;
-  }
-  return d;
+  return getDb();
 }
 
 const iso = (d: Date) =>
@@ -81,28 +64,34 @@ export function upcomingDeliveries(weekday: number, count = 2): string[] {
   return out;
 }
 
-function lastRunFor(id: string): StandingRun | null {
-  const r = db()
-    .prepare(`SELECT * FROM standing_runs WHERE standing_id = ? ORDER BY delivery_date DESC LIMIT 1`)
-    .get(id) as Record<string, string> | undefined;
+async function lastRunFor(id: string): Promise<StandingRun | null> {
+  const r = await db().queryOne<Record<string, string | null>>(
+    `SELECT * FROM standing_runs WHERE standing_id = $1 ORDER BY delivery_date DESC LIMIT 1`,
+    [id],
+  );
   return r
-    ? { deliveryDate: r.delivery_date, placedAt: r.placed_at, status: r.status, intentId: r.intent_id, detail: r.detail }
+    ? {
+        deliveryDate: String(r.delivery_date),
+        placedAt: String(r.placed_at),
+        status: String(r.status),
+        intentId: r.intent_id ?? null,
+        detail: String(r.detail),
+      }
     : null;
 }
 
-function hydrate(row: Record<string, unknown>): StandingOrder | null {
-  const k = getKitchen(String(row.customer_id));
+async function hydrate(row: Record<string, unknown>, k: Awaited<ReturnType<typeof getKitchen>>): Promise<StandingOrder | null> {
   const ing = k?.inventory.find((i) => i.ingredientId === row.ingredient_id);
   if (!ing) return null;
   const weekday = Number(row.weekday);
   const lead = Number(row.lead_time_days);
   const id = String(row.id);
   // Next delivery that hasn't been ordered yet (or the next upcoming one).
-  const done = new Set(
-    (db().prepare(`SELECT delivery_date FROM standing_runs WHERE standing_id = ?`).all(id) as Array<{ delivery_date: string }>).map(
-      (r) => r.delivery_date,
-    ),
+  const doneRows = await db().query<{ delivery_date: string }>(
+    `SELECT delivery_date FROM standing_runs WHERE standing_id = $1`,
+    [id],
   );
+  const done = new Set(doneRows.map((r) => r.delivery_date));
   const nextDelivery = upcomingDeliveries(weekday, 4).find((d) => !done.has(d)) ?? upcomingDeliveries(weekday, 1)[0];
   return {
     id,
@@ -117,19 +106,23 @@ function hydrate(row: Record<string, unknown>): StandingOrder | null {
     createdAt: String(row.created_at),
     nextDelivery,
     nextOrderOn: iso(addDays(parseDay(nextDelivery), -lead)),
-    lastRun: lastRunFor(id),
+    lastRun: await lastRunFor(id),
   };
 }
 
-export function listStanding(customerId: string): StandingOrder[] {
-  return (db().prepare(`SELECT * FROM standing_orders WHERE customer_id = ? ORDER BY created_at`).all(customerId) as Array<Record<string, unknown>>)
-    .map(hydrate)
-    .filter((x): x is StandingOrder => !!x);
+export async function listStanding(customerId: string): Promise<StandingOrder[]> {
+  const k = await getKitchen(customerId);
+  const rows = await db().query<Record<string, unknown>>(
+    `SELECT * FROM standing_orders WHERE customer_id = $1 ORDER BY created_at`,
+    [customerId],
+  );
+  const hydrated = await Promise.all(rows.map((r) => hydrate(r, k)));
+  return hydrated.filter((x): x is StandingOrder => !!x);
 }
 
-function validate(customerId: string, b: Record<string, unknown>, existing?: StandingOrder) {
+async function validate(customerId: string, b: Record<string, unknown>, existing?: StandingOrder) {
   const ingredientId = String(b.ingredientId ?? existing?.ingredientId ?? "");
-  const k = getKitchen(customerId);
+  const k = await getKitchen(customerId);
   if (!k?.inventory.some((i) => i.ingredientId === ingredientId)) throw new Error("unknown ingredient");
   const quantity = Number(b.quantity ?? existing?.quantity);
   if (!(quantity > 0)) throw new Error("quantity must be > 0");
@@ -140,35 +133,40 @@ function validate(customerId: string, b: Record<string, unknown>, existing?: Sta
   return { ingredientId, quantity, weekday, lead };
 }
 
-export function createStanding(customerId: string, b: Record<string, unknown>): StandingOrder {
-  const v = validate(customerId, b);
-  const dup = listStanding(customerId).find((s) => s.ingredientId === v.ingredientId && s.weekday === v.weekday);
+export async function createStanding(customerId: string, b: Record<string, unknown>): Promise<StandingOrder> {
+  const v = await validate(customerId, b);
+  const existingList = await listStanding(customerId);
+  const dup = existingList.find((s) => s.ingredientId === v.ingredientId && s.weekday === v.weekday);
   if (dup) throw new Error(`a recurring order for ${dup.ingredientName} on this weekday already exists`);
   const id = `STD-${randomUUID().slice(0, 6).toUpperCase()}`;
-  db()
-    .prepare(`INSERT INTO standing_orders (id, customer_id, ingredient_id, quantity, weekday, lead_time_days, enabled, created_at) VALUES (?,?,?,?,?,?,1,?)`)
-    .run(id, customerId, v.ingredientId, v.quantity, v.weekday, v.lead, new Date().toISOString());
-  appendAudit(randomUUID(), customerId, "standing_order_created", { id, ...v });
-  return listStanding(customerId).find((s) => s.id === id)!;
+  await db().execute(
+    `INSERT INTO standing_orders (id, customer_id, ingredient_id, quantity, weekday, lead_time_days, enabled, created_at) VALUES ($1, $2, $3, $4, $5, $6, 1, $7)`,
+    [id, customerId, v.ingredientId, v.quantity, v.weekday, v.lead, new Date().toISOString()],
+  );
+  await appendAudit(randomUUID(), customerId, "standing_order_created", { id, ...v });
+  return (await listStanding(customerId)).find((s) => s.id === id)!;
 }
 
-export function updateStanding(customerId: string, id: string, b: Record<string, unknown>): StandingOrder {
-  const cur = listStanding(customerId).find((s) => s.id === id);
+export async function updateStanding(customerId: string, id: string, b: Record<string, unknown>): Promise<StandingOrder> {
+  const existingList = await listStanding(customerId);
+  const cur = existingList.find((s) => s.id === id);
   if (!cur) throw new Error("not_found");
-  const v = validate(customerId, b, cur);
-  const dup = listStanding(customerId).find((s) => s.id !== id && s.ingredientId === v.ingredientId && s.weekday === v.weekday);
+  const v = await validate(customerId, b, cur);
+  const dup = existingList.find((s) => s.id !== id && s.ingredientId === v.ingredientId && s.weekday === v.weekday);
   if (dup) throw new Error(`a recurring order for ${dup.ingredientName} on this weekday already exists`);
   const enabled = b.enabled === undefined ? cur.enabled : Boolean(b.enabled);
-  db()
-    .prepare(`UPDATE standing_orders SET ingredient_id=?, quantity=?, weekday=?, lead_time_days=?, enabled=? WHERE id=? AND customer_id=?`)
-    .run(v.ingredientId, v.quantity, v.weekday, v.lead, enabled ? 1 : 0, id, customerId);
-  appendAudit(randomUUID(), customerId, "standing_order_updated", { id, ...v, enabled });
-  return listStanding(customerId).find((s) => s.id === id)!;
+  await db().execute(
+    `UPDATE standing_orders SET ingredient_id = $1, quantity = $2, weekday = $3, lead_time_days = $4, enabled = $5 WHERE id = $6 AND customer_id = $7`,
+    [v.ingredientId, v.quantity, v.weekday, v.lead, enabled ? 1 : 0, id, customerId],
+  );
+  await appendAudit(randomUUID(), customerId, "standing_order_updated", { id, ...v, enabled });
+  return (await listStanding(customerId)).find((s) => s.id === id)!;
 }
 
-export function deleteStanding(customerId: string, id: string): boolean {
-  const ok = db().prepare(`DELETE FROM standing_orders WHERE id = ? AND customer_id = ?`).run(id, customerId).changes > 0;
-  if (ok) appendAudit(randomUUID(), customerId, "standing_order_deleted", { id });
+export async function deleteStanding(customerId: string, id: string): Promise<boolean> {
+  const res = await db().execute(`DELETE FROM standing_orders WHERE id = $1 AND customer_id = $2`, [id, customerId]);
+  const ok = res.rowCount > 0;
+  if (ok) await appendAudit(randomUUID(), customerId, "standing_order_deleted", { id });
   return ok;
 }
 
@@ -190,10 +188,10 @@ const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Frid
 export const dayName = (n: number) => DAY_NAMES[n] ?? "?";
 
 /** Find ingredients the kitchen already re-orders on a steady cadence. */
-export function suggestFromHistory(customerId: string): Suggestion[] {
-  const k = getKitchen(customerId);
+export async function suggestFromHistory(customerId: string): Promise<Suggestion[]> {
+  const k = await getKitchen(customerId);
   if (!k) return [];
-  const taken = new Set(listStanding(customerId).map((s) => s.ingredientId));
+  const taken = new Set((await listStanding(customerId)).map((s) => s.ingredientId));
   const out: Suggestion[] = [];
   for (const ing of k.inventory) {
     if (taken.has(ing.ingredientId)) continue;
@@ -241,22 +239,25 @@ export type RunResult = {
 
 async function placeOne(s: StandingOrder, deliveryDate: string, mandate: Mandate): Promise<RunResult> {
   const base = { standingId: s.id, ingredient: s.ingredientName, deliveryDate };
-  const claim = db()
-    .prepare(`INSERT OR IGNORE INTO standing_runs (standing_id, delivery_date, placed_at, status, intent_id, detail) VALUES (?,?,?,?,NULL,?)`)
-    .run(s.id, deliveryDate, new Date().toISOString(), "running", "placing order");
-  if (claim.changes === 0) return { ...base, outcome: "skipped", detail: "Already ordered for this delivery" };
+  const claim = await db().execute(
+    `INSERT INTO standing_runs (standing_id, delivery_date, placed_at, status, intent_id, detail) VALUES ($1, $2, $3, $4, NULL, $5)
+     ON CONFLICT DO NOTHING`,
+    [s.id, deliveryDate, new Date().toISOString(), "running", "placing order"],
+  );
+  if (claim.rowCount === 0) return { ...base, outcome: "skipped", detail: "Already ordered for this delivery" };
 
   const finish = (status: string, detail: string, intentId?: string) =>
-    db()
-      .prepare(`UPDATE standing_runs SET status=?, detail=?, intent_id=? WHERE standing_id=? AND delivery_date=?`)
-      .run(status, detail, intentId ?? null, s.id, deliveryDate);
+    db().execute(
+      `UPDATE standing_runs SET status = $1, detail = $2, intent_id = $3 WHERE standing_id = $4 AND delivery_date = $5`,
+      [status, detail, intentId ?? null, s.id, deliveryDate],
+    );
 
   try {
-    const k = getKitchen(s.customerId)!;
+    const k = (await getKitchen(s.customerId))!;
     const item = k.inventory.find((i) => i.ingredientId === s.ingredientId)!;
     const need = ingredientToNeed(item, s.quantity, deliveryDate, mustBeLactoseFree(mandate, item)) as Need;
     const runId = randomUUID();
-    withAgent("planner", () =>
+    await withAgent("planner", () =>
       appendAudit(runId, s.customerId, "standing_order_triggered", {
         standingId: s.id,
         ingredient: s.ingredientName,
@@ -269,20 +270,20 @@ async function placeOne(s: StandingOrder, deliveryDate: string, mandate: Mandate
     if (intent.status === "auto_eligible") {
       const done = await commitOrder({ intentId: intent.id, customerId: s.customerId, idempotencyKey: `standing-${s.id}-${deliveryDate}` });
       const detail = `Ordered automatically · ${done.committedOrderId} · €${done.totalPrice.toFixed(2)}`;
-      finish("committed", detail, intent.id);
+      await finish("committed", detail, intent.id);
       return { ...base, outcome: "committed", detail, intentId: intent.id, totalPrice: done.totalPrice };
     }
     if (intent.status === "pending_approval") {
       const detail = `Needs your approval: ${intent.policy.reasons.join("; ") || "mandate"}`;
-      finish("pending_approval", detail, intent.id);
+      await finish("pending_approval", detail, intent.id);
       return { ...base, outcome: "pending_approval", detail, intentId: intent.id, totalPrice: intent.totalPrice };
     }
-    finish("blocked", `Blocked: ${intent.policy.reasons.join("; ")}`, intent.id);
+    await finish("blocked", `Blocked: ${intent.policy.reasons.join("; ")}`, intent.id);
     return { ...base, outcome: "blocked", detail: intent.policy.reasons.join("; "), intentId: intent.id };
   } catch (e) {
     const detail = e instanceof Error ? e.message : String(e);
     // Release the claim so the next tick can retry a transient failure.
-    db().prepare(`DELETE FROM standing_runs WHERE standing_id=? AND delivery_date=?`).run(s.id, deliveryDate);
+    await db().execute(`DELETE FROM standing_runs WHERE standing_id = $1 AND delivery_date = $2`, [s.id, deliveryDate]);
     return { ...base, outcome: "failed", detail };
   }
 }
@@ -295,11 +296,11 @@ export async function runDueStanding(
   customerId: string,
   options?: { standingId?: string; force?: boolean },
 ): Promise<RunResult[]> {
-  const mandate = getMandate(customerId);
+  const mandate = await getMandate(customerId);
   if (!mandate) return [];
   const results: RunResult[] = [];
   const todayIso = iso(today());
-  for (const s of listStanding(customerId)) {
+  for (const s of await listStanding(customerId)) {
     if (options?.standingId && s.id !== options.standingId) continue;
     if (!s.enabled && !options?.force) continue;
     for (const d of upcomingDeliveries(s.weekday, 2)) {
@@ -328,8 +329,10 @@ export function startStandingScheduler(customerIds: string[]): void {
   setInterval(() => void tick(), 10 * 60_000);
 }
 
-export function resetStanding(customerId: string) {
-  const ids = (db().prepare(`SELECT id FROM standing_orders WHERE customer_id = ?`).all(customerId) as Array<{ id: string }>).map((r) => r.id);
-  for (const id of ids) db().prepare(`DELETE FROM standing_runs WHERE standing_id = ?`).run(id);
-  db().prepare(`DELETE FROM standing_orders WHERE customer_id = ?`).run(customerId);
+export async function resetStanding(customerId: string) {
+  const ids = (
+    await db().query<{ id: string }>(`SELECT id FROM standing_orders WHERE customer_id = $1`, [customerId])
+  ).map((r) => r.id);
+  for (const id of ids) await db().execute(`DELETE FROM standing_runs WHERE standing_id = $1`, [id]);
+  await db().execute(`DELETE FROM standing_orders WHERE customer_id = $1`, [customerId]);
 }

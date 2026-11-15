@@ -218,7 +218,7 @@ export async function getPrices(
     };
   });
   try {
-    recordPriceSnapshots(customerId, requestedDate, results);
+    await recordPriceSnapshots(customerId, requestedDate, results);
   } catch {
     // non-fatal if DB snapshot write fails
   }
@@ -298,7 +298,7 @@ export async function getAvailability(
     };
   });
   try {
-    recordAvailabilitySnapshots(customerId, requestedDate, results);
+    await recordAvailabilitySnapshots(customerId, requestedDate, results);
   } catch {
     // non-fatal if DB snapshot write fails
   }

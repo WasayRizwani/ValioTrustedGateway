@@ -289,14 +289,14 @@ export async function resolveUnifiedKitchenPrompt(params: {
   callerRole?: string;
 }): Promise<UnifiedAssistantResponse> {
   const text = params.text.trim();
-  const mandate = getMandate(params.customerId) ?? null;
+  const mandate = (await getMandate(params.customerId)) ?? null;
   const preferences = params.preferences ? PreferencesSchema.parse(params.preferences) : undefined;
   const neededBy = extractNeededByFromText(text);
 
   // 1. Pantry restock / low-stock query → build interactive Restock Bundle
   if (isRestockPrompt(text) && !/\bsmart\s+restock|expiry|waste\b/i.test(text)) {
-    const rec = recommendRestock(params.customerId, { daysCover: 7 });
-    const kitchen = getKitchen(params.customerId);
+    const rec = await recommendRestock(params.customerId, { daysCover: 7 });
+    const kitchen = await getKitchen(params.customerId);
     const urgent = (rec?.recommendations ?? []).filter(
       (r) => (r.urgency === "critical" || r.urgency === "low") && r.suggestedOrderQty > 0,
     );
@@ -393,7 +393,7 @@ export async function resolveUnifiedKitchenPrompt(params: {
   }
 
   // 3. Check if the user is asking for a Recipe / Dish (saved kitchen recipes OR culinary dishes)
-  const kitchen = getKitchen(params.customerId);
+  const kitchen = await getKitchen(params.customerId);
   const savedRecipeMatches = kitchen ? matchSavedKitchenRecipes(kitchen.recipes, text) : [];
   const builtinMatch = BUILTIN_CULINARY_RECIPES.find((tpl) => tpl.matchRe.test(text));
   const explicitQuantities = parseComplexNeedFromText(text);

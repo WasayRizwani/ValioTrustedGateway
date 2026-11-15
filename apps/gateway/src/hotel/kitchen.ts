@@ -373,33 +373,9 @@ const seedKitchens = new Map<string, HotelKitchen>([
 // ───────────────────────── persistence ─────────────────────────
 
 const iso = (d = new Date()) => d.toISOString();
-let ready = false;
 
 function db() {
-  const d = getDb();
-  if (!ready) {
-    d.exec(`
-      CREATE TABLE IF NOT EXISTS kitchen_profile (
-        customer_id TEXT PRIMARY KEY, hotel_name TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS kitchen_inventory (
-        customer_id TEXT NOT NULL, ingredient_id TEXT NOT NULL, json TEXT NOT NULL,
-        PRIMARY KEY (customer_id, ingredient_id)
-      );
-      CREATE TABLE IF NOT EXISTS kitchen_recipes (
-        customer_id TEXT NOT NULL, recipe_id TEXT NOT NULL, json TEXT NOT NULL,
-        PRIMARY KEY (customer_id, recipe_id)
-      );
-      CREATE TABLE IF NOT EXISTS kitchen_orders (
-        order_id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, ordered_at TEXT NOT NULL,
-        status TEXT NOT NULL, intent_id TEXT, json TEXT NOT NULL
-      );
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_kitchen_orders_intent
-        ON kitchen_orders(intent_id) WHERE intent_id IS NOT NULL;
-    `);
-    ready = true;
-  }
-  return d;
+  return getDb();
 }
 
 function inferIngredientId(
@@ -421,91 +397,108 @@ function inferIngredientId(
   return scored[0]?.id;
 }
 
-function seedCustomer(customerId: string) {
+async function seedCustomer(customerId: string) {
   const seed = seedKitchens.get(customerId);
   if (!seed) return;
   const d = db();
-  d.prepare(
-    `INSERT OR REPLACE INTO kitchen_profile (customer_id, hotel_name) VALUES (?, ?)`,
-  ).run(customerId, seed.hotelName);
-  const insInv = d.prepare(
-    `INSERT OR REPLACE INTO kitchen_inventory (customer_id, ingredient_id, json) VALUES (?, ?, ?)`,
-  );
-  for (const i of seed.inventory) {
-    const f = SEED_FRESHNESS[i.ingredientId];
-    const withDates: IngredientStock = f
-      ? {
-          ...i,
-          shelfLifeDays: f.shelfLifeDays,
-          expiresOn: f.expiresInDays != null && i.onHand > 0 ? daysFromNow(f.expiresInDays) : undefined,
-          lastUsedAt: f.lastUsedDaysAgo != null ? daysAgo(f.lastUsedDaysAgo) : undefined,
-        }
-      : i;
-    insInv.run(customerId, i.ingredientId, JSON.stringify(withDates));
-  }
-  const insRec = d.prepare(
-    `INSERT OR REPLACE INTO kitchen_recipes (customer_id, recipe_id, json) VALUES (?, ?, ?)`,
-  );
-  for (const r of seed.recipes) insRec.run(customerId, r.recipeId, JSON.stringify(r));
-  const insOrd = d.prepare(
-    `INSERT OR REPLACE INTO kitchen_orders (order_id, customer_id, ordered_at, status, intent_id, json) VALUES (?, ?, ?, ?, NULL, ?)`,
-  );
-  for (const o of seed.orderHistory) {
-    const withIds: PastOrder = {
-      ...o,
-      lines: o.lines.map((l) => ({
-        ...l,
-        ingredientId: l.ingredientId ?? inferIngredientId(seed.inventory, l.productName),
-      })),
-    };
-    insOrd.run(o.orderId, customerId, o.orderedAt, o.status, JSON.stringify(withIds));
-  }
+  await d.withTransaction(async (tx) => {
+    await tx.execute(
+      `INSERT INTO kitchen_profile (customer_id, hotel_name) VALUES ($1, $2)
+       ON CONFLICT (customer_id) DO UPDATE SET hotel_name = excluded.hotel_name`,
+      [customerId, seed.hotelName],
+    );
+    for (const i of seed.inventory) {
+      const f = SEED_FRESHNESS[i.ingredientId];
+      const withDates: IngredientStock = f
+        ? {
+            ...i,
+            shelfLifeDays: f.shelfLifeDays,
+            expiresOn: f.expiresInDays != null && i.onHand > 0 ? daysFromNow(f.expiresInDays) : undefined,
+            lastUsedAt: f.lastUsedDaysAgo != null ? daysAgo(f.lastUsedDaysAgo) : undefined,
+          }
+        : i;
+      await tx.execute(
+        `INSERT INTO kitchen_inventory (customer_id, ingredient_id, json) VALUES ($1, $2, $3)
+         ON CONFLICT (customer_id, ingredient_id) DO UPDATE SET json = excluded.json`,
+        [customerId, i.ingredientId, JSON.stringify(withDates)],
+      );
+    }
+    for (const r of seed.recipes) {
+      await tx.execute(
+        `INSERT INTO kitchen_recipes (customer_id, recipe_id, json) VALUES ($1, $2, $3)
+         ON CONFLICT (customer_id, recipe_id) DO UPDATE SET json = excluded.json`,
+        [customerId, r.recipeId, JSON.stringify(r)],
+      );
+    }
+    for (const o of seed.orderHistory) {
+      const withIds: PastOrder = {
+        ...o,
+        lines: o.lines.map((l) => ({
+          ...l,
+          ingredientId: l.ingredientId ?? inferIngredientId(seed.inventory, l.productName),
+        })),
+      };
+      await tx.execute(
+        `INSERT INTO kitchen_orders (order_id, customer_id, ordered_at, status, intent_id, json) VALUES ($1, $2, $3, $4, NULL, $5)
+         ON CONFLICT (order_id) DO UPDATE SET customer_id = excluded.customer_id, ordered_at = excluded.ordered_at, status = excluded.status, intent_id = excluded.intent_id, json = excluded.json`,
+        [o.orderId, customerId, o.orderedAt, o.status, JSON.stringify(withIds)],
+      );
+    }
+  });
 }
 
-function ensureSeeded(customerId: string) {
+async function ensureSeeded(customerId: string) {
   const d = db();
-  const has = d
-    .prepare(`SELECT 1 FROM kitchen_profile WHERE customer_id = ?`)
-    .get(customerId);
-  if (!has) seedCustomer(customerId);
+  const has = await d.queryOne(`SELECT 1 FROM kitchen_profile WHERE customer_id = $1`, [customerId]);
+  if (!has) await seedCustomer(customerId);
 }
 
 /** Wipe a customer's kitchen back to the demo seed. */
-export function resetKitchen(customerId: string) {
+export async function resetKitchen(customerId: string) {
   const d = db();
-  d.prepare(`DELETE FROM kitchen_inventory WHERE customer_id = ?`).run(customerId);
-  d.prepare(`DELETE FROM kitchen_recipes WHERE customer_id = ?`).run(customerId);
-  d.prepare(`DELETE FROM kitchen_orders WHERE customer_id = ?`).run(customerId);
-  d.prepare(`DELETE FROM kitchen_profile WHERE customer_id = ?`).run(customerId);
-  seedCustomer(customerId);
+  await d.execute(`DELETE FROM kitchen_inventory WHERE customer_id = $1`, [customerId]);
+  await d.execute(`DELETE FROM kitchen_recipes WHERE customer_id = $1`, [customerId]);
+  await d.execute(`DELETE FROM kitchen_orders WHERE customer_id = $1`, [customerId]);
+  await d.execute(`DELETE FROM kitchen_profile WHERE customer_id = $1`, [customerId]);
+  await seedCustomer(customerId);
 }
 
-export function getKitchen(customerId: string): HotelKitchen | null {
-  ensureSeeded(customerId);
+export async function getKitchen(customerId: string): Promise<HotelKitchen | null> {
+  await ensureSeeded(customerId);
   const d = db();
-  const profile = d
-    .prepare(`SELECT hotel_name FROM kitchen_profile WHERE customer_id = ?`)
-    .get(customerId) as { hotel_name: string } | undefined;
+  const profile = await d.queryOne<{ hotel_name: string }>(
+    `SELECT hotel_name FROM kitchen_profile WHERE customer_id = $1`,
+    [customerId],
+  );
   if (!profile) return null;
   const parse = <T,>(rows: Array<{ json: string }>) =>
     rows.map((r) => JSON.parse(r.json) as T);
   const inventory = parse<IngredientStock>(
-    d.prepare(`SELECT json FROM kitchen_inventory WHERE customer_id = ? ORDER BY rowid`).all(customerId) as Array<{ json: string }>,
+    await d.query<{ json: string }>(
+      `SELECT json FROM kitchen_inventory WHERE customer_id = $1 ORDER BY seq`,
+      [customerId],
+    ),
   );
   const recipes = parse<Recipe>(
-    d.prepare(`SELECT json FROM kitchen_recipes WHERE customer_id = ? ORDER BY rowid`).all(customerId) as Array<{ json: string }>,
+    await d.query<{ json: string }>(
+      `SELECT json FROM kitchen_recipes WHERE customer_id = $1 ORDER BY seq`,
+      [customerId],
+    ),
   );
   const orderHistory = parse<PastOrder>(
-    d.prepare(`SELECT json FROM kitchen_orders WHERE customer_id = ? ORDER BY ordered_at DESC, rowid DESC`).all(customerId) as Array<{ json: string }>,
+    await d.query<{ json: string }>(
+      `SELECT json FROM kitchen_orders WHERE customer_id = $1 ORDER BY ordered_at DESC, seq DESC`,
+      [customerId],
+    ),
   );
   return { customerId, hotelName: profile.hotel_name, inventory, recipes, orderHistory };
 }
 
-export function getInventory(customerId: string) {
-  const k = getKitchen(customerId);
+export async function getInventory(customerId: string) {
+  const k = await getKitchen(customerId);
   if (!k) return null;
   const inbound = inboundByIngredient(k.orderHistory);
-  const recs = new Map((recommendRestock(customerId)?.recommendations ?? []).map((r) => [r.ingredientId, r]));
+  const recs = new Map(((await recommendRestock(customerId))?.recommendations ?? []).map((r) => [r.ingredientId, r]));
   const inventory = k.inventory.map((i) => {
     const r = recs.get(i.ingredientId);
     return {
@@ -523,14 +516,14 @@ export function getInventory(customerId: string) {
   };
 }
 
-export function getRecipes(customerId: string) {
-  const k = getKitchen(customerId);
+export async function getRecipes(customerId: string) {
+  const k = await getKitchen(customerId);
   if (!k) return null;
   return { hotelName: k.hotelName, recipes: k.recipes };
 }
 
-export function getOrderHistory(customerId: string) {
-  const k = getKitchen(customerId);
+export async function getOrderHistory(customerId: string) {
+  const k = await getKitchen(customerId);
   if (!k) return null;
   return { hotelName: k.hotelName, orders: k.orderHistory };
 }
@@ -618,55 +611,56 @@ export function normalizeRecipe(
   };
 }
 
-export function upsertInventory(customerId: string, items: Array<Record<string, unknown>>) {
-  ensureSeeded(customerId);
-  const ins = db().prepare(
-    `INSERT INTO kitchen_inventory (customer_id, ingredient_id, json) VALUES (?, ?, ?)
-     ON CONFLICT(customer_id, ingredient_id) DO UPDATE SET json=excluded.json`,
-  );
+export async function upsertInventory(customerId: string, items: Array<Record<string, unknown>>) {
+  await ensureSeeded(customerId);
   const saved = items.map(normalizeIngredient);
-  db().transaction(() => {
-    for (const i of saved) ins.run(customerId, i.ingredientId, JSON.stringify(i));
-  })();
+  await db().withTransaction(async (tx) => {
+    for (const i of saved) {
+      await tx.execute(
+        `INSERT INTO kitchen_inventory (customer_id, ingredient_id, json) VALUES ($1, $2, $3)
+         ON CONFLICT (customer_id, ingredient_id) DO UPDATE SET json = excluded.json`,
+        [customerId, i.ingredientId, JSON.stringify(i)],
+      );
+    }
+  });
   return saved;
 }
 
-export function deleteIngredient(customerId: string, ingredientId: string): boolean {
-  const k = getKitchen(customerId);
+export async function deleteIngredient(customerId: string, ingredientId: string): Promise<boolean> {
+  const k = await getKitchen(customerId);
   const used = k?.recipes.filter((r) => r.ingredients.some((i) => i.ingredientId === ingredientId));
   if (used?.length) {
     throw new Error(`ingredient is used by recipe(s): ${used.map((r) => r.name).join(", ")}`);
   }
-  return (
-    db()
-      .prepare(`DELETE FROM kitchen_inventory WHERE customer_id = ? AND ingredient_id = ?`)
-      .run(customerId, ingredientId).changes > 0
+  const res = await db().execute(
+    `DELETE FROM kitchen_inventory WHERE customer_id = $1 AND ingredient_id = $2`,
+    [customerId, ingredientId],
   );
+  return res.rowCount > 0;
 }
 
-export function upsertRecipe(customerId: string, raw: Record<string, unknown>): Recipe {
-  const k = getKitchen(customerId);
+export async function upsertRecipe(customerId: string, raw: Record<string, unknown>): Promise<Recipe> {
+  const k = await getKitchen(customerId);
   if (!k) throw new Error("no_kitchen_profile");
   const recipe = normalizeRecipe(raw, new Set(k.inventory.map((i) => i.ingredientId)));
-  db()
-    .prepare(
-      `INSERT INTO kitchen_recipes (customer_id, recipe_id, json) VALUES (?, ?, ?)
-       ON CONFLICT(customer_id, recipe_id) DO UPDATE SET json=excluded.json`,
-    )
-    .run(customerId, recipe.recipeId, JSON.stringify(recipe));
+  await db().execute(
+    `INSERT INTO kitchen_recipes (customer_id, recipe_id, json) VALUES ($1, $2, $3)
+     ON CONFLICT (customer_id, recipe_id) DO UPDATE SET json = excluded.json`,
+    [customerId, recipe.recipeId, JSON.stringify(recipe)],
+  );
   return recipe;
 }
 
-export function deleteRecipe(customerId: string, recipeId: string): boolean {
-  return (
-    db()
-      .prepare(`DELETE FROM kitchen_recipes WHERE customer_id = ? AND recipe_id = ?`)
-      .run(customerId, recipeId).changes > 0
+export async function deleteRecipe(customerId: string, recipeId: string): Promise<boolean> {
+  const res = await db().execute(
+    `DELETE FROM kitchen_recipes WHERE customer_id = $1 AND recipe_id = $2`,
+    [customerId, recipeId],
   );
+  return res.rowCount > 0;
 }
 
 /** Bulk import (e.g. from the hotel's PMS / recipe system or a spreadsheet exported to JSON). */
-export function importKitchen(
+export async function importKitchen(
   customerId: string,
   body: {
     inventory?: Array<Record<string, unknown>>;
@@ -674,30 +668,31 @@ export function importKitchen(
     replace?: boolean;
   },
 ) {
-  ensureSeeded(customerId);
+  await ensureSeeded(customerId);
   const d = db();
-  d.transaction(() => {
+  await d.withTransaction(async (tx) => {
     if (body.replace) {
-      if (body.inventory) d.prepare(`DELETE FROM kitchen_inventory WHERE customer_id = ?`).run(customerId);
-      if (body.recipes) d.prepare(`DELETE FROM kitchen_recipes WHERE customer_id = ?`).run(customerId);
+      if (body.inventory) await tx.execute(`DELETE FROM kitchen_inventory WHERE customer_id = $1`, [customerId]);
+      if (body.recipes) await tx.execute(`DELETE FROM kitchen_recipes WHERE customer_id = $1`, [customerId]);
     }
-    if (body.inventory) upsertInventory(customerId, body.inventory);
-    for (const r of body.recipes ?? []) upsertRecipe(customerId, r);
-  })();
-  const k = getKitchen(customerId)!;
+    if (body.inventory) await upsertInventory(customerId, body.inventory);
+    for (const r of body.recipes ?? []) await upsertRecipe(customerId, r);
+  });
+  const k = (await getKitchen(customerId))!;
   return { inventory: k.inventory.length, recipes: k.recipes.length };
 }
 
 // ───────────────────────── stock movements ─────────────────────────
 
-function saveInventoryItem(customerId: string, item: IngredientStock) {
-  db()
-    .prepare(`UPDATE kitchen_inventory SET json = ? WHERE customer_id = ? AND ingredient_id = ?`)
-    .run(JSON.stringify(item), customerId, item.ingredientId);
+async function saveInventoryItem(customerId: string, item: IngredientStock) {
+  await db().execute(
+    `UPDATE kitchen_inventory SET json = $1 WHERE customer_id = $2 AND ingredient_id = $3`,
+    [JSON.stringify(item), customerId, item.ingredientId],
+  );
 }
 
 /** Record a committed Valio order as inbound stock (linked to its ingredient when known). */
-export function recordCommittedOrder(
+export async function recordCommittedOrder(
   customerId: string,
   order: {
     orderId: string;
@@ -716,8 +711,8 @@ export function recordCommittedOrder(
     }>;
   },
 ) {
-  ensureSeeded(customerId);
-  const k = getKitchen(customerId);
+  await ensureSeeded(customerId);
+  const k = await getKitchen(customerId);
   const resolvedLines =
     order.lines && order.lines.length > 0
       ? order.lines.map((l) => ({
@@ -746,12 +741,12 @@ export function recordCommittedOrder(
     intentId: order.intentId,
     lines: resolvedLines,
   };
-  db()
-    .prepare(
-      `INSERT OR IGNORE INTO kitchen_orders (order_id, customer_id, ordered_at, status, intent_id, json)
-       VALUES (?, ?, ?, 'committed', ?, ?)`,
-    )
-    .run(order.orderId, customerId, entry.orderedAt, order.intentId, JSON.stringify(entry));
+  await db().execute(
+    `INSERT INTO kitchen_orders (order_id, customer_id, ordered_at, status, intent_id, json)
+     VALUES ($1, $2, $3, 'committed', $4, $5)
+     ON CONFLICT DO NOTHING`,
+    [order.orderId, customerId, entry.orderedAt, order.intentId, JSON.stringify(entry)],
+  );
 }
 
 function inboundByIngredient(orders: PastOrder[]): Map<string, number> {
@@ -766,18 +761,18 @@ function inboundByIngredient(orders: PastOrder[]): Map<string, number> {
 }
 
 /** Mark a committed order delivered and add its quantities to on-hand stock. */
-export function receiveDelivery(
+export async function receiveDelivery(
   customerId: string,
   orderId: string,
   received?: Record<string, number>,
 ) {
-  const k = getKitchen(customerId);
+  const k = await getKitchen(customerId);
   if (!k) throw new Error("no_kitchen_profile");
   const order = k.orderHistory.find((o) => o.orderId === orderId);
   if (!order) throw new Error("order_not_found");
   if (order.status === "delivered") throw new Error("order_already_received");
   const applied: Array<{ ingredientId: string; added: number }> = [];
-  db().transaction(() => {
+  await db().withTransaction(async (tx) => {
     for (const line of order.lines) {
       if (!line.ingredientId) continue;
       const item = k.inventory.find((i) => i.ingredientId === line.ingredientId);
@@ -787,24 +782,25 @@ export function receiveDelivery(
       item.onHand = Math.round((item.onHand + qty) * 100) / 100;
       // The nearest expiry stays the old batch's; a delivery into an empty shelf sets a fresh date.
       if (item.shelfLifeDays && (!hadStock || !item.expiresOn)) item.expiresOn = daysFromNow(item.shelfLifeDays);
-      saveInventoryItem(customerId, item);
+      await saveInventoryItem(customerId, item);
       applied.push({ ingredientId: item.ingredientId, added: qty });
     }
     order.status = "delivered";
     order.deliveredAt = new Date().toISOString();
-    db()
-      .prepare(`UPDATE kitchen_orders SET status = 'delivered', json = ? WHERE order_id = ?`)
-      .run(JSON.stringify(order), orderId);
-  })();
+    await tx.execute(`UPDATE kitchen_orders SET status = 'delivered', json = $1 WHERE order_id = $2`, [
+      JSON.stringify(order),
+      orderId,
+    ]);
+  });
   return { orderId, applied };
 }
 
 /** Manual stock correction (stock-take) or recipe usage (cook N batches). */
-export function adjustStock(
+export async function adjustStock(
   customerId: string,
   change: { ingredientId: string; onHand?: number; delta?: number; expiresOn?: string; shelfLifeDays?: number },
 ) {
-  const k = getKitchen(customerId);
+  const k = await getKitchen(customerId);
   const item = k?.inventory.find((i) => i.ingredientId === change.ingredientId);
   if (!item) throw new Error("unknown_ingredient");
   if (change.expiresOn !== undefined) item.expiresOn = dateOrUndef(change.expiresOn, "expiresOn");
@@ -813,27 +809,27 @@ export function adjustStock(
   const delta = change.delta !== undefined ? num(change.delta, "delta", -1_000_000) : undefined;
   const next = onHand ?? item.onHand + (delta ?? 0);
   item.onHand = Math.max(0, Math.round(next * 100) / 100);
-  saveInventoryItem(customerId, item);
+  await saveInventoryItem(customerId, item);
   return item;
 }
 
-export function recordUsage(customerId: string, recipeId: string, batches: number) {
+export async function recordUsage(customerId: string, recipeId: string, batches: number) {
   const b = num(batches, "batches", 0.01);
-  const k = getKitchen(customerId);
+  const k = await getKitchen(customerId);
   const recipe = k?.recipes.find((r) => r.recipeId === recipeId);
   if (!k || !recipe) throw new Error("unknown_recipe");
   const used: Array<{ ingredientId: string; used: number; onHand: number }> = [];
-  db().transaction(() => {
+  await db().withTransaction(async () => {
     for (const ing of recipe.ingredients) {
       const item = k.inventory.find((i) => i.ingredientId === ing.ingredientId);
       if (!item) continue;
       item.onHand = Math.max(0, Math.round((item.onHand - ing.qtyPerBatch * b) * 100) / 100);
       item.lastUsedAt = daysAgo(0);
       if (item.onHand === 0) item.expiresOn = undefined;
-      saveInventoryItem(customerId, item);
+      await saveInventoryItem(customerId, item);
       used.push({ ingredientId: item.ingredientId, used: ing.qtyPerBatch * b, onHand: item.onHand });
     }
-  })();
+  });
   return { recipeId, batches: b, used };
 }
 
@@ -906,15 +902,15 @@ export function classifyStock(onHand: number, onOrder: number, parLevel: number,
   return { urgency, targetQty: Math.round(targetQty * 10) / 10, effective };
 }
 
-export function recommendRestock(
+export async function recommendRestock(
   customerId: string,
   options?: { daysCover?: number },
-): {
+): Promise<{
   hotelName: string;
   recommendations: RestockRecommendation[];
   summary: string;
-} | null {
-  const k = getKitchen(customerId);
+} | null> {
+  const k = await getKitchen(customerId);
   if (!k) return null;
   const daysCover = options?.daysCover ?? 7;
   const weekFraction = daysCover / 7;

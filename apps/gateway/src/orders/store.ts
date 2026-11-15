@@ -1,14 +1,22 @@
 import { randomUUID } from "node:crypto";
-import type { BasketLine, Mandate, Need, PolicyVerdict } from "@tta/shared";
-import { getDb, appendAudit } from "../audit/chain.js";
+import type {
+  BasketLine,
+  DetachedBuyerSignatureInput,
+  Mandate,
+  Need,
+  Offer,
+  PolicyVerdict,
+  TradeReceipt,
+} from "@tta/shared";
+import { getDb, appendAudit, verifyAuditChain } from "../audit/chain.js";
+import { getTradeReceipt, issueTradeReceipt, saveTradeReceipt } from "../claims/receipt.js";
 import { snapshotHash } from "../claims/sign.js";
 import { evaluatePolicy, offerToBasketLine } from "../policy/engine.js";
 import { computeSpend } from "../policy/spend.js";
 import { buildOffers, buildOffersBatch } from "../catalog/offers.js";
 import { getAvailability, getPrices } from "../valio/client.js";
-import type { Offer } from "@tta/shared";
 import { recordCommittedOrder } from "../hotel/kitchen.js";
-import { withAgent } from "../agents/context.js";
+import { currentAgent, withAgent } from "../agents/context.js";
 import { getMandate } from "../auth/customers.js";
 import { verifyHumanSignature, type HumanSignatureProof } from "../auth/humanProof.js";
 import { getQuote, markQuoteUsed } from "./quotes.js";
@@ -75,6 +83,9 @@ export type IntentMeta = {
   quoteValidUntil?: string;
   /** Cryptographic proof attached when buyer signs an override with Passkey / ECDSA P-256. */
   humanSignatureProof?: HumanSignatureProof;
+  humanSignatureRaw?: Record<string, unknown>;
+  receiptId?: string;
+  receiptHash?: string;
   /** Pre-authorized backup SKU for autonomous stock-out cascade at commit time. */
   authorizedFallback?: AuthorizedFallback;
   /** Recorded when the primary SKU stocked out at commit and cascaded to `authorizedFallback`. */
@@ -107,27 +118,25 @@ function rowToIntent(row: Record<string, unknown>): OrderIntent {
   };
 }
 
-function saveIntent(intent: OrderIntent) {
-  getDb()
-    .prepare(
-      `INSERT INTO order_intents (
-        id, customer_id, run_id, status, need_json, basket_json, snapshot_hash,
-        policy_json, total_price, needed_by, expires_at, approval_snapshot_hash,
-        idempotency_key, committed_order_id, created_at, updated_at, meta_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        status=excluded.status,
-        basket_json=excluded.basket_json,
-        snapshot_hash=excluded.snapshot_hash,
-        policy_json=excluded.policy_json,
-        total_price=excluded.total_price,
-        approval_snapshot_hash=excluded.approval_snapshot_hash,
-        idempotency_key=excluded.idempotency_key,
-        committed_order_id=excluded.committed_order_id,
-        updated_at=excluded.updated_at,
-        meta_json=COALESCE(excluded.meta_json, order_intents.meta_json)`,
-    )
-    .run(
+async function saveIntent(intent: OrderIntent): Promise<void> {
+  await getDb().execute(
+    `INSERT INTO order_intents (
+      id, customer_id, run_id, status, need_json, basket_json, snapshot_hash,
+      policy_json, total_price, needed_by, expires_at, approval_snapshot_hash,
+      idempotency_key, committed_order_id, created_at, updated_at, meta_json
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+    ON CONFLICT (id) DO UPDATE SET
+      status = excluded.status,
+      basket_json = excluded.basket_json,
+      snapshot_hash = excluded.snapshot_hash,
+      policy_json = excluded.policy_json,
+      total_price = excluded.total_price,
+      approval_snapshot_hash = excluded.approval_snapshot_hash,
+      idempotency_key = excluded.idempotency_key,
+      committed_order_id = excluded.committed_order_id,
+      updated_at = excluded.updated_at,
+      meta_json = COALESCE(excluded.meta_json, order_intents.meta_json)`,
+    [
       intent.id,
       intent.customerId,
       intent.runId,
@@ -145,68 +154,67 @@ function saveIntent(intent: OrderIntent) {
       intent.createdAt,
       intent.updatedAt,
       intent.meta ? JSON.stringify(intent.meta) : null,
-    );
+    ],
+  );
 }
 
-export function getIntent(id: string, customerId: string): OrderIntent | null {
-  const row = getDb()
-    .prepare(`SELECT * FROM order_intents WHERE id = ? AND customer_id = ?`)
-    .get(id, customerId) as Record<string, unknown> | undefined;
+export async function getIntent(id: string, customerId: string): Promise<OrderIntent | null> {
+  const row = await getDb().queryOne<Record<string, unknown>>(
+    `SELECT * FROM order_intents WHERE id = $1 AND customer_id = $2`,
+    [id, customerId],
+  );
   return row ? rowToIntent(row) : null;
 }
 
 /** Intents past their expiry can never be committed — close them so queues stay honest. */
-export function expireStaleIntents(customerId: string): number {
+export async function expireStaleIntents(customerId: string): Promise<number> {
   const now = new Date().toISOString();
-  const rows = getDb()
-    .prepare(
-      `SELECT id, run_id FROM order_intents
-       WHERE customer_id = ? AND expires_at < ?
-         AND status IN ('pending_approval','auto_eligible','approved','intent_created')`,
-    )
-    .all(customerId, now) as Array<{ id: string; run_id: string }>;
+  const rows = await getDb().query<{ id: string; run_id: string }>(
+    `SELECT id, run_id FROM order_intents
+     WHERE customer_id = $1 AND expires_at < $2
+       AND status IN ('pending_approval','auto_eligible','approved','intent_created')`,
+    [customerId, now],
+  );
   for (const r of rows) {
-    getDb()
-      .prepare(`UPDATE order_intents SET status = 'expired', updated_at = ? WHERE id = ?`)
-      .run(now, r.id);
-    appendAudit(r.run_id, customerId, "intent_expired", { intentId: r.id });
+    await getDb().execute(
+      `UPDATE order_intents SET status = 'expired', updated_at = $1 WHERE id = $2`,
+      [now, r.id],
+    );
+    await appendAudit(r.run_id, customerId, "intent_expired", { intentId: r.id });
   }
   return rows.length;
 }
 
-export function listPending(customerId: string): OrderIntent[] {
-  expireStaleIntents(customerId);
-  const rows = getDb()
-    .prepare(
-      `SELECT * FROM order_intents WHERE customer_id = ? AND status = 'pending_approval' ORDER BY created_at DESC`,
-    )
-    .all(customerId) as Array<Record<string, unknown>>;
+export async function listPending(customerId: string): Promise<OrderIntent[]> {
+  await expireStaleIntents(customerId);
+  const rows = await getDb().query<Record<string, unknown>>(
+    `SELECT * FROM order_intents WHERE customer_id = $1 AND status = 'pending_approval' ORDER BY created_at DESC`,
+    [customerId],
+  );
   return rows.map(rowToIntent);
 }
 
-export function listOrders(customerId: string): OrderIntent[] {
-  expireStaleIntents(customerId);
-  const rows = getDb()
-    .prepare(
-      `SELECT * FROM order_intents WHERE customer_id = ? ORDER BY created_at DESC LIMIT 100`,
-    )
-    .all(customerId) as Array<Record<string, unknown>>;
+export async function listOrders(customerId: string): Promise<OrderIntent[]> {
+  await expireStaleIntents(customerId);
+  const rows = await getDb().query<Record<string, unknown>>(
+    `SELECT * FROM order_intents WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 100`,
+    [customerId],
+  );
   return rows.map(rowToIntent);
 }
 
-function findOpenDuplicate(
+async function findOpenDuplicate(
   customerId: string,
   need: Need,
   productId: string,
-): OrderIntent | null {
-  const rows = getDb()
-    .prepare(
-      `SELECT * FROM order_intents
-       WHERE customer_id = ? AND needed_by = ? AND expires_at > ?
-         AND status IN ('pending_approval','auto_eligible','approved')
-       ORDER BY created_at DESC`,
-    )
-    .all(customerId, need.neededBy, new Date().toISOString()) as Array<Record<string, unknown>>;
+): Promise<OrderIntent | null> {
+  const rows = await getDb().query<Record<string, unknown>>(
+    `SELECT * FROM order_intents
+     WHERE customer_id = $1 AND needed_by = $2 AND expires_at > $3
+       AND status IN ('pending_approval','auto_eligible','approved')
+     ORDER BY created_at DESC`,
+    [customerId, need.neededBy, new Date().toISOString()],
+  );
   for (const row of rows) {
     const i = rowToIntent(row);
     if (
@@ -221,13 +229,13 @@ function findOpenDuplicate(
 }
 
 /** Demo helper: clear a customer's intents (audit chain is kept — append-only). */
-export function resetIntents(customerId: string, source: string | null = null): number {
-  const ids = (getDb().prepare(`SELECT id FROM order_intents WHERE customer_id = ?`).all(customerId) as Array<{ id: string }>).map((r) => r.id);
-  const res = getDb()
-    .prepare(`DELETE FROM order_intents WHERE customer_id = ?`)
-    .run(customerId);
-  appendAudit(randomUUID(), customerId, "demo_reset", { removedIntents: res.changes, intentIds: ids.slice(0, 200), source });
-  return res.changes;
+export async function resetIntents(customerId: string, source: string | null = null): Promise<number> {
+  const ids = (
+    await getDb().query<{ id: string }>(`SELECT id FROM order_intents WHERE customer_id = $1`, [customerId])
+  ).map((r) => r.id);
+  const res = await getDb().execute(`DELETE FROM order_intents WHERE customer_id = $1`, [customerId]);
+  await appendAudit(randomUUID(), customerId, "demo_reset", { removedIntents: res.rowCount, intentIds: ids.slice(0, 200), source });
+  return res.rowCount;
 }
 
 function buildMeta(selected: Offer, offers: Offer[], need: Need): IntentMeta {
@@ -316,7 +324,7 @@ async function createOrderIntentImpl(params: CreateIntentParams): Promise<{
     throw new Error("Need or items required to create order intent");
   }
   const resolvedParams = { ...params, need: singleNeed, offerProductId: singleOfferProductId };
-  appendAudit(runId, resolvedParams.customerId, "need_validated", resolvedParams.need);
+  await appendAudit(runId, resolvedParams.customerId, "need_validated", resolvedParams.need);
 
   // Comparing offers is the Sourcing agent's job; the Procurement agent only decides what to do with the result.
   const offers = await withAgent("sourcing", async () => {
@@ -324,7 +332,7 @@ async function createOrderIntentImpl(params: CreateIntentParams): Promise<{
       includeSubstitutions: resolvedParams.includeSubstitutions ?? true,
       mandate: resolvedParams.mandate,
     });
-    appendAudit(runId, resolvedParams.customerId, "offers_built", {
+    await appendAudit(runId, resolvedParams.customerId, "offers_built", {
       count: found.length,
       top: found.slice(0, 5).map((o) => ({
         productId: o.productId,
@@ -350,9 +358,9 @@ async function createOrderIntentImpl(params: CreateIntentParams): Promise<{
   }
 
   // Idempotency: an identical open intent (same product, qty, date) is reused, not duplicated.
-  const open = findOpenDuplicate(resolvedParams.customerId, resolvedParams.need, selected.productId);
+  const open = await findOpenDuplicate(resolvedParams.customerId, resolvedParams.need, selected.productId);
   if (open) {
-    appendAudit(runId, resolvedParams.customerId, "intent_deduplicated", {
+    await appendAudit(runId, resolvedParams.customerId, "intent_deduplicated", {
       reusedIntentId: open.id,
       productId: selected.productId,
     });
@@ -377,24 +385,29 @@ async function createOrderIntentImpl(params: CreateIntentParams): Promise<{
 
   // A newer proposal for the very same need replaces older unapproved ones (no stacked duplicates).
   // Supersede before computeSpend so a replaced auto_eligible intent is never double-counted.
-  const replaced = getDb()
-    .prepare(
-      `SELECT id, run_id FROM order_intents
-       WHERE customer_id = ? AND needed_by = ? AND status IN ('pending_approval', 'auto_eligible')
-        AND json_extract(need_json,'$.productIntent') = ?
-        AND json_extract(need_json,'$.quantity') = ?
-        AND json_extract(need_json,'$.unit') = ?`,
-    )
-    .all(resolvedParams.customerId, resolvedParams.need.neededBy, resolvedParams.need.productIntent, resolvedParams.need.quantity, resolvedParams.need.unit) as Array<{ id: string; run_id: string }>;
+  const replaced = await getDb().query<{ id: string; run_id: string }>(
+    `SELECT id, run_id FROM order_intents
+     WHERE customer_id = $1 AND needed_by = $2 AND status IN ('pending_approval', 'auto_eligible')
+       AND (need_json::jsonb)->>'productIntent' = $3
+       AND ((need_json::jsonb)->>'quantity')::double precision = $4
+       AND (need_json::jsonb)->>'unit' = $5`,
+    [
+      resolvedParams.customerId,
+      resolvedParams.need.neededBy,
+      resolvedParams.need.productIntent,
+      resolvedParams.need.quantity,
+      resolvedParams.need.unit,
+    ],
+  );
   for (const r of replaced) {
-    getDb().prepare(`UPDATE order_intents SET status='superseded', updated_at=? WHERE id=?`).run(now, r.id);
-    appendAudit(r.run_id, resolvedParams.customerId, "intent_superseded", { intentId: r.id, by: intentId });
+    await getDb().execute(`UPDATE order_intents SET status = 'superseded', updated_at = $1 WHERE id = $2`, [now, r.id]);
+    await appendAudit(r.run_id, resolvedParams.customerId, "intent_superseded", { intentId: r.id, by: intentId });
   }
 
   const policy = evaluatePolicy(resolvedParams.mandate, resolvedParams.need, basket, {
     isSubstitution: selected.isSubstitution,
     partialFulfil: !selected.canFulfil,
-    spend: computeSpend(resolvedParams.customerId),
+    spend: await computeSpend(resolvedParams.customerId),
   });
 
   let status = "intent_created";
@@ -423,8 +436,8 @@ async function createOrderIntentImpl(params: CreateIntentParams): Promise<{
     meta,
   };
 
-  saveIntent(intent);
-  appendAudit(runId, resolvedParams.customerId, "intent_created", {
+  await saveIntent(intent);
+  await appendAudit(runId, resolvedParams.customerId, "intent_created", {
     intentId: intent.id,
     snapshotHash: hash,
     productId: selected.productId,
@@ -433,7 +446,7 @@ async function createOrderIntentImpl(params: CreateIntentParams): Promise<{
     why: meta.rationale.slice(0, 3),
     alternatives: meta.alternatives.length,
   });
-  appendAudit(runId, resolvedParams.customerId, "policy_evaluated", policy);
+  await appendAudit(runId, resolvedParams.customerId, "policy_evaluated", policy);
 
   const explanation = [
     `Selected ${selected.productName}.`,
@@ -455,7 +468,7 @@ async function createMultiItemIntentImpl(
 }> {
   const { customerId, mandate, runId } = params;
   const itemNeeds = items.map((it) => it.need);
-  appendAudit(runId, customerId, "need_validated", {
+  await appendAudit(runId, customerId, "need_validated", {
     isMultiItem: true,
     itemCount: itemNeeds.length,
     needs: itemNeeds,
@@ -470,7 +483,7 @@ async function createMultiItemIntentImpl(
       includeSubstitutions: params.includeSubstitutions ?? true,
       mandate,
     });
-    appendAudit(runId, customerId, "offers_built", {
+    await appendAudit(runId, customerId, "offers_built", {
       isMultiItem: true,
       count: res.items.reduce((s, it) => s + it.offers.length, 0),
       perItemCounts: res.items.map((it) => ({
@@ -535,7 +548,7 @@ async function createMultiItemIntentImpl(
   const policy = evaluatePolicy(mandate, summaryNeed, basket, {
     isSubstitution: selectedOffers.some((o) => o.isSubstitution),
     partialFulfil: selectedOffers.some((o) => !o.canFulfil),
-    spend: computeSpend(customerId),
+    spend: await computeSpend(customerId),
     lineNeeds: itemNeeds,
   });
 
@@ -565,8 +578,8 @@ async function createMultiItemIntentImpl(
     meta,
   };
 
-  saveIntent(intent);
-  appendAudit(runId, customerId, "intent_created", {
+  await saveIntent(intent);
+  await appendAudit(runId, customerId, "intent_created", {
     intentId: intent.id,
     snapshotHash: hash,
     isMultiItemBasket: true,
@@ -577,7 +590,7 @@ async function createMultiItemIntentImpl(
     why: rationale,
     alternatives: 0,
   });
-  appendAudit(runId, customerId, "policy_evaluated", policy);
+  await appendAudit(runId, customerId, "policy_evaluated", policy);
 
   const explanation = [
     `Prepared ${basket.length}-item basket (${basket.map((b) => `${b.packs}× ${b.productName}`).join(" + ")}).`,
@@ -590,9 +603,9 @@ async function createMultiItemIntentImpl(
 }
 
 /** Quote -> intent: lines and prices come from the quote (no re-pricing). The quote is consumed atomically. */
-function createIntentFromQuote(params: CreateIntentParams, quoteId: string) {
+async function createIntentFromQuote(params: CreateIntentParams, quoteId: string) {
   const customerId = params.customerId;
-  const quote = getQuote(quoteId, customerId); // scoped by owner: another customer's quote looks like "not found"
+  const quote = await getQuote(quoteId, customerId); // scoped by owner: another customer's quote looks like "not found"
   if (!quote) throw new Error("quote_not_found: no such quote for this customer");
   if (quote.status === "used") throw new Error(`quote_already_used: quote ${quoteId} was already turned into an order intent`);
   if (quote.status !== "open") throw new Error(`quote_${quote.status}: quote ${quoteId} can no longer be used; request a new quote`);
@@ -629,14 +642,14 @@ function createIntentFromQuote(params: CreateIntentParams, quoteId: string) {
       quoteValidUntil: quote.validUntil,
     };
     const db = getDb();
-    const commitMultiQuote = db.transaction(() => {
-      if (!markQuoteUsed(quoteId, customerId, intentId)) {
+    const { intent, policy } = await db.withTransaction(async () => {
+      if (!(await markQuoteUsed(quoteId, customerId, intentId))) {
         throw new Error(`quote_expired: quote ${quoteId} is no longer open (used or past its firm window)`);
       }
       const policy = evaluatePolicy(params.mandate, need, basket, {
         isSubstitution: basket.some((l) => l.isSubstitution),
         partialFulfil: partial,
-        spend: computeSpend(customerId),
+        spend: await computeSpend(customerId),
         lineNeeds: itemNeeds,
       });
       const status =
@@ -664,12 +677,11 @@ function createIntentFromQuote(params: CreateIntentParams, quoteId: string) {
         updatedAt: now,
         meta,
       };
-      saveIntent(intent);
+      await saveIntent(intent);
       return { intent, policy };
     });
-    const { intent, policy } = commitMultiQuote();
 
-    appendAudit(runId, customerId, "quote_accepted", {
+    await appendAudit(runId, customerId, "quote_accepted", {
       quoteId,
       intentId,
       isMultiItemBasket: true,
@@ -678,7 +690,7 @@ function createIntentFromQuote(params: CreateIntentParams, quoteId: string) {
       totalPrice,
       validUntil: quote.validUntil,
     });
-    appendAudit(runId, customerId, "intent_created", {
+    await appendAudit(runId, customerId, "intent_created", {
       intentId,
       snapshotHash: hash,
       isMultiItemBasket: true,
@@ -690,12 +702,12 @@ function createIntentFromQuote(params: CreateIntentParams, quoteId: string) {
       why: meta.rationale,
       alternatives: 0,
     });
-    appendAudit(runId, customerId, "policy_evaluated", policy);
-    return Promise.resolve({
+    await appendAudit(runId, customerId, "policy_evaluated", policy);
+    return {
       intent,
       offers: [] as Offer[],
       explanation: `Used firm multi-item quote ${quoteId}: ${basket.length} items (${basket.map((b) => b.productName).join(" + ")}), total €${totalPrice.toFixed(2)} (price fixed until ${quote.validUntil}). Policy: ${policy.decision}. ${policy.reasons.join(" ")}`.trim(),
-    });
+    };
   }
 
   const chosen = params.offerProductId ? quote.lines.find((l) => l.productId === params.offerProductId) : quote.lines.find((l) => (l.availableQuantity ?? Infinity) >= l.packs) ?? quote.lines[0];
@@ -760,25 +772,26 @@ function createIntentFromQuote(params: CreateIntentParams, quoteId: string) {
     quoteValidUntil: quote.validUntil,
   };
   const db = getDb();
-  const commitQuoteToIntent = db.transaction(() => {
-    if (!markQuoteUsed(quoteId, customerId, intentId)) {
+  const { intent, policy } = await db.withTransaction(async (tx) => {
+    if (!(await markQuoteUsed(quoteId, customerId, intentId))) {
       throw new Error(`quote_expired: quote ${quoteId} is no longer open (used or past its firm window)`);
     }
-    const replaced = db
-      .prepare(
-        `SELECT id, run_id FROM order_intents
-         WHERE customer_id = ? AND needed_by = ? AND status IN ('pending_approval', 'auto_eligible')
-           AND json_extract(need_json,'$.productIntent') = ? AND json_extract(need_json,'$.quantity') = ? AND json_extract(need_json,'$.unit') = ?`,
-      )
-      .all(customerId, need.neededBy, need.productIntent, need.quantity, need.unit) as Array<{ id: string; run_id: string }>;
+    const replaced = await tx.query<{ id: string; run_id: string }>(
+      `SELECT id, run_id FROM order_intents
+       WHERE customer_id = $1 AND needed_by = $2 AND status IN ('pending_approval', 'auto_eligible')
+         AND (need_json::jsonb)->>'productIntent' = $3
+         AND ((need_json::jsonb)->>'quantity')::double precision = $4
+         AND (need_json::jsonb)->>'unit' = $5`,
+      [customerId, need.neededBy, need.productIntent, need.quantity, need.unit],
+    );
     for (const r of replaced) {
-      db.prepare(`UPDATE order_intents SET status='superseded', updated_at=? WHERE id=?`).run(now, r.id);
-      appendAudit(r.run_id, customerId, "intent_superseded", { intentId: r.id, by: intentId });
+      await tx.execute(`UPDATE order_intents SET status = 'superseded', updated_at = $1 WHERE id = $2`, [now, r.id]);
+      await appendAudit(r.run_id, customerId, "intent_superseded", { intentId: r.id, by: intentId });
     }
     const policy = evaluatePolicy(params.mandate, need, basket, {
       isSubstitution: chosen.isSubstitution,
       partialFulfil: partial,
-      spend: computeSpend(customerId),
+      spend: await computeSpend(customerId),
     });
     const status = policy.decision === "auto_commit" ? "auto_eligible" : policy.decision === "pending_approval" ? "pending_approval" : "blocked";
     const intent: OrderIntent = {
@@ -787,22 +800,21 @@ function createIntentFromQuote(params: CreateIntentParams, quoteId: string) {
       expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
       approvalSnapshotHash: null, idempotencyKey: null, committedOrderId: null, createdAt: now, updatedAt: now, meta,
     };
-    saveIntent(intent);
+    await saveIntent(intent);
     return { intent, policy };
   });
-  const { intent, policy } = commitQuoteToIntent();
 
-  appendAudit(runId, customerId, "quote_accepted", { quoteId, intentId, productId: chosen.productId, totalPrice: chosen.totalPrice, validUntil: quote.validUntil });
-  appendAudit(runId, customerId, "intent_created", { intentId, snapshotHash: hash, productId: chosen.productId, productName: chosen.productName, totalPrice: chosen.totalPrice, quoteId, why: meta.rationale, alternatives: meta.alternatives.length });
-  appendAudit(runId, customerId, "policy_evaluated", policy);
-  return Promise.resolve({
+  await appendAudit(runId, customerId, "quote_accepted", { quoteId, intentId, productId: chosen.productId, totalPrice: chosen.totalPrice, validUntil: quote.validUntil });
+  await appendAudit(runId, customerId, "intent_created", { intentId, snapshotHash: hash, productId: chosen.productId, productName: chosen.productName, totalPrice: chosen.totalPrice, quoteId, why: meta.rationale, alternatives: meta.alternatives.length });
+  await appendAudit(runId, customerId, "policy_evaluated", policy);
+  return {
     intent,
     offers: [] as Offer[],
     explanation: `Used firm quote ${quoteId}: ${chosen.productName}, total €${chosen.totalPrice.toFixed(2)} (price fixed until ${quote.validUntil}). Policy: ${policy.decision}. ${policy.reasons.join(" ")}`.trim(),
-  });
+  };
 }
 
-export function approveOrder(
+export async function approveOrder(
   intentId: string,
   customerId: string,
   snapshotHash: string,
@@ -812,8 +824,8 @@ export function approveOrder(
     humanSignature?: unknown;
     authorizedFallback?: AuthorizedFallback;
   },
-): OrderIntent {
-  const intent = getIntent(intentId, customerId);
+): Promise<OrderIntent> {
+  const intent = await getIntent(intentId, customerId);
   if (!intent) throw new Error("Intent not found");
   if (intent.status !== "pending_approval" && intent.status !== "auto_eligible") {
     throw new Error(`Cannot approve from status ${intent.status}`);
@@ -821,15 +833,15 @@ export function approveOrder(
   if (new Date(intent.expiresAt).getTime() < Date.now()) {
     intent.status = "expired";
     intent.updatedAt = new Date().toISOString();
-    saveIntent(intent);
-    appendAudit(intent.runId, customerId, "intent_expired", { intentId: intent.id });
+    await saveIntent(intent);
+    await appendAudit(intent.runId, customerId, "intent_expired", { intentId: intent.id });
     throw new Error("intent_expired: Order intent has expired");
   }
   if (snapshotHash !== intent.snapshotHash) {
     intent.status = "stale_invalidated";
     intent.updatedAt = new Date().toISOString();
-    saveIntent(intent);
-    appendAudit(intent.runId, customerId, "approval_rejected_snapshot_mismatch", {
+    await saveIntent(intent);
+    await appendAudit(intent.runId, customerId, "approval_rejected_snapshot_mismatch", {
       expected: intent.snapshotHash,
       got: snapshotHash,
     });
@@ -842,7 +854,7 @@ export function approveOrder(
 
   if (needsOverride) {
     if (!options?.authorizeMandateOverride) {
-      appendAudit(intent.runId, customerId, "approval_blocked_no_override", {
+      await appendAudit(intent.runId, customerId, "approval_blocked_no_override", {
         intentId,
         failingRules: failing,
       });
@@ -853,7 +865,7 @@ export function approveOrder(
     const acked = new Set(options.acknowledgedRules ?? []);
     const missing = failing.filter((r) => !acked.has(r));
     if (missing.length > 0) {
-      appendAudit(intent.runId, customerId, "approval_blocked_incomplete_ack", {
+      await appendAudit(intent.runId, customerId, "approval_blocked_incomplete_ack", {
         intentId,
         missing,
       });
@@ -865,6 +877,10 @@ export function approveOrder(
 
   const humanSignatureProof =
     options?.humanSignature != null ? verifyHumanSignature(intent, options.humanSignature) : undefined;
+  const humanSignatureRaw =
+    humanSignatureProof && typeof options?.humanSignature === "object" && options.humanSignature !== null
+      ? (options.humanSignature as Record<string, unknown>)
+      : undefined;
   const authorizedFallback =
     options?.authorizedFallback && typeof options.authorizedFallback.productId === "string" && options.authorizedFallback.productId.trim()
       ? {
@@ -879,6 +895,7 @@ export function approveOrder(
     intent.meta = {
       ...baseMeta,
       ...(humanSignatureProof ? { humanSignatureProof } : {}),
+      ...(humanSignatureRaw ? { humanSignatureRaw } : {}),
       ...(authorizedFallback ? { authorizedFallback } : {}),
     };
   }
@@ -886,8 +903,8 @@ export function approveOrder(
   intent.status = "approved";
   intent.approvalSnapshotHash = snapshotHash;
   intent.updatedAt = new Date().toISOString();
-  saveIntent(intent);
-  appendAudit(intent.runId, customerId, "human_approved", {
+  await saveIntent(intent);
+  await appendAudit(intent.runId, customerId, "human_approved", {
     intentId,
     snapshotHash,
     mandateOverride: needsOverride,
@@ -899,13 +916,13 @@ export function approveOrder(
   return intent;
 }
 
-export function rejectOrder(
+export async function rejectOrder(
   intentId: string,
   customerId: string,
   snapshotHash: string,
   reason?: string,
-): OrderIntent {
-  const intent = getIntent(intentId, customerId);
+): Promise<OrderIntent> {
+  const intent = await getIntent(intentId, customerId);
   if (!intent) throw new Error("Intent not found");
   if (intent.status === "committed") {
     throw new Error("order_already_committed: Cannot reject a committed order");
@@ -915,8 +932,8 @@ export function rejectOrder(
   }
   intent.status = "rejected";
   intent.updatedAt = new Date().toISOString();
-  saveIntent(intent);
-  appendAudit(intent.runId, customerId, "human_rejected", {
+  await saveIntent(intent);
+  await appendAudit(intent.runId, customerId, "human_rejected", {
     intentId,
     reason: reason ?? null,
   });
@@ -927,15 +944,16 @@ export function commitOrder(params: CommitParams) {
   return withAgent("procurement", () => commitOrderImpl(params));
 }
 
-type CommitParams = {
+export type CommitParams = {
   intentId: string;
   customerId: string;
   idempotencyKey: string;
   priceToleranceEur?: number;
+  buyerSignature?: DetachedBuyerSignatureInput;
 };
 
-// Concurrent commits: one in-flight promise per intent, so a double-submit resolves to a single order.
-const inFlightCommits = new Map<string, { key: string; customerId: string; promise: Promise<OrderIntent> }>();
+// Concurrent commits: one in-flight promise per (customerId, intentId), so a double-submit resolves to a single order.
+const inFlightCommits = new Map<string, { intentId: string; key: string; customerId: string; promise: Promise<OrderIntent> }>();
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -952,85 +970,102 @@ function mandateRevoked(mandate: Mandate): boolean {
 }
 
 function commitOrderImpl(params: CommitParams): Promise<OrderIntent> {
-  // Everything up to the first await runs synchronously, so the check-and-set below cannot interleave.
+  // Synchronously deduplicate concurrent commits BEFORE the first await.
+  const key = params.idempotencyKey;
+  const mapKey = `${params.customerId}:${params.intentId}`;
+
+  const running = inFlightCommits.get(mapKey);
+  if (running) {
+    return running.promise; // join the in-flight commit: still exactly one order
+  }
+  for (const [, r] of inFlightCommits) {
+    if (r.key === key && (r.intentId !== params.intentId || r.customerId !== params.customerId)) {
+      return Promise.reject(
+        new Error(`idempotency_key_conflict: idempotency key "${key}" is in use by a different order intent`),
+      );
+    }
+  }
+
+  const promise = runCommitFlow(params).finally(() => inFlightCommits.delete(mapKey));
+  inFlightCommits.set(mapKey, { intentId: params.intentId, key, customerId: params.customerId, promise });
+  return promise;
+}
+
+async function runCommitFlow(params: CommitParams): Promise<OrderIntent> {
   const key = params.idempotencyKey;
 
-  const bound = getDb()
-    .prepare(`SELECT * FROM order_intents WHERE idempotency_key = ?`)
-    .get(key) as Record<string, unknown> | undefined;
+  const bound = await getDb().queryOne<Record<string, unknown>>(
+    `SELECT * FROM order_intents WHERE idempotency_key = $1`,
+    [key],
+  );
   if (bound) {
     const b = rowToIntent(bound);
     if (b.id !== params.intentId || b.customerId !== params.customerId) {
-      const target = getIntent(params.intentId, params.customerId);
-      if (target) appendAudit(target.runId, target.customerId, "idempotency_key_conflict", { intentId: target.id, idempotencyKey: key });
-      return Promise.reject(
-        new Error(`idempotency_key_conflict: idempotency key "${key}" is already bound to a different order intent; use a fresh key per intent`),
+      const target = await getIntent(params.intentId, params.customerId);
+      if (target) {
+        await appendAudit(target.runId, target.customerId, "idempotency_key_conflict", {
+          intentId: target.id,
+          idempotencyKey: key,
+        });
+      }
+      throw new Error(
+        `idempotency_key_conflict: idempotency key "${key}" is already bound to a different order intent; use a fresh key per intent`,
       );
     }
-    return Promise.resolve(b); // same key, same intent → replay the stored result
+    return b; // same key, same intent → replay the stored result
   }
 
-  const running = inFlightCommits.get(params.intentId);
-  if (running) {
-    if (running.customerId !== params.customerId) {
-      return Promise.reject(new Error("Intent not found"));
-    }
-    return running.promise; // join the in-flight commit: still exactly one order
-  }
-  for (const [otherId, r] of inFlightCommits) {
-    if (r.key === key && otherId !== params.intentId) {
-      return Promise.reject(new Error(`idempotency_key_conflict: idempotency key "${key}" is in use by a different order intent`));
-    }
-  }
-
-  const intent = getIntent(params.intentId, params.customerId);
-  if (!intent) return Promise.reject(new Error("Intent not found"));
-  if (intent.status === "committed") return Promise.resolve(intent); // already placed — never double-commit
+  const intent = await getIntent(params.intentId, params.customerId);
+  if (!intent) throw new Error("Intent not found");
+  if (intent.status === "committed") return intent; // already placed — never double-commit
   if (intent.status === "blocked" || intent.status === "rejected") {
-    return Promise.reject(new Error(`Cannot commit status ${intent.status}`));
+    throw new Error(`Cannot commit status ${intent.status}`);
   }
   if (intent.status === "pending_approval") {
-    return Promise.reject(new Error("Human approval required before commit"));
+    throw new Error("Human approval required before commit");
   }
   if (intent.status !== "approved" && intent.status !== "auto_eligible") {
-    return Promise.reject(new Error(`Cannot commit from status ${intent.status}`));
+    throw new Error(`Cannot commit from status ${intent.status}`);
   }
   if (new Date(intent.expiresAt).getTime() < Date.now()) {
     intent.status = "expired";
     intent.updatedAt = new Date().toISOString();
-    saveIntent(intent);
-    return Promise.reject(new Error("Order intent expired"));
+    await saveIntent(intent);
+    throw new Error("Order intent expired");
   }
   if (intent.status === "auto_eligible") intent.approvalSnapshotHash = intent.snapshotHash; // auto path
 
-  // Claim the intent (check-and-set) before any await.
   const priorStatus = intent.status;
   intent.status = "revalidating";
   intent.updatedAt = new Date().toISOString();
-  saveIntent(intent);
-  const promise = doCommit(intent, params, priorStatus).finally(() => inFlightCommits.delete(intent.id));
-  inFlightCommits.set(intent.id, { key, customerId: params.customerId, promise });
-  return promise;
+  await saveIntent(intent);
+  return doCommit(intent, params, priorStatus);
 }
 
-function refuse(intent: OrderIntent, status: string, auditType: string, payload: Record<string, unknown>, message: string): never {
+async function refuse(
+  intent: OrderIntent,
+  status: string,
+  auditType: string,
+  payload: Record<string, unknown>,
+  message: string,
+): Promise<never> {
   intent.status = status;
   intent.updatedAt = new Date().toISOString();
-  saveIntent(intent);
-  appendAudit(intent.runId, intent.customerId, auditType, { intentId: intent.id, ...payload });
+  await saveIntent(intent);
+  await appendAudit(intent.runId, intent.customerId, auditType, { intentId: intent.id, ...payload });
   throw new Error(message);
 }
 
 async function doCommit(intent: OrderIntent, params: CommitParams, priorStatus: string): Promise<OrderIntent> {
   const customerId = params.customerId;
-  appendAudit(intent.runId, customerId, "revalidating", { intentId: intent.id });
+  await appendAudit(intent.runId, customerId, "revalidating", { intentId: intent.id });
 
   try {
     // 1. The CURRENT mandate must still authorise this purchase.
-    const mandate = getMandate(customerId);
+    const mandate = await getMandate(customerId);
     if (!mandate || mandateRevoked(mandate) || new Date(mandate.expiresAt).getTime() < Date.now()) {
       const reason = !mandate ? "mandate_missing" : mandateRevoked(mandate) ? "mandate_revoked" : "mandate_expired";
-      refuse(intent, "blocked", "commit_refused_policy", { reason, failingRules: [reason] }, `mandate_invalid: ${reason} — commit refused`);
+      return await refuse(intent, "blocked", "commit_refused_policy", { reason, failingRules: [reason] }, `mandate_invalid: ${reason} — commit refused`);
     }
 
     // 2. Re-quote against the live Valio backend.
@@ -1042,7 +1077,7 @@ async function doCommit(intent: OrderIntent, params: CommitParams, priorStatus: 
 
     // A quote still inside its firm window fixes the price: live drift is recorded, not enforced.
     const quoteId = intent.meta?.quoteId;
-    const quote = quoteId ? getQuote(quoteId, customerId) : null;
+    const quote = quoteId ? await getQuote(quoteId, customerId) : null;
     const firm = !!quote && new Date(quote.validUntil).getTime() >= Date.now();
 
     const tol = params.priceToleranceEur ?? 0.01;
@@ -1055,7 +1090,7 @@ async function doCommit(intent: OrderIntent, params: CommitParams, priorStatus: 
       const avail = avails.find((a) => a.productId === line.productId);
       const livePrice = price && price.unitPrice != null && !price.error ? price.unitPrice : null;
       if (livePrice == null && !firm) {
-        refuse(intent, "stale_invalidated", "stale_offer", { reason: "price_missing", productId: line.productId }, `stale_offer: price missing for ${line.productId}`);
+        await refuse(intent, "stale_invalidated", "stale_offer", { reason: "price_missing", productId: line.productId }, `stale_offer: price missing for ${line.productId}`);
       }
       const approvedPartial =
         (priorStatus === "approved" || intent.status === "approved") &&
@@ -1087,7 +1122,7 @@ async function doCommit(intent: OrderIntent, params: CommitParams, priorStatus: 
             const fbVerdict = evaluatePolicy(mandate, intent.need, [fbLine], {
               isSubstitution: fbLine.isSubstitution,
               partialFulfil: false,
-              spend: computeSpend(customerId),
+              spend: await computeSpend(customerId),
             });
             if (fbVerdict.decision !== "blocked") {
               newLines = [fbLine];
@@ -1102,7 +1137,7 @@ async function doCommit(intent: OrderIntent, params: CommitParams, priorStatus: 
               const baseMeta: IntentMeta = intent.meta ?? { rationale: [], alternatives: [], consideredOffers: 1 };
               intent.meta = { ...baseMeta, cascadeExecuted };
               cascaded = true;
-              appendAudit(intent.runId, customerId, "fallback_cascade_executed", {
+              await appendAudit(intent.runId, customerId, "fallback_cascade_executed", {
                 intentId: intent.id,
                 ...cascadeExecuted,
                 trigger: salesBlocked ? "sales_block" : "qty_change",
@@ -1112,9 +1147,9 @@ async function doCommit(intent: OrderIntent, params: CommitParams, priorStatus: 
           }
         }
         if (salesBlocked) {
-          refuse(intent, "stale_invalidated", "stale_offer", { reason: "sales_block", productId: line.productId }, `stale_offer: sales block for ${line.productId}`);
+          return await refuse(intent, "stale_invalidated", "stale_offer", { reason: "sales_block", productId: line.productId }, `stale_offer: sales block for ${line.productId}`);
         }
-        refuse(
+        return await refuse(
           intent, "stale_invalidated", "stale_offer",
           { reason: "qty_change", productId: line.productId, was: minRequiredAvail, now: avail!.availableAmount },
           `stale_offer: availability dropped for ${line.productId}`,
@@ -1125,7 +1160,7 @@ async function doCommit(intent: OrderIntent, params: CommitParams, priorStatus: 
       }
       if (firm) {
         if (livePrice != null && Math.abs(livePrice - line.unitPrice) > tol) {
-          appendAudit(intent.runId, customerId, "quote_price_honoured", {
+          await appendAudit(intent.runId, customerId, "quote_price_honoured", {
             intentId: intent.id, quoteId, productId: line.productId, quotedUnitPrice: line.unitPrice, liveUnitPrice: livePrice, validUntil: quote!.validUntil,
           });
         }
@@ -1152,11 +1187,11 @@ async function doCommit(intent: OrderIntent, params: CommitParams, priorStatus: 
     const verdict = evaluatePolicy(mandate, intent.need, newLines, {
       isSubstitution: newLines.some((l) => l.isSubstitution),
       partialFulfil: !cascaded && (intent.policy.failingRules ?? []).includes("partial_fulfil"),
-      spend: computeSpend(customerId),
+      spend: await computeSpend(customerId),
       lineNeeds: intent.meta?.itemNeeds,
     });
     if (verdict.decision === "blocked") {
-      refuse(intent, "blocked", "commit_refused_policy", { reason: "policy_blocked", failingRules: verdict.failingRules, reasons: verdict.reasons },
+      await refuse(intent, "blocked", "commit_refused_policy", { reason: "policy_blocked", failingRules: verdict.failingRules, reasons: verdict.reasons },
         `policy_blocked: ${verdict.reasons.join("; ")}`);
     }
     // Rules a human already acknowledged at approval time stay acknowledged (approveOrder required the override to
@@ -1179,7 +1214,7 @@ async function doCommit(intent: OrderIntent, params: CommitParams, priorStatus: 
       const msg = `price_drift_exceeded: ${driftDetail}; tolerance ${tolPct}%`;
       const payload = { changes, tolerancePct: tolPct, was: intent.totalPrice, now: newTotal };
       if (!driftNeedsApproval) {
-        refuse(intent, "stale_invalidated", "stale_offer", { reason: "price_change", ...payload }, `stale_offer: ${msg}; re-quote required`);
+        await refuse(intent, "stale_invalidated", "stale_offer", { reason: "price_change", ...payload }, `stale_offer: ${msg}; re-quote required`);
       }
       newFailing.push("price_change_on_revalidate");
       verdict.failingRules = [...new Set([...verdict.failingRules, "price_change_on_revalidate"])];
@@ -1194,13 +1229,13 @@ async function doCommit(intent: OrderIntent, params: CommitParams, priorStatus: 
       intent.policy = verdict;
       intent.snapshotHash = snapshotHash({ basket: newLines, neededBy: intent.neededBy, customerId });
       intent.approvalSnapshotHash = null;
-      refuse(intent, "pending_approval", "commit_requires_reapproval", { newFailingRules: newFailing, changes, now: newTotal },
+      await refuse(intent, "pending_approval", "commit_requires_reapproval", { newFailingRules: newFailing, changes, now: newTotal },
         `reapproval_required: commit-time checks failed rules not acknowledged at approval (${newFailing.join(", ")})${changes.length ? `; ${driftDetail}` : ""}`);
     }
 
     // 4. Within tolerance (or an improvement / pre-authorized cascade): proceed at the live price.
     for (const c of changes) {
-      appendAudit(intent.runId, customerId, c.now < c.was ? "price_improved" : "price_drift_accepted", {
+      await appendAudit(intent.runId, customerId, c.now < c.was ? "price_improved" : "price_drift_accepted", {
         intentId: intent.id, productId: c.productId, was: c.was, now: c.now, pct: c.pct, tolerancePct: tolPct,
       });
     }
@@ -1211,14 +1246,43 @@ async function doCommit(intent: OrderIntent, params: CommitParams, priorStatus: 
     }
 
     const orderId = `ORD-${randomUUID().slice(0, 8).toUpperCase()}`;
+    const committedAt = new Date().toISOString();
+    const chainHead = (await verifyAuditChain(intent.runId, customerId)).headHash ?? null;
+    let receipt: TradeReceipt;
+    try {
+      receipt = issueTradeReceipt({
+        orderId,
+        intent: { ...intent, updatedAt: committedAt },
+        mandate,
+        actingAgentId: currentAgent() ?? "procurement",
+        auditHeadHash: chainHead,
+        detachedBuyerSignature: params.buyerSignature,
+      });
+    } catch (sigErr) {
+      if (sigErr instanceof Error && sigErr.message.startsWith("invalid_buyer_signature")) {
+        await appendAudit(intent.runId, customerId, "commit_refused_buyer_signature", {
+          intentId: intent.id,
+          reason: sigErr.message,
+        });
+      }
+      throw sigErr;
+    }
+
+    const baseMeta: IntentMeta = intent.meta ?? { rationale: [], alternatives: [], consideredOffers: 1 };
+    intent.meta = {
+      ...baseMeta,
+      receiptId: receipt.receiptId,
+      receiptHash: receipt.receiptHash,
+    };
     intent.status = "committed";
     intent.idempotencyKey = params.idempotencyKey;
     intent.committedOrderId = orderId;
-    intent.updatedAt = new Date().toISOString();
-    saveIntent(intent);
+    intent.updatedAt = committedAt;
+    await saveIntent(intent);
+    await saveTradeReceipt(receipt);
     const line = intent.basket[0];
     const itemNeeds = intent.meta?.itemNeeds;
-    recordCommittedOrder(customerId, {
+    await recordCommittedOrder(customerId, {
       orderId,
       intentId: intent.id,
       ingredientId: intent.need.ingredientId,
@@ -1242,22 +1306,73 @@ async function doCommit(intent: OrderIntent, params: CommitParams, priorStatus: 
             })
           : undefined,
     });
-    appendAudit(intent.runId, customerId, "committed", {
+    await appendAudit(intent.runId, customerId, "committed", {
       orderId,
       intentId: intent.id,
       basket: intent.basket,
       totalPrice: intent.totalPrice,
       confirmedAt: intent.updatedAt,
     });
+    await appendAudit(intent.runId, customerId, "bilateral_receipt_issued", {
+      receiptId: receipt.receiptId,
+      orderId,
+      intentId: intent.id,
+      receiptHash: receipt.receiptHash,
+      mandateHash: receipt.buyer.payload.mandateHash,
+      quoteId: receipt.buyer.payload.quoteId,
+      authorityMode: receipt.buyer.payload.authorityMode,
+      buyerAlgorithm: receipt.buyer.algorithm,
+      buyerKeyId: receipt.buyer.keyId,
+      supplierKeyId: receipt.supplier.keyId,
+    });
     return intent;
   } catch (err) {
     // A backend/network failure mid-revalidation must not strand the intent in "revalidating".
-    const cur = getIntent(intent.id, customerId);
+    const cur = await getIntent(intent.id, customerId);
     if (cur && cur.status === "revalidating") {
       cur.status = priorStatus;
       cur.updatedAt = new Date().toISOString();
-      saveIntent(cur);
+      await saveIntent(cur);
     }
     throw err;
   }
+}
+
+export async function ensureReceiptForCommittedOrder(
+  idOrOrderId: string,
+  customerId: string,
+): Promise<TradeReceipt | null> {
+  const existing = await getTradeReceipt(idOrOrderId, customerId);
+  if (existing) return existing;
+
+  const normalizedOrderId = idOrOrderId.startsWith("VTR-")
+    ? `ORD-${idOrOrderId.slice(4)}`
+    : idOrOrderId;
+  const row = await getDb().queryOne<Record<string, unknown>>(
+    `SELECT * FROM order_intents
+     WHERE customer_id = $2 AND (id = $1 OR committed_order_id = $1 OR committed_order_id = $3)
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [idOrOrderId, customerId, normalizedOrderId],
+  );
+  if (!row) return null;
+
+  const intent = rowToIntent(row);
+  if (intent.status !== "committed" || !intent.committedOrderId) {
+    return null;
+  }
+
+  const mandate = await getMandate(customerId);
+  if (!mandate) return null;
+
+  const chainHead = (await verifyAuditChain(intent.runId, customerId)).headHash ?? null;
+  const receipt = issueTradeReceipt({
+    orderId: intent.committedOrderId,
+    intent,
+    mandate,
+    actingAgentId: "procurement",
+    auditHeadHash: chainHead,
+  });
+  await saveTradeReceipt(receipt);
+  return receipt;
 }

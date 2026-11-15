@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, getApiKey, setApiKey, type AuditEvent } from "./api";
+import { api, getApiKey, isLabModeEnabled, setApiKey, type AuditEvent } from "./api";
 
 const ACCOUNTS = [
   {
@@ -45,12 +45,14 @@ export function TechProofModal(props: {
   const [selfTesting, setSelfTesting] = useState(false);
   const [selfTest, setSelfTest] = useState<SelfTestResult | null>(null);
 
+  const labMode = isLabModeEnabled();
+
   // Clear stale verification/self-test status whenever modal opens/closes or target runId changes
   useEffect(() => {
     setVerifyMsg(null);
     setMsgTone("success");
     setSelfTest(null);
-    if (!props.open) return;
+    if (!props.open || !labMode) return;
 
     let cancelled = false;
     api<{ checks: SystemCheck[]; allOk: boolean }>("/v1/system/status")
@@ -66,7 +68,7 @@ export function TechProofModal(props: {
     return () => {
       cancelled = true;
     };
-  }, [props.open, props.runId]);
+  }, [props.open, props.runId, labMode]);
 
   // Escape key closes modal cleanly
   useEffect(() => {
@@ -203,7 +205,7 @@ export function TechProofModal(props: {
           }}
         >
           <h2 id="tech-proof-modal-title" style={{ margin: 0, fontSize: 20, fontWeight: 800 }}>
-            Kitchen Account &amp; System Verification
+            {labMode ? "Kitchen Account & System Verification" : "Switch Kitchen Account"}
           </h2>
           <button
             type="button"
@@ -249,7 +251,7 @@ export function TechProofModal(props: {
           </div>
 
           {/* Live System Health Pills */}
-          {healthChecks && healthChecks.length > 0 && (
+          {labMode && healthChecks && healthChecks.length > 0 && (
             <div className="card-subtle" style={{ padding: "12px 14px" }}>
               <div
                 style={{
@@ -279,6 +281,7 @@ export function TechProofModal(props: {
           )}
 
           {/* Judge & IT Verification Controls */}
+          {labMode && (
           <div style={{ borderTop: "1px solid var(--border-light)", paddingTop: 16 }}>
             <div
               style={{
@@ -428,6 +431,7 @@ export function TechProofModal(props: {
               </button>
             </div>
           </div>
+          )}
         </div>
       </div>
     </div>

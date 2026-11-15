@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, nextMonday, ruleLabel, type Intent, type Mandate } from "./api";
+import { api, isLabModeEnabled, nextMonday, ruleLabel, type Intent, type Mandate } from "./api";
 import { day, money, qty, tidy } from "./format";
 import { signHumanOverride } from "./webauthn";
 
@@ -729,59 +729,63 @@ export function ApprovalView(props: {
                   </div>
                 </label>
 
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    gap: 10,
-                    flexWrap: "wrap",
-                    paddingLeft: 32,
-                  }}
-                >
-                  {alternatives.length > 1 && (
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5 }}>
-                      <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Backup choice:</span>
-                      <select
-                        className="field-select"
-                        style={{ minHeight: 34, padding: "4px 10px", fontSize: 12.5 }}
-                        value={backupAlt.productId}
-                        onChange={(e) => setSelectedBackupId(e.target.value)}
-                      >
-                        {alternatives.map((alt) => (
-                          <option key={alt.productId} value={alt.productId}>
-                            {alt.productName} ({money(alt.totalPrice)})
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  )}
-
-                  <button
-                    type="button"
-                    className="chip-btn"
-                    style={
-                      isStockoutArmed
-                        ? {
-                            background: "var(--bg-amber-soft)",
-                            borderColor: "var(--amber-main)",
-                            color: "var(--amber-text)",
-                            fontWeight: 700,
-                          }
-                        : undefined
-                    }
-                    disabled={busyId !== null}
-                    onClick={() => void handleToggleSimulateStockout(current)}
+                {(alternatives.length > 1 || isLabModeEnabled()) && (
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: 10,
+                      flexWrap: "wrap",
+                      paddingLeft: 32,
+                    }}
                   >
-                    {busyMode === "stockout"
-                      ? "Updating warehouse sim…"
-                      : isStockoutArmed
-                        ? "⚡ Stock-Out Armed (Click to Disarm)"
-                        : "⚡ Demo: Simulate Last-Second Warehouse Stock-Out"}
-                  </button>
-                </div>
+                    {alternatives.length > 1 && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5 }}>
+                        <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Backup choice:</span>
+                        <select
+                          className="field-select"
+                          style={{ minHeight: 34, padding: "4px 10px", fontSize: 12.5 }}
+                          value={backupAlt.productId}
+                          onChange={(e) => setSelectedBackupId(e.target.value)}
+                        >
+                          {alternatives.map((alt) => (
+                            <option key={alt.productId} value={alt.productId}>
+                              {alt.productName} ({money(alt.totalPrice)})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
 
-                {isStockoutArmed && (
+                    {isLabModeEnabled() && (
+                      <button
+                        type="button"
+                        className="chip-btn"
+                        style={
+                          isStockoutArmed
+                            ? {
+                                background: "var(--bg-amber-soft)",
+                                borderColor: "var(--amber-main)",
+                                color: "var(--amber-text)",
+                                fontWeight: 700,
+                              }
+                            : undefined
+                        }
+                        disabled={busyId !== null}
+                        onClick={() => void handleToggleSimulateStockout(current)}
+                      >
+                        {busyMode === "stockout"
+                          ? "Updating warehouse sim…"
+                          : isStockoutArmed
+                            ? "⚡ Stock-Out Armed (Click to Disarm)"
+                            : "⚡ Demo: Simulate Last-Second Warehouse Stock-Out"}
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {isLabModeEnabled() && isStockoutArmed && (
                   <div
                     style={{
                       marginLeft: 32,

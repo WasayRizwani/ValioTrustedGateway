@@ -80,7 +80,7 @@ test("REST: sensitive endpoints are throttled tighter, 429 + Retry-After + stabl
   const j = await res.json();
   assert.equal(j.error, "rate_limited");
   assert.equal(j.retryAfterSec, 30);
-  const rows = getDb().prepare(`SELECT payload FROM audit_events WHERE type='rate_limited'`).all() as Array<{ payload: string }>;
+  const rows = await getDb().query<{ payload: string }>(`SELECT payload FROM audit_events WHERE type = 'rate_limited'`);
   assert.ok(rows.some((r) => JSON.parse(r.payload).bucket === "sensitive"));
   // non-sensitive endpoint still works for the same key
   assert.equal((await app.request("/v1/me", { headers: { "x-api-key": AGENT } })).status, 200);

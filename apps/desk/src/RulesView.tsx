@@ -745,7 +745,9 @@ export function RulesView(props: {
                   <strong>
                     {autoBundle.policy.urgencies.includes("low") ? "Very Low & Low" : "Very Low"}
                   </strong>{" "}
-                  pantry items within your spending &amp; allergen limits below.
+                  pantry items within your spending &amp; allergen limits below, and sends{" "}
+                  <strong>1 daily digest email</strong> summarizing every restock placed or planned,
+                  your inventory history, and incoming deliveries to your workplace.
                 </p>
               </div>
 

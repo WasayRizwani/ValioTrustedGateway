@@ -1,4 +1,22 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-valio}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-valio}
+      POSTGRES_DB: ${POSTGRES_DB:-valio_gateway}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-valio} -d $${POSTGRES_DB:-valio_gateway}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
   gateway:
     build:
       context: .
@@ -12,6 +30,10 @@ services:
         required: false
     environment:
       GATEWAY_PORT: "8787"
+      DATABASE_URL: ${DATABASE_URL:-postgresql://valio:valio@postgres:5432/valio_gateway}
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - ./data:/app/data
       - ./keys:/app/keys
@@ -64,3 +86,6 @@ services:
     depends_on:
       gateway:
         condition: service_healthy
+
+volumes:
+  postgres_data:

@@ -8,7 +8,7 @@
  *    that use it, before anything new is bought.
  * The mandate still gates every order; this only decides which offer and how many packs to propose.
  */
-import type { Need } from "@tta/shared";
+import type { Mandate, Need } from "@tta/shared";
 import { buildOffers } from "../catalog/offers.js";
 import { getMandate } from "../auth/customers.js";
 import { isDairyText } from "../policy/engine.js";
@@ -90,16 +90,14 @@ export function nextMondayIso(): string {
 
 const r2 = (n: number) => Math.round(n * 100) / 100;
 
-function mustBeLactoseFree(customerId: string, item: IngredientStock): boolean {
-  const m = getMandate(customerId);
+function mustBeLactoseFree(m: Mandate | null, item: IngredientStock): boolean {
   return Boolean(
     item.lactoseFreePreferred ||
       (m?.allergenRestrictions.includes("must_be_lactose_free") && isDairyText(`${item.name} ${item.catalogHints.join(" ")}`)),
   );
 }
 
-function quantityCap(customerId: string, unit: string): number {
-  const m = getMandate(customerId);
+function quantityCap(m: Mandate | null, unit: string): number {
   if (!m) return Infinity;
   const cap = (m.maxQuantities as Record<string, number> | undefined)?.[unit];
   if (cap != null) return cap;
@@ -126,8 +124,9 @@ export async function optimizeLine(
     note: "",
     others: [],
   };
-  const need = ingredientToNeed(item, rec.suggestedOrderQty, neededBy, mustBeLactoseFree(customerId, item)) as Need;
-  const offers = await buildOffers(customerId, need);
+  const mandate = await getMandate(customerId);
+  const need = ingredientToNeed(item, rec.suggestedOrderQty, neededBy, mustBeLactoseFree(mandate, item)) as Need;
+  const offers = await buildOffers(customerId, need, { mandate });
   const onTime = (o: { availableDate: string | null }) => !o.availableDate || o.availableDate <= neededBy;
   const deliverable = offers.filter((o) => o.canFulfil && onTime(o) && !o.isSubstitution);
   const counts = new Map<string, number>();
@@ -143,8 +142,7 @@ export async function optimizeLine(
   // Extra stock is only worth buying if it is used well within shelf life, after the days this order already covers.
   const extraDays = Math.max(0, Math.floor(shelf * 0.6) - daysCover);
   const usableExtra = dailyUse * extraDays;
-  const cap = quantityCap(customerId, need.unit);
-  const mandate = getMandate(customerId);
+  const cap = quantityCap(mandate, need.unit);
 
   const options: QtyOption[] = pool.map((o) => {
     const surplus = Math.max(0, o.totalQuantity - needQty);
@@ -243,10 +241,10 @@ function lastUnitPrice(history: Array<{ lines: Array<{ ingredientId?: string; qu
   return null;
 }
 
-export function useFirstFor(customerId: string): UseFirst[] {
-  const k = getKitchen(customerId);
+export async function useFirstFor(customerId: string): Promise<UseFirst[]> {
+  const k = await getKitchen(customerId);
   if (!k) return [];
-  const rec = recommendRestock(customerId)?.recommendations ?? [];
+  const rec = (await recommendRestock(customerId))?.recommendations ?? [];
   const out: UseFirst[] = [];
   for (const r of rec) {
     const price = lastUnitPrice(k.orderHistory, r.ingredientId);
@@ -287,8 +285,8 @@ export function useFirstFor(customerId: string): UseFirst[] {
 
 export async function smartRestock(customerId: string, options?: { daysCover?: number }): Promise<SmartRestock | null> {
   const daysCover = options?.daysCover ?? 7;
-  const k = getKitchen(customerId);
-  const rec = recommendRestock(customerId, { daysCover });
+  const k = await getKitchen(customerId);
+  const rec = await recommendRestock(customerId, { daysCover });
   if (!k || !rec) return null;
   const neededBy = nextMondayIso();
   const todo = rec.recommendations.filter((r) => r.urgency !== "ok" && r.suggestedOrderQty > 0);
@@ -320,7 +318,7 @@ export async function smartRestock(customerId: string, options?: { daysCover?: n
     hotelName: k.hotelName,
     neededBy,
     lines,
-    useFirst: useFirstFor(customerId),
+    useFirst: await useFirstFor(customerId),
     totalSavingEur: r2(lines.reduce((s, l) => s + l.savingEur, 0)),
   };
 }

@@ -6,7 +6,8 @@
     "build": "echo ok",
     "demo:a": "tsx src/demo.ts --scenario a",
     "demo:b": "tsx src/demo.ts --scenario b",
-    "demo:team": "tsx src/team-demo.ts"
+    "demo:team": "tsx src/team-demo.ts",
+    "demo:bilateral": "tsx src/bilateral-team-demo.ts"
   },
   "dependencies": {
     "@tta/shared": "*"

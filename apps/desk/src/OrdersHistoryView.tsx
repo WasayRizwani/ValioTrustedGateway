@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
-import { api } from "./api";
+import { api, isLabModeEnabled } from "./api";
 import { day, money, originLabel, qty, tidy } from "./format";
+import { TradeReceiptArbitratorCard } from "./TradeReceiptArbitratorCard";
 
 type Stage = "approval" | "awaiting_delivery" | "delivered" | "closed";
 
 type OrderRow = {
   intentId: string;
   orderId: string | null;
+  receiptId?: string | null;
+  quoteId?: string | null;
   runId: string;
   stage: Stage;
   status?: string;
@@ -715,117 +718,149 @@ export function OrdersHistoryView(props: {
 
               {/* Dual-Signed Cryptographic Trade Certificate (#2C) for committed / delivered orders */}
               {isCommittedOrDelivered ? (
-                <div
-                  className="cert-box safe"
-                  style={{
-                    padding: "16px 18px",
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 12,
-                  }}
-                >
+                <>
                   <div
+                    className="cert-box safe"
                     style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "center",
-                      flexWrap: "wrap",
-                      gap: 8,
-                      borderBottom: "1px solid rgba(167, 243, 208, 0.22)",
-                      paddingBottom: 10,
-                    }}
-                  >
-                    <div style={{ fontWeight: 800, fontSize: 14, color: "#ecfdf5" }}>
-                      Verified Trade Certificate
-                    </div>
-                    <button
-                      type="button"
-                      className="link-quiet"
-                      style={{ color: "#6ee7b7", fontSize: 12.5 }}
-                      onClick={() => props.onOpenTechModal(activeOrder.runId)}
-                    >
-                      Inspect Signed Audit Chain ↗
-                    </button>
-                  </div>
-
-                  {/* 1. Supplier Fixed-Price & Allergen Guarantee */}
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      flexWrap: "wrap",
-                      gap: 8,
-                    }}
-                  >
-                    <span style={{ fontWeight: 700, color: "#d1fae5", fontSize: 13 }}>
-                      ✓ Valio Aimo® Ed25519 Signed Price &amp; Product Envelope Verified
-                    </span>
-                  </div>
-
-                  {/* 2. Kitchen Buyer Authority Proof */}
-                  <div
-                    style={{
-                      background: "rgba(15, 23, 42, 0.45)",
-                      border: "1px solid rgba(167, 243, 208, 0.24)",
-                      borderRadius: 10,
-                      padding: "10px 12px",
+                      padding: "16px 18px",
                       display: "flex",
                       flexDirection: "column",
-                      gap: 6,
+                      gap: 12,
                     }}
                   >
-                    {activeOrder.humanSignatureProof?.verified ? (
-                      <>
-                        <div
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 8,
-                            flexWrap: "wrap",
-                          }}
-                        >
-                          <span className="pill blue" style={{ fontSize: 12 }}>
-                            🔐 Counter-Signed by {activeOrder.humanSignatureProof.signerLabel}
-                          </span>
-                          <span style={{ fontSize: 12, color: "#a7f3d0" }}>
-                            Verified {formatVerifiedAt(activeOrder.humanSignatureProof.verifiedAt)}
-                          </span>
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        flexWrap: "wrap",
+                        gap: 8,
+                        borderBottom: "1px solid rgba(167, 243, 208, 0.22)",
+                        paddingBottom: 10,
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <div style={{ fontWeight: 800, fontSize: 14, color: "#ecfdf5" }}>
+                          Verified Trade Certificate
                         </div>
-                        <div className="mono" style={{ fontSize: 12, color: "#cbd5e1" }}>
-                          Signature fingerprint: {activeOrder.humanSignatureProof.signaturePrefix}… ·{" "}
-                          {activeOrder.humanSignatureProof.mode} ({activeOrder.humanSignatureProof.credentialId})
+                        {activeOrder.receiptId && (
+                          <span
+                            className="pill mono"
+                            style={{
+                              fontSize: 11.5,
+                              padding: "2px 8px",
+                              background: "rgba(15, 23, 42, 0.55)",
+                              color: "#a7f3d0",
+                              border: "1px solid rgba(167, 243, 208, 0.28)",
+                            }}
+                          >
+                            📄 {activeOrder.receiptId.replace(/\.vtr\.json$/i, "")}.vtr.json
+                          </span>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        className="link-quiet"
+                        style={{ color: "#6ee7b7", fontSize: 12.5 }}
+                        onClick={() => props.onOpenTechModal(activeOrder.runId)}
+                      >
+                        Inspect Signed Audit Chain ↗
+                      </button>
+                    </div>
+
+                    {/* 1. Supplier Fixed-Price & Allergen Guarantee */}
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        flexWrap: "wrap",
+                        gap: 8,
+                      }}
+                    >
+                      <span style={{ fontWeight: 700, color: "#d1fae5", fontSize: 13 }}>
+                        ✓ Valio Aimo® Ed25519 Signed Price &amp; Product Envelope Verified
+                      </span>
+                    </div>
+
+                    {/* 2. Kitchen Buyer Authority Proof */}
+                    <div
+                      style={{
+                        background: "rgba(15, 23, 42, 0.45)",
+                        border: "1px solid rgba(167, 243, 208, 0.24)",
+                        borderRadius: 10,
+                        padding: "10px 12px",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 6,
+                      }}
+                    >
+                      {activeOrder.humanSignatureProof?.verified ? (
+                        <>
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 8,
+                              flexWrap: "wrap",
+                            }}
+                          >
+                            <span className="pill blue" style={{ fontSize: 12 }}>
+                              🔐 Counter-Signed by {activeOrder.humanSignatureProof.signerLabel}
+                            </span>
+                            <span style={{ fontSize: 12, color: "#a7f3d0" }}>
+                              Verified {formatVerifiedAt(activeOrder.humanSignatureProof.verifiedAt)}
+                            </span>
+                          </div>
+                          <div className="mono" style={{ fontSize: 12, color: "#cbd5e1" }}>
+                            Signature fingerprint: {activeOrder.humanSignatureProof.signaturePrefix}… ·{" "}
+                            {activeOrder.humanSignatureProof.mode} ({activeOrder.humanSignatureProof.credentialId})
+                          </div>
+                        </>
+                      ) : (
+                        <div style={{ fontWeight: 700, fontSize: 13, color: "#ecfdf5" }}>
+                          ⚡ Placed Autonomously Within Kitchen Spending &amp; Safety Rules
                         </div>
-                      </>
-                    ) : (
-                      <div style={{ fontWeight: 700, fontSize: 13, color: "#ecfdf5" }}>
-                        ⚡ Placed Autonomously Within Kitchen Spending &amp; Safety Rules
+                      )}
+                    </div>
+
+                    {/* 3. Cold-Chain Auto-Recovery Summary inside Certificate when triggered */}
+                    {activeOrder.cascadeExecuted && (
+                      <div
+                        style={{
+                          background: "rgba(217, 119, 6, 0.18)",
+                          border: "1px solid rgba(253, 230, 138, 0.45)",
+                          borderRadius: 10,
+                          padding: "9px 12px",
+                          color: "#fef3c7",
+                          fontSize: 12.5,
+                          fontWeight: 600,
+                        }}
+                      >
+                        🛡️ Cold-Chain Recovery Proof: Primary{" "}
+                        {activeOrder.cascadeExecuted.droppedProductName ||
+                          activeOrder.cascadeExecuted.droppedProductId}{" "}
+                        → fulfilled with pre-authorized backup{" "}
+                        {activeOrder.cascadeExecuted.backupProductName} (
+                        {money(activeOrder.cascadeExecuted.newTotalPrice)})
                       </div>
                     )}
                   </div>
 
-                  {/* 3. Cold-Chain Auto-Recovery Summary inside Certificate when triggered */}
-                  {activeOrder.cascadeExecuted && (
-                    <div
-                      style={{
-                        background: "rgba(217, 119, 6, 0.18)",
-                        border: "1px solid rgba(253, 230, 138, 0.45)",
-                        borderRadius: 10,
-                        padding: "9px 12px",
-                        color: "#fef3c7",
-                        fontSize: 12.5,
-                        fontWeight: 600,
-                      }}
-                    >
-                      🛡️ Cold-Chain Recovery Proof: Primary{" "}
-                      {activeOrder.cascadeExecuted.droppedProductName ||
-                        activeOrder.cascadeExecuted.droppedProductId}{" "}
-                      → fulfilled with pre-authorized backup{" "}
-                      {activeOrder.cascadeExecuted.backupProductName} (
-                      {money(activeOrder.cascadeExecuted.newTotalPrice)})
-                    </div>
-                  )}
-                </div>
+                  <TradeReceiptArbitratorCard
+                    key={activeOrder.intentId}
+                    orderId={activeOrder.orderId}
+                    intentId={activeOrder.intentId}
+                    variant="embedded"
+                  />
+                </>
               ) : (
                 /* Quiet Valio Aimo Trust & Discreet IT Link for non-committed intents */
                 <div
@@ -844,13 +879,15 @@ export function OrdersHistoryView(props: {
                   <div style={{ fontSize: 13, color: "var(--green-text)", fontWeight: 600 }}>
                     ✓ Valio Aimo® Price, Stock &amp; Kitchen Privacy Guarantee
                   </div>
-                  <button
-                    type="button"
-                    className="link-quiet"
-                    onClick={() => props.onOpenTechModal(activeOrder.runId)}
-                  >
-                    Verification &amp; Demo Tools
-                  </button>
+                  {isLabModeEnabled() && (
+                    <button
+                      type="button"
+                      className="link-quiet"
+                      onClick={() => props.onOpenTechModal(activeOrder.runId)}
+                    >
+                      Verification &amp; Demo Tools
+                    </button>
+                  )}
                 </div>
               )}
             </div>

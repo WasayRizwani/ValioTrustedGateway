@@ -154,10 +154,10 @@ function timelineItem(e: AuditEvent, intent: OrderIntent): ExplainTimelineItem |
   }
 }
 
-export function explainOrder(intentId: string, customerId: string): OrderExplanation | null {
-  const intent = getIntent(intentId, customerId);
+export async function explainOrder(intentId: string, customerId: string): Promise<OrderExplanation | null> {
+  const intent = await getIntent(intentId, customerId);
   if (!intent) return null;
-  const events = getAuditTrail(intent.runId, customerId);
+  const events = await getAuditTrail(intent.runId, customerId);
   const mine = bound(events, intent.id);
   const approved = mine.find((e) => e.type === "human_approved");
   const rejected = mine.find((e) => e.type === "human_rejected");
@@ -233,7 +233,7 @@ export function explainOrder(intentId: string, customerId: string): OrderExplana
     whyNotChosen: a.note || (!a.canFulfil ? "It cannot deliver the full quantity." : a.deltaEur > 0 ? `It costs ${eur(a.deltaEur)} more.` : "The chosen offer ranked higher overall."),
   }));
 
-  const verification = verifyAuditChain(intent.runId, customerId);
+  const verification = await verifyAuditChain(intent.runId, customerId);
 
   return {
     intentId: intent.id,

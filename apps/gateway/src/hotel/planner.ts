@@ -193,7 +193,7 @@ export function planSourcing(customerId: string, mandate: Mandate, request: Plan
 }
 
 async function planSourcingImpl(customerId: string, mandate: Mandate, request: PlanRequest): Promise<PlanResult> {
-  const k = getKitchen(customerId);
+  const k = await getKitchen(customerId);
   if (!k) throw new Error("no_kitchen_profile");
   const runId = request.runId ?? randomUUID();
   const req = requirements(k.recipes, request);
@@ -205,7 +205,7 @@ async function planSourcingImpl(customerId: string, mandate: Mandate, request: P
     }
   }
 
-  appendAudit(runId, customerId, "menu_plan_started", {
+  await appendAudit(runId, customerId, "menu_plan_started", {
     neededBy: request.neededBy,
     recipes: request.recipes ?? "all",
     only: request.onlyIngredients ?? null,
@@ -468,7 +468,7 @@ async function planSourcingImpl(customerId: string, mandate: Mandate, request: P
     `${lines.length} ingredients checked for ${request.neededBy}: ${parts.join(", ") || "nothing to buy"}. ` +
     `Estimated purchase €${total.toFixed(2)}${request.createIntents ? " (orders created; the audit trail shows what was actually placed)" : ""}.`;
 
-  appendAudit(runId, customerId, "menu_plan_completed", {
+  await appendAudit(runId, customerId, "menu_plan_completed", {
     summary,
     flags,
     substituteJudge: {
@@ -492,7 +492,7 @@ export async function handleStockout(
     productId?: string;
   },
 ): Promise<PlanResult & { affectedRecipes: string[] }> {
-  const k = getKitchen(customerId);
+  const k = await getKitchen(customerId);
   if (!k) throw new Error("no_kitchen_profile");
   const affected = k.recipes.filter((r) =>
     r.ingredients.some((i) => i.ingredientId === params.ingredientId),

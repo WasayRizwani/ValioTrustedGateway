@@ -38,49 +38,54 @@ function rowToQuote(row: Record<string, unknown>): Quote {
 }
 
 /** Reads a quote scoped to its owner; lazily flips an open quote past its window to "expired". */
-export function getQuote(quoteId: string, customerId: string): Quote | null {
-  const row = getDb().prepare(`SELECT * FROM quotes WHERE id = ? AND customer_id = ?`).get(quoteId, customerId) as
-    | Record<string, unknown>
-    | undefined;
+export async function getQuote(quoteId: string, customerId: string): Promise<Quote | null> {
+  const row = await getDb().queryOne<Record<string, unknown>>(
+    `SELECT * FROM quotes WHERE id = $1 AND customer_id = $2`,
+    [quoteId, customerId],
+  );
   if (!row) return null;
   if (row.status === "open" && String(row.valid_until) < new Date().toISOString()) {
-    expireQuotes(customerId);
+    await expireQuotes(customerId);
     row.status = "expired";
   }
   return rowToQuote(row);
 }
 
 /** Closes every open quote of the customer (or all customers) whose firm window has ended. */
-export function expireQuotes(customerId?: string): number {
+export async function expireQuotes(customerId?: string): Promise<number> {
   const now = new Date().toISOString();
-  const rows = getDb()
-    .prepare(
-      `SELECT id, run_id, customer_id FROM quotes WHERE status = 'open' AND valid_until < ? ${customerId ? "AND customer_id = ?" : ""}`,
-    )
-    .all(...(customerId ? [now, customerId] : [now])) as Array<{ id: string; run_id: string; customer_id: string }>;
+  const rows = await getDb().query<{ id: string; run_id: string; customer_id: string }>(
+    `SELECT id, run_id, customer_id FROM quotes WHERE status = 'open' AND valid_until < $1 ${customerId ? "AND customer_id = $2" : ""}`,
+    customerId ? [now, customerId] : [now],
+  );
   for (const r of rows) {
-    const res = getDb().prepare(`UPDATE quotes SET status = 'expired' WHERE id = ? AND status = 'open'`).run(r.id);
-    if (res.changes) appendAudit(r.run_id, r.customer_id, "quote_expired", { quoteId: r.id });
+    const res = await getDb().execute(
+      `UPDATE quotes SET status = 'expired' WHERE id = $1 AND status = 'open'`,
+      [r.id],
+    );
+    if (res.rowCount) await appendAudit(r.run_id, r.customer_id, "quote_expired", { quoteId: r.id });
   }
   return rows.length;
 }
 
 /** Atomic open -> used transition (single use). Returns false if the quote was not open and in-window. */
-export function markQuoteUsed(quoteId: string, customerId: string, intentId: string): boolean {
-  const res = getDb()
-    .prepare(
-      `UPDATE quotes SET status = 'used', intent_id = ? WHERE id = ? AND customer_id = ? AND status = 'open' AND valid_until >= ?`,
-    )
-    .run(intentId, quoteId, customerId, new Date().toISOString());
-  return res.changes === 1;
+export async function markQuoteUsed(quoteId: string, customerId: string, intentId: string): Promise<boolean> {
+  const res = await getDb().execute(
+    `UPDATE quotes SET status = 'used', intent_id = $1 WHERE id = $2 AND customer_id = $3 AND status = 'open' AND valid_until >= $4`,
+    [intentId, quoteId, customerId, new Date().toISOString()],
+  );
+  return res.rowCount === 1;
 }
 
-export function withdrawQuote(quoteId: string, customerId: string): boolean {
-  const q = getQuote(quoteId, customerId);
+export async function withdrawQuote(quoteId: string, customerId: string): Promise<boolean> {
+  const q = await getQuote(quoteId, customerId);
   if (!q) return false;
-  const res = getDb().prepare(`UPDATE quotes SET status = 'withdrawn' WHERE id = ? AND status = 'open'`).run(quoteId);
-  if (res.changes) appendAudit(q.runId ?? quoteId, customerId, "quote_withdrawn", { quoteId });
-  return res.changes === 1;
+  const res = await getDb().execute(
+    `UPDATE quotes SET status = 'withdrawn' WHERE id = $1 AND status = 'open'`,
+    [quoteId],
+  );
+  if (res.rowCount) await appendAudit(q.runId ?? quoteId, customerId, "quote_withdrawn", { quoteId });
+  return res.rowCount === 1;
 }
 
 /**
@@ -137,14 +142,24 @@ export async function createQuote(
   lines.forEach((l, i) => (l.claimIds = [claims[i].claimId ?? claims[i].signature]));
   const totalPrice = round2(lines[0].totalPrice);
 
-  getDb()
-    .prepare(
-      `INSERT INTO quotes (id, customer_id, run_id, status, need_json, lines_json, claims_json, total_price, currency, issued_at, valid_until, intent_id)
-       VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, NULL)`,
-    )
-    .run(quoteId, customerId, runId, JSON.stringify(need), JSON.stringify(lines), JSON.stringify(claims), totalPrice, currency, issuedAt.toISOString(), validUntil);
+  await getDb().execute(
+    `INSERT INTO quotes (id, customer_id, run_id, status, need_json, lines_json, claims_json, total_price, currency, issued_at, valid_until, intent_id)
+     VALUES ($1, $2, $3, 'open', $4, $5, $6, $7, $8, $9, $10, NULL)`,
+    [
+      quoteId,
+      customerId,
+      runId,
+      JSON.stringify(need),
+      JSON.stringify(lines),
+      JSON.stringify(claims),
+      totalPrice,
+      currency,
+      issuedAt.toISOString(),
+      validUntil,
+    ],
+  );
 
-  appendAudit(runId, customerId, "quote_issued", {
+  await appendAudit(runId, customerId, "quote_issued", {
     quoteId,
     totalPrice,
     currency,
@@ -152,7 +167,7 @@ export async function createQuote(
     lines: lines.map((l) => ({ productId: l.productId, packs: l.packs, unitPrice: l.unitPrice, totalPrice: l.totalPrice })),
     availabilityHeld: false,
   });
-  return getQuote(quoteId, customerId)!;
+  return (await getQuote(quoteId, customerId))!;
 }
 
 export type MultiQuoteItemInput = {
@@ -263,12 +278,10 @@ export async function createMultiItemQuote(
     isMultiItemBasket: true,
   });
 
-  getDb()
-    .prepare(
-      `INSERT INTO quotes (id, customer_id, run_id, status, need_json, lines_json, claims_json, total_price, currency, issued_at, valid_until, intent_id, meta_json)
-       VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
-    )
-    .run(
+  await getDb().execute(
+    `INSERT INTO quotes (id, customer_id, run_id, status, need_json, lines_json, claims_json, total_price, currency, issued_at, valid_until, intent_id, meta_json)
+     VALUES ($1, $2, $3, 'open', $4, $5, $6, $7, $8, $9, $10, NULL, $11)`,
+    [
       quoteId,
       customerId,
       runId,
@@ -280,9 +293,10 @@ export async function createMultiItemQuote(
       issuedAt.toISOString(),
       validUntil,
       metaJson,
-    );
+    ],
+  );
 
-  appendAudit(runId, customerId, "quote_issued", {
+  await appendAudit(runId, customerId, "quote_issued", {
     quoteId,
     isMultiItemBasket: true,
     itemCount: lines.length,
@@ -297,5 +311,5 @@ export async function createMultiItemQuote(
     })),
     availabilityHeld: false,
   });
-  return getQuote(quoteId, customerId)!;
+  return (await getQuote(quoteId, customerId))!;
 }

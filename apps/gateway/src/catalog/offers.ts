@@ -183,7 +183,7 @@ export async function buildOffers(
     options?.mandate !== undefined
       ? options.mandate
       : !options?.productIds?.length
-        ? getMandate(customerId)
+        ? await getMandate(customerId)
         : null;
   const mandateExcluded = extractMandateExcludedAllergens(effectiveMandate?.allergenRestrictions);
   const mandateMustLf = Boolean(effectiveMandate?.allergenRestrictions?.includes("must_be_lactose_free"));

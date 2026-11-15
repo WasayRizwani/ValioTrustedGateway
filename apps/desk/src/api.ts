@@ -445,6 +445,21 @@ export type RestockAutomationPolicy = {
   pauseOnStandingOrderDrift: boolean;
   smartQuantities: boolean;
   intervalMinutes: number;
+  dailyDigestEnabled?: boolean;
+  dailyDigestTime?: string;
+};
+
+export type DailyRestockDigestStatus = {
+  enabled: boolean;
+  cadence: "1 email/day" | string;
+  sendAtLocalTime: string;
+  recipient: string;
+  lastSentAt: string;
+  nextScheduledAt: string;
+  inboundDeliveriesCount: number;
+  plannedRestockCount: number;
+  recentRestockHistoryCount: number;
+  summary: string;
 };
 
 export type RestockRunLine = {
@@ -523,6 +538,7 @@ export type RestockAutomationBundle = {
   lastRun: RestockRunResult | null;
   syncStatus?: InventorySyncStatus;
   stockHealth?: StockHealthSnapshot | null;
+  dailyDigest?: DailyRestockDigestStatus;
 };
 
 export function timeAgoShort(iso?: string | null): string {
@@ -548,6 +564,12 @@ export function nextMonday(): string {
   if (delta === 0) delta = 7;
   d.setDate(d.getDate() + delta);
   return localDate(d);
+}
+
+export function isLabModeEnabled(): boolean {
+  if (import.meta.env.VITE_SHOW_LAB_TOOLS === "true") return true;
+  if (typeof window === "undefined") return false;
+  return new URLSearchParams(window.location.search).get("lab") === "1";
 }
 
 export function ruleLabel(rule: string): string {

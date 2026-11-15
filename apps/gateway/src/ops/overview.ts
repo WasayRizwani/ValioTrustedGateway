@@ -115,7 +115,7 @@ export async function runSelfTest(customerId: string): Promise<{
   const runId = randomUUID();
   const steps: Check[] = [];
   const push = (c: Check) => steps.push(c);
-  const mandate = getMandate(customerId);
+  const mandate = await getMandate(customerId);
 
   const valio = await checkValio();
   push({ id: "valio", label: "Valio backend reachable", ok: valio.ok, ms: valio.ms, detail: valio.ok ? (valio.note ?? "ping ok") : (valio.err ?? "failed") });
@@ -176,8 +176,8 @@ export async function runSelfTest(customerId: string): Promise<{
     }
   }
 
-  appendAudit(runId, customerId, "selftest_run", { steps: steps.length });
-  const chain = verifyAuditChain(runId, customerId);
+  await appendAudit(runId, customerId, "selftest_run", { steps: steps.length });
+  const chain = await verifyAuditChain(runId, customerId);
   push({ id: "audit", label: "Tamper-evident audit chain", ok: chain.valid, detail: chain.valid ? `Hash chain verified · head ${chain.headHash?.slice(0, 12)}…` : `Broken at event ${chain.brokenAt}` });
 
   const llm = await pingLlm();
@@ -353,25 +353,28 @@ function describe(type: string, p: Record<string, any>): Pick<Activity, "actor" 
 export type LastReset = { id: number; at: string; removedIntents: number; source: string | null };
 
 /** Most recent demo reset for this customer (null if none). Orders/feed older than this were wiped or are historical. */
-export function getLastReset(customerId: string): LastReset | null {
-  const r = getDb()
-    .prepare(`SELECT id, payload, created_at FROM audit_events WHERE customer_id = ? AND type = 'demo_reset' ORDER BY id DESC LIMIT 1`)
-    .get(customerId) as { id: number; payload: string; created_at: string } | undefined;
+export async function getLastReset(customerId: string): Promise<LastReset | null> {
+  const r = await getDb().queryOne<{ id: number; payload: string; created_at: string }>(
+    `SELECT id, payload, created_at FROM audit_events WHERE customer_id = $1 AND type = 'demo_reset' ORDER BY id DESC LIMIT 1`,
+    [customerId],
+  );
   if (!r) return null;
   const p = JSON.parse(r.payload) as Record<string, unknown>;
-  return { id: r.id, at: r.created_at, removedIntents: Number(p.removedIntents ?? 0), source: typeof p.source === "string" ? p.source : null };
+  return { id: Number(r.id), at: r.created_at, removedIntents: Number(p.removedIntents ?? 0), source: typeof p.source === "string" ? p.source : null };
 }
 
-export function getActivity(customerId: string, limit = 30, runId?: string): Activity[] {
-  const rows = (runId
-    ? getDb()
-        .prepare(`SELECT id, run_id, type, payload, created_at FROM audit_events WHERE customer_id = ? AND run_id = ? ORDER BY id ASC`)
-        .all(customerId, runId)
-    : getDb()
-        // The live feed only shows what happened since the last demo reset, so it never lists orders that no longer exist.
-        // The append-only audit trail (per run) keeps everything.
-        .prepare(`SELECT id, run_id, type, payload, created_at FROM audit_events WHERE customer_id = ? AND id >= ? ORDER BY id DESC LIMIT ?`)
-        .all(customerId, getLastReset(customerId)?.id ?? 0, limit * 3)) as Array<{ id: number; run_id: string; type: string; payload: string; created_at: string }>;
+export async function getActivity(customerId: string, limit = 30, runId?: string): Promise<Activity[]> {
+  const rows = runId
+    ? await getDb().query<{ id: number; run_id: string; type: string; payload: string; created_at: string }>(
+        `SELECT id, run_id, type, payload, created_at FROM audit_events WHERE customer_id = $1 AND run_id = $2 ORDER BY id ASC`,
+        [customerId, runId],
+      )
+    : // The live feed only shows what happened since the last demo reset, so it never lists orders that no longer exist.
+      // The append-only audit trail (per run) keeps everything.
+      await getDb().query<{ id: number; run_id: string; type: string; payload: string; created_at: string }>(
+        `SELECT id, run_id, type, payload, created_at FROM audit_events WHERE customer_id = $1 AND id >= $2 ORDER BY id DESC LIMIT $3`,
+        [customerId, (await getLastReset(customerId))?.id ?? 0, limit * 3],
+      );
   const out: Activity[] = [];
   const nowMs = Date.now();
   for (const r of rows) {
@@ -383,7 +386,7 @@ export function getActivity(customerId: string, limit = 30, runId?: string): Act
     if (!d) continue;
     const pl2 = JSON.parse(r.payload) as Record<string, unknown>;
     const agent = typeof pl2.agent === "string" && pl2.agent in AGENTS ? (pl2.agent as AgentId) : undefined;
-    out.push({ id: r.id, at: r.created_at, runId: r.run_id, ...d, agent, actor: agent ? (agent === "valio-account" ? "valio" : "agent") : d.actor });
+    out.push({ id: Number(r.id), at: r.created_at, runId: r.run_id, ...d, agent, actor: agent ? (agent === "valio-account" ? "valio" : "agent") : d.actor });
     if (out.length >= limit) break;
   }
   return out;
@@ -391,18 +394,23 @@ export function getActivity(customerId: string, limit = 30, runId?: string): Act
 
 // ───────────────────────── overview ─────────────────────────
 
-export function getOverview(customerId: string) {
-  const mandate = getMandate(customerId);
-  const orders = listOrders(customerId);
-  const pending = listPending(customerId);
+export async function getOverview(customerId: string) {
+  const [mandate, orders, pending, restock, kitchen, lastReset, policy, lastRun] = await Promise.all([
+    getMandate(customerId),
+    listOrders(customerId),
+    listPending(customerId),
+    recommendRestock(customerId),
+    getKitchen(customerId),
+    getLastReset(customerId),
+    getRestockAutomationPolicy(customerId),
+    getLastRestockRun(customerId),
+  ]);
   const committed = orders.filter((o) => o.status === "committed");
   const autoCommitted = committed.filter((o) => o.policy.decision === "auto_commit");
   const humanApproved = committed.length - autoCommitted.length;
   const today = new Date().toISOString().slice(0, 10);
   const spendToday = committed.filter((o) => o.updatedAt.slice(0, 10) === today).reduce((s, o) => s + o.totalPrice, 0);
 
-  const restock = recommendRestock(customerId);
-  const kitchen = getKitchen(customerId);
   const inbound = (kitchen?.orderHistory ?? []).filter((o) => o.status === "committed");
 
   const attention: Array<{ kind: "approval" | "stock" | "drift" | "inbound"; severity: "high" | "med" | "low"; title: string; detail: string; view: string }> = [];
@@ -475,7 +483,7 @@ export function getOverview(customerId: string) {
     }));
 
   return {
-    lastReset: getLastReset(customerId),
+    lastReset,
     approvals,
     deliveries,
     drift,
@@ -507,7 +515,7 @@ export function getOverview(customerId: string) {
       suggested: r.suggestedOrderQty,
       drift: Boolean(r.standingOrderDrift),
     })),
-    automation: { policy: getRestockAutomationPolicy(customerId), lastRun: getLastRestockRun(customerId) },
+    automation: { policy, lastRun },
   };
 }
 
@@ -526,23 +534,23 @@ export type AuditRun = {
 };
 
 /** One row per agent run so a human can pick "what happened with the milk order" instead of pasting a run id. */
-export function getAuditRuns(customerId: string, limit = 40): AuditRun[] {
-  const rows = getDb()
-    .prepare(
-      `SELECT run_id, type, payload, created_at, id FROM audit_events WHERE customer_id = ? ORDER BY id DESC LIMIT 1500`,
-    )
-    .all(customerId) as Array<{ run_id: string; type: string; payload: string; created_at: string; id: number }>;
+export async function getAuditRuns(customerId: string, limit = 40): Promise<AuditRun[]> {
+  const rows = await getDb().query<{ run_id: string; type: string; payload: string; created_at: string; id: number }>(
+    `SELECT run_id, type, payload, created_at, id FROM audit_events WHERE customer_id = $1 ORDER BY id DESC LIMIT 1500`,
+    [customerId],
+  );
   const byRun = new Map<string, typeof rows>();
   for (const r of rows) {
     if (!byRun.has(r.run_id)) byRun.set(r.run_id, []);
     byRun.get(r.run_id)!.unshift(r);
   }
-  const reset = getLastReset(customerId);
+  const reset = await getLastReset(customerId);
   // Event runs are separate from the ordering run, so look up each event's latest ordering result by id.
   const eventOrders = new Map<string, { committed: number; waiting: number }>();
-  const placedRows = getDb()
-    .prepare(`SELECT payload FROM audit_events WHERE customer_id = ? AND type = 'event_orders_placed' ORDER BY id ASC`)
-    .all(customerId) as Array<{ payload: string }>;
+  const placedRows = await getDb().query<{ payload: string }>(
+    `SELECT payload FROM audit_events WHERE customer_id = $1 AND type = 'event_orders_placed' ORDER BY id ASC`,
+    [customerId],
+  );
   for (const r of placedRows) {
     const d = JSON.parse(r.payload) as Record<string, any>;
     const prev = eventOrders.get(String(d.eventId)) ?? { committed: 0, waiting: 0 };
@@ -637,35 +645,38 @@ export function getAuditRuns(customerId: string, limit = 40): AuditRun[] {
 
 // ───────────────────────── agent roster ─────────────────────────
 
-export function getAgentRoster(customerId: string) {
+export async function getAgentRoster(customerId: string) {
   const since = new Date(Date.now() - 24 * 3600_000).toISOString();
-  return Object.values(AGENTS).map((a) => {
-    const rows = getDb()
-      .prepare(`SELECT type, payload, created_at, run_id FROM audit_events WHERE customer_id = ? AND payload LIKE ? ORDER BY id DESC LIMIT 200`)
-      .all(customerId, `%"agent":"${a.id}"%`) as Array<{ type: string; payload: string; created_at: string; run_id: string }>;
-    let last: { text: string; at: string; runId: string } | null = null;
-    let refusal: { text: string; at: string; runId: string } | null = null;
-    for (const r of rows) {
-      const d = describe(r.type, JSON.parse(r.payload));
-      if (!d) continue;
-      const item = { text: d.text, at: r.created_at, runId: r.run_id };
-      if (r.type === "forbidden_action") refusal = refusal ?? item;
-      else {
-        last = item;
-        break;
+  return Promise.all(
+    Object.values(AGENTS).map(async (a) => {
+      const rows = await getDb().query<{ type: string; payload: string; created_at: string; run_id: string }>(
+        `SELECT type, payload, created_at, run_id FROM audit_events WHERE customer_id = $1 AND payload LIKE $2 ORDER BY id DESC LIMIT 200`,
+        [customerId, `%"agent":"${a.id}"%`],
+      );
+      let last: { text: string; at: string; runId: string } | null = null;
+      let refusal: { text: string; at: string; runId: string } | null = null;
+      for (const r of rows) {
+        const d = describe(r.type, JSON.parse(r.payload));
+        if (!d) continue;
+        const item = { text: d.text, at: r.created_at, runId: r.run_id };
+        if (r.type === "forbidden_action") refusal = refusal ?? item;
+        else {
+          last = item;
+          break;
+        }
       }
-    }
-    last = last ?? refusal;
-    return {
-      id: a.id,
-      name: a.name,
-      short: a.short,
-      side: a.side,
-      job: a.job,
-      capabilities: a.capabilities,
-      cannot: a.cannot,
-      actions24h: rows.filter((r) => r.created_at >= since).length,
-      last,
-    };
-  });
+      last = last ?? refusal;
+      return {
+        id: a.id,
+        name: a.name,
+        short: a.short,
+        side: a.side,
+        job: a.job,
+        capabilities: a.capabilities,
+        cannot: a.cannot,
+        actions24h: rows.filter((r) => r.created_at >= since).length,
+        last,
+      };
+    }),
+  );
 }

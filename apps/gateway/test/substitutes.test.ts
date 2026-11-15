@@ -215,8 +215,8 @@ test("Stage 2 (Batched LLM Culinary Judge): vets entire plan in 1 LLM call, veto
   }) as typeof fetch;
 
   try {
-    kitchen.resetKitchen("HOTEL-001");
-    const mandate = customers.getMandate("HOTEL-001")!;
+    await kitchen.resetKitchen("HOTEL-001");
+    const mandate = (await customers.getMandate("HOTEL-001"))!;
     const plan = await planner.planSourcing("HOTEL-001", mandate, {
       neededBy: "2026-11-23",
       baselineUntil: "2026-11-24",

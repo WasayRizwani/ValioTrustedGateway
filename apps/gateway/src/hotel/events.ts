@@ -99,63 +99,63 @@ export function readinessOf(ev: EventRecord, today = todayIso()): Readiness {
 
 // ───────────────────────── storage ─────────────────────────
 
-let ready = false;
 function db() {
-  const d = getDb();
-  if (!ready) {
-    d.exec(`CREATE TABLE IF NOT EXISTS events (
-      id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, status TEXT NOT NULL, date TEXT NOT NULL, json TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS event_order_claims (
-      event_id TEXT PRIMARY KEY, lease_until TEXT NOT NULL
-    );`);
-    ready = true;
-  }
-  return d;
+  return getDb();
 }
-function save(ev: EventRecord, preserveAutoOrder = false, onStored?: (ev: EventRecord) => void) {
+async function save(ev: EventRecord, preserveAutoOrder = false, onStored?: (ev: EventRecord) => void | Promise<void>) {
   const database = db();
-  const tx = database.transaction(() => {
-    const current = database.prepare("SELECT json FROM events WHERE id=? AND customer_id=?").get(ev.id, ev.customerId) as { json: string } | undefined;
+  await database.withTransaction(async (tx) => {
+    const current = await tx.queryOne<{ json: string }>(
+      "SELECT json FROM events WHERE id = $1 AND customer_id = $2",
+      [ev.id, ev.customerId],
+    );
     if (current) {
       const previous = JSON.parse(current.json) as EventRecord;
       ev.version = (previous.version ?? 1) + 1;
       if (preserveAutoOrder) ev.autoOrder = previous.autoOrder;
     } else ev.version ??= 1;
-    database.prepare(`INSERT INTO events (id, customer_id, status, date, json) VALUES (?,?,?,?,?)
-      ON CONFLICT(id) DO UPDATE SET status=excluded.status, date=excluded.date, json=excluded.json`)
-      .run(ev.id, ev.customerId, ev.status, ev.date, JSON.stringify(ev));
-    onStored?.(ev);
+    await tx.execute(
+      `INSERT INTO events (id, customer_id, status, date, json) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (id) DO UPDATE SET status = excluded.status, date = excluded.date, json = excluded.json`,
+      [ev.id, ev.customerId, ev.status, ev.date, JSON.stringify(ev)],
+    );
+    await onStored?.(ev);
   });
-  tx();
 }
-function load(customerId: string, id: string): EventRecord {
-  const row = db().prepare(`SELECT json FROM events WHERE id = ? AND customer_id = ?`).get(id, customerId) as { json: string } | undefined;
+async function load(customerId: string, id: string): Promise<EventRecord> {
+  const row = await db().queryOne<{ json: string }>(
+    `SELECT json FROM events WHERE id = $1 AND customer_id = $2`,
+    [id, customerId],
+  );
   if (!row) throw new Error("event not found");
   const record = JSON.parse(row.json) as EventRecord;
   record.version ??= 1;
   return record;
 }
 /** Read a persisted event for public approval rendering after token validation. */
-export function getEventRecord(customerId: string, id: string): EventRecord {
+export async function getEventRecord(customerId: string, id: string): Promise<EventRecord> {
   return load(customerId, id);
 }
-export function resetEvents(customerId: string) {
-  db().prepare(`DELETE FROM events WHERE customer_id = ?`).run(customerId);
+export async function resetEvents(customerId: string) {
+  await db().execute(`DELETE FROM events WHERE customer_id = $1`, [customerId]);
 }
-export function deleteEvent(customerId: string, id: string) {
-  db().prepare(`DELETE FROM events WHERE id = ? AND customer_id = ?`).run(id, customerId);
+export async function deleteEvent(customerId: string, id: string) {
+  await db().execute(`DELETE FROM events WHERE id = $1 AND customer_id = $2`, [id, customerId]);
 }
 
-function claimScheduledOrder(eventId: string): boolean {
+async function claimScheduledOrder(eventId: string): Promise<boolean> {
   const d = db();
   const until = new Date(Date.now() + 5 * 60_000).toISOString();
-  const result = d.prepare(`INSERT INTO event_order_claims(event_id,lease_until) VALUES(?,?)
-    ON CONFLICT(event_id) DO UPDATE SET lease_until=excluded.lease_until WHERE event_order_claims.lease_until < ?`)
-    .run(eventId, until, new Date().toISOString());
-  return result.changes === 1;
+  const result = await d.execute(
+    `INSERT INTO event_order_claims (event_id, lease_until) VALUES ($1, $2)
+     ON CONFLICT (event_id) DO UPDATE SET lease_until = excluded.lease_until WHERE event_order_claims.lease_until < $3`,
+    [eventId, until, new Date().toISOString()],
+  );
+  return result.rowCount === 1;
 }
-function releaseScheduledOrder(eventId: string) { db().prepare("DELETE FROM event_order_claims WHERE event_id=?").run(eventId); }
+async function releaseScheduledOrder(eventId: string) {
+  await db().execute("DELETE FROM event_order_claims WHERE event_id = $1", [eventId]);
+}
 
 export function view(ev: EventRecord): EventView {
   const today = todayIso();
@@ -174,8 +174,11 @@ export function view(ev: EventRecord): EventView {
   return { ...ev, deliverBy, orderBy, daysAway, daysToOrderBy, orderDue: readiness === "ready_to_order" || readiness === "at_risk" ? daysToOrderBy <= 0 : false, readiness, headline };
 }
 
-export function listEvents(customerId: string, includeCancelled = false): EventView[] {
-  const rows = db().prepare(`SELECT json FROM events WHERE customer_id = ? ORDER BY date ASC`).all(customerId) as Array<{ json: string }>;
+export async function listEvents(customerId: string, includeCancelled = false): Promise<EventView[]> {
+  const rows = await db().query<{ json: string }>(
+    `SELECT json FROM events WHERE customer_id = $1 ORDER BY date ASC`,
+    [customerId],
+  );
   const cutoff = addDays(todayIso(), -7);
   return rows
     .map((r) => JSON.parse(r.json) as EventRecord)
@@ -185,8 +188,8 @@ export function listEvents(customerId: string, includeCancelled = false): EventV
 
 // ───────────────────────── planning & ordering ─────────────────────────
 
-function validate(customerId: string, input: EventInput) {
-  const k = getKitchen(customerId);
+async function validate(customerId: string, input: EventInput) {
+  const k = await getKitchen(customerId);
   if (!k) throw new Error("no_kitchen_profile");
   if (!input.name?.trim()) throw new Error("event needs a name");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.date)) throw new Error("date must be YYYY-MM-DD");
@@ -197,8 +200,8 @@ function validate(customerId: string, input: EventInput) {
   return k;
 }
 
-function normalize(customerId: string, input: EventInput, existing?: EventRecord): EventRecord {
-  validate(customerId, input);
+async function normalize(customerId: string, input: EventInput, existing?: EventRecord): Promise<EventRecord> {
+  await validate(customerId, input);
   return {
     id: existing?.id ?? `EVT-${randomUUID().slice(0, 6).toUpperCase()}`,
     version: existing ? (existing.version ?? 1) + 1 : 1,
@@ -221,7 +224,7 @@ function normalize(customerId: string, input: EventInput, existing?: EventRecord
 }
 
 async function runPlan(ev: EventRecord, mandate: Mandate, createIntents: boolean): Promise<PlanResult> {
-  const k = getKitchen(ev.customerId)!;
+  const k = (await getKitchen(ev.customerId))!;
   const idx = new Map(k.recipes.map((r) => [r.recipeId, { servingsPerBatch: r.servingsPerBatch, name: r.name }]));
   const req = buildRequest(ev, idx);
   return planSourcing(ev.customerId, mandate, { ...req, createIntents, runId: randomUUID() });
@@ -236,14 +239,14 @@ function summarise(plan: PlanResult): NonNullable<EventRecord["plan"]> {
 /** (Re)compute the plan — read-only against Valio, nothing is ordered. */
 export async function replanEvent(customerId: string, id: string): Promise<EventView> {
   return withAgent("planner", async () => {
-    const mandate = getMandate(customerId);
+    const mandate = await getMandate(customerId);
     if (!mandate) throw new Error("no_mandate");
-    const ev = load(customerId, id);
+    const ev = await load(customerId, id);
     const before = readinessOf(ev);
     ev.plan = summarise(await runPlan(ev, mandate, false));
-    save(ev, true);
+    await save(ev, true);
     const after = readinessOf(ev);
-    appendAudit(randomUUID(), customerId, "event_planned", {
+    await appendAudit(randomUUID(), customerId, "event_planned", {
       eventId: ev.id,
       name: ev.name,
       date: ev.date,
@@ -256,24 +259,24 @@ export async function replanEvent(customerId: string, id: string): Promise<Event
   });
 }
 
-export async function createEvent(customerId: string, input: EventInput, onStored?: (ev: EventRecord) => void): Promise<EventView> {
-  const ev = normalize(customerId, input);
-  save(ev, true, onStored);
-  appendAudit(randomUUID(), customerId, "event_created", { eventId: ev.id, name: ev.name, date: ev.date, guests: ev.guests });
+export async function createEvent(customerId: string, input: EventInput, onStored?: (ev: EventRecord) => void | Promise<void>): Promise<EventView> {
+  const ev = await normalize(customerId, input);
+  await save(ev, true, onStored);
+  await appendAudit(randomUUID(), customerId, "event_created", { eventId: ev.id, name: ev.name, date: ev.date, guests: ev.guests });
   return replanEvent(customerId, ev.id);
 }
 
 export async function updateEvent(customerId: string, id: string, input: EventInput): Promise<EventView> {
-  const ev = normalize(customerId, input, load(customerId, id));
-  save(ev);
+  const ev = await normalize(customerId, input, await load(customerId, id));
+  await save(ev);
   return replanEvent(customerId, ev.id);
 }
 
-export function cancelEvent(customerId: string, id: string) {
-  const ev = load(customerId, id);
+export async function cancelEvent(customerId: string, id: string) {
+  const ev = await load(customerId, id);
   ev.status = "cancelled";
-  save(ev, true);
-  appendAudit(randomUUID(), customerId, "event_cancelled", { eventId: ev.id, name: ev.name });
+  await save(ev, true);
+  await appendAudit(randomUUID(), customerId, "event_cancelled", { eventId: ev.id, name: ev.name });
   return { cancelled: true };
 }
 
@@ -282,9 +285,9 @@ export function cancelEvent(customerId: string, id: string) {
  * creates the orders — auto-placed if inside the mandate, otherwise waiting in Needs approval.
  */
 export async function orderEvent(customerId: string, id: string, trigger: "manual" | "schedule" = "manual"): Promise<EventView> {
-  const mandate = getMandate(customerId);
+  const mandate = await getMandate(customerId);
   if (!mandate) throw new Error("no_mandate");
-  const ev = load(customerId, id);
+  const ev = await load(customerId, id);
   if (ev.status === "cancelled") throw new Error("event is cancelled");
   if (ev.status === "ordered") return view(ev);
   const plan = await withAgent("planner", () => runPlan(ev, mandate, true));
@@ -303,8 +306,8 @@ export async function orderEvent(customerId: string, id: string, trigger: "manua
   ev.plan = summarise(plan);
   ev.orders = [...(ev.orders ?? []).filter((o) => !placed.some((p) => p.intentId === o.intentId)), ...placed];
   ev.status = placed.length || ev.plan.lines.every((l) => l.shortfall <= 0) ? "ordered" : ev.status;
-  save(ev, true);
-  appendAudit(randomUUID(), customerId, "event_orders_placed", {
+  await save(ev, true);
+  await appendAudit(randomUUID(), customerId, "event_orders_placed", {
     eventId: ev.id,
     name: ev.name,
     trigger,
@@ -320,18 +323,18 @@ export async function orderEvent(customerId: string, id: string, trigger: "manua
 /** Orders events whose order-by date has come; refreshes stale plans so risks surface early. */
 export async function tickEvents(customerId: string): Promise<string[]> {
   const log: string[] = [];
-  for (const e of listEvents(customerId)) {
+  for (const e of await listEvents(customerId)) {
     if (e.status !== "planned" || e.readiness === "past") continue;
     try {
       const stale = !e.plan || Date.now() - new Date(e.plan.at).getTime() > 6 * 3600_000;
       if (e.autoOrder && e.daysToOrderBy <= 0 && e.readiness !== "covered") {
-        if (!claimScheduledOrder(e.id)) continue;
+        if (!(await claimScheduledOrder(e.id))) continue;
         try {
           await orderEvent(customerId, e.id, "schedule");
           log.push(`ordered ${e.name}`);
-        } finally { releaseScheduledOrder(e.id); }
+        } finally { await releaseScheduledOrder(e.id); }
       } else if (stale && e.daysAway <= 21) {
-        const voiceApproval = getVoiceState(customerId, e.id)?.approval;
+        const voiceApproval = (await getVoiceState(customerId, e.id))?.approval;
         if (voiceApproval === "pending" || voiceApproval === "pending_buyer_approval") continue;
         await replanEvent(customerId, e.id);
         log.push(`re-checked ${e.name}`);

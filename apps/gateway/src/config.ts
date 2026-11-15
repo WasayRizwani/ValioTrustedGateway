@@ -30,7 +30,9 @@ export const config = {
   claimKeyId: process.env.CLAIM_KEY_ID ?? "demo-key-01",
   dataDir: resolve(root, "data"),
   keysDir: resolve(root, "keys"),
-  dbPath: process.env.GATEWAY_DB_PATH ?? resolve(root, "data", "gateway.db"),
+  databaseUrl: process.env.DATABASE_URL ?? "",
+  projectCaCert: process.env.PROJECT_CA_CERT ?? "",
+  pgliteDataDir: process.env.PGLITE_DATA_DIR ?? resolve(root, "data", "pgdata"),
   /** Firm-price guarantee window of a quote, in minutes. */
   quoteTtlMinutes: Number(process.env.QUOTE_TTL_MINUTES ?? 30),
   openaiApiKey: process.env.OPENAI_API_KEY ?? "",
